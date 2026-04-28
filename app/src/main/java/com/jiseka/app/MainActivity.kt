@@ -43,7 +43,7 @@ class MainActivity : AppCompatActivity() {
         webView.addJavascriptInterface(JiSeKaBridge(this, webView), "JiSeKaNative")
         
         // 사용자님의 실제 Vercel 주소
-        webView.loadUrl("https://seka-app.vercel.app")
+        webView.loadUrl("https://ziseka-app.vercel.app")
     }
 }
 
