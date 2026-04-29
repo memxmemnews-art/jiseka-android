@@ -26,7 +26,7 @@ class MainActivity : AppCompatActivity() {
             e.printStackTrace() // 모델 로드 실패 시 로그 출력
         }
 
-        webView = findViewById(R.id.webview)
+        webView = findViewById(R.id.webView)
         webView.settings.javaScriptEnabled = true
         webView.addJavascriptInterface(WebAppInterface(), "JiSeKaNative")
         webView.loadUrl("https://ziseka-app.vercel.app")
