@@ -11,6 +11,8 @@ import android.webkit.WebView
 import androidx.appcompat.app.AppCompatActivity
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.support.common.FileUtil
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
@@ -28,14 +30,13 @@ class MainActivity : AppCompatActivity() {
             e.printStackTrace()
         }
 
-        webView = findViewById(R.id.webView) // 아까 수정한 대문자 W 유지
+        webView = findViewById(R.id.webView)
         webView.settings.javaScriptEnabled = true
-        webView.settings.mediaPlaybackRequiresUserGesture = false // 카메라 자동 재생 허용
+        webView.settings.mediaPlaybackRequiresUserGesture = false
         
-        // 🚨 [핵심 추가] 웹뷰 내부 카메라 권한 뚫어주기 (두 번째 보안문 해제)
+        // 카메라 권한 승인 로직 (이중 보안문 해제)
         webView.webChromeClient = object : WebChromeClient() {
             override fun onPermissionRequest(request: PermissionRequest) {
-                // Vercel 웹사이트가 카메라 권한을 요청하면 무조건 승인!
                 request.grant(request.resources)
             }
         }
@@ -47,12 +48,15 @@ class MainActivity : AppCompatActivity() {
     inner class WebAppInterface {
         @JavascriptInterface
         fun sendImageData(base64Str: String) {
+            // 웹에서 온 Base64 이미지를 비트맵으로 변환
             val pureBase64 = base64Str.substringAfter(",")
             val decodedString = Base64.decode(pureBase64, Base64.DEFAULT)
             val bitmap = BitmapFactory.decodeByteArray(decodedString, 0, decodedString.size)
 
+            // AI 추론 실행
             val cornersJson = runInference(bitmap)
 
+            // 결과 웹으로 쏘기
             runOnUiThread {
                 webView.evaluateJavascript("window.receiveAICorners('$cornersJson')", null)
             }
@@ -61,8 +65,76 @@ class MainActivity : AppCompatActivity() {
 
     private fun runInference(bitmap: Bitmap): String {
         if (tflite == null) return "[]"
+
+        val inputSize = 256
         
-        // 현재는 통신 테스트를 위한 임시 가짜 좌표 응답입니다.
-        return "[{\"x\":150, \"y\":200}, {\"x\":450, \"y\":200}, {\"x\":450, \"y\":300}, {\"x\":150, \"y\":300}]"
+        // 1. 입력 이미지 전처리 (256x256 리사이징)
+        val resizedBitmap = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
+        val inputBuffer = ByteBuffer.allocateDirect(4 * inputSize * inputSize * 3)
+        inputBuffer.order(ByteOrder.nativeOrder())
+        
+        val intValues = IntArray(inputSize * inputSize)
+        resizedBitmap.getPixels(intValues, 0, resizedBitmap.width, 0, 0, resizedBitmap.width, resizedBitmap.height)
+        
+        var pixel = 0
+        for (i in 0 until inputSize) {
+            for (j in 0 until inputSize) {
+                val valInt = intValues[pixel++]
+                // RGB 값을 0.0 ~ 1.0 사이의 Float로 변환하여 주입
+                inputBuffer.putFloat(((valInt shr 16) and 0xFF) / 255.0f)
+                inputBuffer.putFloat(((valInt shr 8) and 0xFF) / 255.0f)
+                inputBuffer.putFloat((valInt and 0xFF) / 255.0f)
+            }
+        }
+
+        // 2. 출력 배열 준비 (1 x 256 x 256 x 1)
+        val outputArray = Array(1) { Array(inputSize) { Array(inputSize) { FloatArray(1) } } }
+        
+        // 3. AI 모델 실행
+        tflite?.run(inputBuffer, outputArray)
+
+        // 4. 후처리: 마스크(도면)에서 번호판 위치(Bounding Box) 찾기
+        var minX = inputSize
+        var minY = inputSize
+        var maxX = -1
+        var maxY = -1
+
+        val threshold = 0.5f // 50% 이상의 확신이 있는 픽셀만 번호판으로 간주
+
+        for (y in 0 until inputSize) {
+            for (x in 0 until inputSize) {
+                val confidence = outputArray[0][y][x][0]
+                if (confidence > threshold) {
+                    if (x < minX) minX = x
+                    if (x > maxX) maxX = x
+                    if (y < minY) minY = y
+                    if (y > maxY) maxY = y
+                }
+            }
+        }
+
+        // 번호판을 아예 찾지 못한 경우 (하얀색 픽셀이 없음)
+        if (minX > maxX || minY > maxY) {
+            return "[]"
+        }
+
+        // 5. 좌표 복원: 256x256 기준의 좌표를 원래 사진 크기 비율에 맞춰 확대
+        val scaleX = bitmap.width.toFloat() / inputSize
+        val scaleY = bitmap.height.toFloat() / inputSize
+
+        val realMinX = minX * scaleX
+        val realMaxX = maxX * scaleX
+        val realMinY = minY * scaleY
+        val realMaxY = maxY * scaleY
+
+        // 6. JSON 형태로 4개 꼭짓점 반환 (Top-Left, Top-Right, Bottom-Right, Bottom-Left)
+        return """
+            [
+              {"x": $realMinX, "y": $realMinY},
+              {"x": $realMaxX, "y": $realMinY},
+              {"x": $realMaxX, "y": $realMaxY},
+              {"x": $realMinX, "y": $realMaxY}
+            ]
+        """.trimIndent()
     }
 }
