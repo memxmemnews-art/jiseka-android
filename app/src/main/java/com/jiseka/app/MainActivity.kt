@@ -1,59 +1,62 @@
 package com.jiseka.app
 
-import android.Manifest
-import android.annotation.SuppressLint
-import android.content.Context
-import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.util.Log
+import android.util.Base64
 import android.webkit.JavascriptInterface
-import android.webkit.PermissionRequest
-import android.webkit.WebChromeClient
 import android.webkit.WebView
-import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
+import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.support.common.FileUtil
 
 class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
+    private var tflite: Interpreter? = null
 
-    @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 100)
+        // 1. AI 모델 로드 (fairscan-segmentation-model.tflite)
+        try {
+            val modelBuffer = FileUtil.loadMappedFile(this, "fairscan-segmentation-model.tflite")
+            tflite = Interpreter(modelBuffer)
+        } catch (e: Exception) {
+            e.printStackTrace() // 모델 로드 실패 시 로그 출력
         }
 
-        webView = findViewById(R.id.webView)
+        webView = findViewById(R.id.webview)
         webView.settings.javaScriptEnabled = true
-        webView.settings.domStorageEnabled = true
-        webView.settings.mediaPlaybackRequiresUserGesture = false
-
-        webView.webChromeClient = object : WebChromeClient() {
-            override fun onPermissionRequest(request: PermissionRequest?) {
-                request?.grant(request.resources)
-            }
-        }
-        webView.webViewClient = WebViewClient()
-        webView.addJavascriptInterface(JiSeKaBridge(this, webView), "JiSeKaNative")
-        
-        // 사용자님의 실제 Vercel 주소
+        webView.addJavascriptInterface(WebAppInterface(), "JiSeKaNative")
         webView.loadUrl("https://ziseka-app.vercel.app")
     }
-}
 
-class JiSeKaBridge(private val context: Context, private val webView: WebView) {
-    @JavascriptInterface
-    fun processImage(base64Data: String, bboxJSON: String) {
-        Log.d("JiSeKaNative", "사진 수신 완료, 가짜 좌표 반환 대기 중...")
-        val fakeCorners = "[{\"x\":100,\"y\":100},{\"x\":200,\"y\":100},{\"x\":200,\"y\":150},{\"x\":100,\"y\":150}]"
-        Handler(Looper.getMainLooper()).postDelayed({
-            webView.evaluateJavascript("window.receiveAICorners('$fakeCorners');", null)
-        }, 1000)
+    inner class WebAppInterface {
+        @JavascriptInterface
+        fun sendImageData(base64Str: String) {
+            // 2. 웹에서 넘어온 Base64 데이터를 진짜 사진(Bitmap)으로 변환
+            val pureBase64 = base64Str.substringAfter(",")
+            val decodedString = Base64.decode(pureBase64, Base64.DEFAULT)
+            val bitmap = BitmapFactory.decodeByteArray(decodedString, 0, decodedString.size)
+
+            // 3. AI 분석 실행 
+            val cornersJson = runInference(bitmap)
+
+            // 4. 찾은 좌표를 다시 Vercel 웹으로 쏘아주기!
+            runOnUiThread {
+                webView.evaluateJavascript("window.receiveAICorners('$cornersJson')", null)
+            }
+        }
+    }
+
+    private fun runInference(bitmap: Bitmap): String {
+        if (tflite == null) {
+            return "[]" // 모델이 없으면 빈 배열 반환
+        }
+        
+        // TODO: segmentation 모델의 출력 배열을 분석하여 4개 꼭짓점(x, y)으로 변환하는 세부 로직 필요.
+        // 현재는 통신(브릿지)이 완벽하게 성공했는지 확인하기 위한 임시 가짜 응답입니다.
+        return "[{\"x\":150, \"y\":200}, {\"x\":450, \"y\":200}, {\"x\":450, \"y\":300}, {\"x\":150, \"y\":300}]"
     }
 }
