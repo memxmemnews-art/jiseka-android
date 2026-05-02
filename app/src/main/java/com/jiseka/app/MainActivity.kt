@@ -22,7 +22,6 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        // 1. AI 모델 로드
         try {
             val modelBuffer = FileUtil.loadMappedFile(this, "fairscan-segmentation-model.tflite")
             tflite = Interpreter(modelBuffer)
@@ -50,19 +49,19 @@ class MainActivity : AppCompatActivity() {
         fun sendImageData(base64Str: String) {
             try {
                 val pureBase64 = base64Str.substringAfter(",")
-                val decodedString = Base64.decode(pureBase64, Base64.DEFAULT)
-                val bitmap = BitmapFactory.decodeByteArray(decodedString, 0, decodedString.size) 
+                val decodedByteArray = Base64.decode(pureBase64, Base64.DEFAULT)
+                
+                // 💡 [핵심 수정] 웹에서 이미 작은 조각만 보내주므로, 화질을 뭉개는 메모리 다이어트 코드 삭제!
+                val bitmap = BitmapFactory.decodeByteArray(decodedByteArray, 0, decodedByteArray.size) 
                     ?: throw Exception("비트맵 변환 실패")
 
                 val cornersJson = runInference(bitmap)
 
-                // 정상 결과 반환
                 runOnUiThread {
                     webView.evaluateJavascript("window.receiveAICorners('$cornersJson')", null)
                 }
-            } catch (e: Exception) {
-                // 🚨 에러 메시지 안에 섞인 특수문자나 줄바꿈 때문에 JS가 또 뻗는 것을 방지
-                val safeMsg = e.message?.replace(Regex("[^a-zA-Z0-9가-힣 ]"), "_") ?: "Unknown Error"
+            } catch (e: Throwable) { 
+                val safeMsg = e.message?.replace(Regex("[^a-zA-Z0-9가-힣 ]"), "_") ?: "Fatal Error"
                 runOnUiThread {
                     webView.evaluateJavascript("alert('AI 에러 발생: $safeMsg'); window.receiveAICorners('[]');", null)
                 }
@@ -75,7 +74,6 @@ class MainActivity : AppCompatActivity() {
 
         val inputSize = 256
         
-        // 1. 입력 이미지 리사이징 (256x256)
         val resizedBitmap = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
         val inputBuffer = ByteBuffer.allocateDirect(4 * inputSize * inputSize * 3)
         inputBuffer.order(ByteOrder.nativeOrder())
@@ -93,15 +91,12 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // 2. 출력 버퍼 (모델의 배열 모양에 상관없이 데이터를 강제로 쏟아붓게 만드는 마법의 ByteBuffer)
         val outputBuffer = ByteBuffer.allocateDirect(4 * inputSize * inputSize * 1)
         outputBuffer.order(ByteOrder.nativeOrder())
         
-        // 3. AI 실행
         tflite?.run(inputBuffer, outputBuffer)
-        outputBuffer.rewind() // 다 읽은 후 처음으로 되감기
+        outputBuffer.rewind() 
 
-        // 4. 좌표 추출
         var minX = inputSize
         var minY = inputSize
         var maxX = -1
@@ -121,21 +116,19 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // 번호판을 못 찾은 경우
         if (minX > maxX || minY > maxY) {
             return "[]"
         }
 
-        // 5. 원본 비율로 확대
-        val scaleX = bitmap.width.toFloat() / inputSize
-        val scaleY = bitmap.height.toFloat() / inputSize
+        // 비율 계산 시 소수점 누락 방지 (.toFloat() 적용)
+        val scaleX = bitmap.width.toFloat() / inputSize.toFloat()
+        val scaleY = bitmap.height.toFloat() / inputSize.toFloat()
 
         val realMinX = minX * scaleX
         val realMaxX = maxX * scaleX
         val realMinY = minY * scaleY
         val realMaxY = maxY * scaleY
 
-        // 6. JSON 반환 (🚨 절대 엔터키를 치지 않고 한 줄로 반환해야 JS 에러가 안 납니다!)
         return "[{\"x\": $realMinX, \"y\": $realMinY}, {\"x\": $realMaxX, \"y\": $realMinY}, {\"x\": $realMaxX, \"y\": $realMaxY}, {\"x\": $realMinX, \"y\": $realMaxY}]"
     }
 }
