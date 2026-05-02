@@ -22,7 +22,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        // 1. AI 모델 로드 (fairscan-segmentation-model.tflite)
+        // 1. AI 모델 로드
         try {
             val modelBuffer = FileUtil.loadMappedFile(this, "fairscan-segmentation-model.tflite")
             tflite = Interpreter(modelBuffer)
@@ -33,8 +33,8 @@ class MainActivity : AppCompatActivity() {
         webView = findViewById(R.id.webView)
         webView.settings.javaScriptEnabled = true
         webView.settings.mediaPlaybackRequiresUserGesture = false
+        webView.settings.domStorageEnabled = true
         
-        // 카메라 권한 승인 로직 (이중 보안문 해제)
         webView.webChromeClient = object : WebChromeClient() {
             override fun onPermissionRequest(request: PermissionRequest) {
                 request.grant(request.resources)
@@ -45,39 +45,37 @@ class MainActivity : AppCompatActivity() {
         webView.loadUrl("https://ziseka-app.vercel.app")
     }
 
-   inner class WebAppInterface {
+    inner class WebAppInterface {
         @JavascriptInterface
         fun sendImageData(base64Str: String) {
             try {
-                // 웹에서 온 Base64 이미지를 비트맵으로 변환
                 val pureBase64 = base64Str.substringAfter(",")
                 val decodedString = Base64.decode(pureBase64, Base64.DEFAULT)
-                val bitmap = BitmapFactory.decodeByteArray(decodedString, 0, decodedString.size)
+                val bitmap = BitmapFactory.decodeByteArray(decodedString, 0, decodedString.size) 
+                    ?: throw Exception("비트맵 변환 실패")
 
-                // AI 추론 실행
                 val cornersJson = runInference(bitmap)
 
-                // 결과 웹으로 쏘기
+                // 정상 결과 반환
                 runOnUiThread {
                     webView.evaluateJavascript("window.receiveAICorners('$cornersJson')", null)
                 }
             } catch (e: Exception) {
-                // 🚨 AI 분석 중 에러가 발생하면 폰 화면에 팝업 띄우기
-                val errorMsg = e.message?.replace("'", "\\'") ?: "Unknown Error"
+                // 🚨 에러 메시지 안에 섞인 특수문자나 줄바꿈 때문에 JS가 또 뻗는 것을 방지
+                val safeMsg = e.message?.replace(Regex("[^a-zA-Z0-9가-힣 ]"), "_") ?: "Unknown Error"
                 runOnUiThread {
-                    webView.evaluateJavascript("alert('AI 에러 발생: $errorMsg');", null)
-                    webView.evaluateJavascript("window.receiveAICorners('[]');", null) // UI 원상복구
+                    webView.evaluateJavascript("alert('AI 에러 발생: $safeMsg'); window.receiveAICorners('[]');", null)
                 }
             }
         }
     }
 
     private fun runInference(bitmap: Bitmap): String {
-        if (tflite == null) return "[]"
+        if (tflite == null) throw Exception("TFLite 모델을 찾을 수 없습니다")
 
         val inputSize = 256
         
-        // 1. 입력 이미지 전처리 (256x256 리사이징)
+        // 1. 입력 이미지 리사이징 (256x256)
         val resizedBitmap = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
         val inputBuffer = ByteBuffer.allocateDirect(4 * inputSize * inputSize * 3)
         inputBuffer.order(ByteOrder.nativeOrder())
@@ -89,30 +87,31 @@ class MainActivity : AppCompatActivity() {
         for (i in 0 until inputSize) {
             for (j in 0 until inputSize) {
                 val valInt = intValues[pixel++]
-                // RGB 값을 0.0 ~ 1.0 사이의 Float로 변환하여 주입
                 inputBuffer.putFloat(((valInt shr 16) and 0xFF) / 255.0f)
                 inputBuffer.putFloat(((valInt shr 8) and 0xFF) / 255.0f)
                 inputBuffer.putFloat((valInt and 0xFF) / 255.0f)
             }
         }
 
-        // 2. 출력 배열 준비 (1 x 256 x 256 x 1)
-        val outputArray = Array(1) { Array(inputSize) { Array(inputSize) { FloatArray(1) } } }
+        // 2. 출력 버퍼 (모델의 배열 모양에 상관없이 데이터를 강제로 쏟아붓게 만드는 마법의 ByteBuffer)
+        val outputBuffer = ByteBuffer.allocateDirect(4 * inputSize * inputSize * 1)
+        outputBuffer.order(ByteOrder.nativeOrder())
         
-        // 3. AI 모델 실행
-        tflite?.run(inputBuffer, outputArray)
+        // 3. AI 실행
+        tflite?.run(inputBuffer, outputBuffer)
+        outputBuffer.rewind() // 다 읽은 후 처음으로 되감기
 
-        // 4. 후처리: 마스크(도면)에서 번호판 위치(Bounding Box) 찾기
+        // 4. 좌표 추출
         var minX = inputSize
         var minY = inputSize
         var maxX = -1
         var maxY = -1
 
-        val threshold = 0.5f // 50% 이상의 확신이 있는 픽셀만 번호판으로 간주
+        val threshold = 0.5f 
 
         for (y in 0 until inputSize) {
             for (x in 0 until inputSize) {
-                val confidence = outputArray[0][y][x][0]
+                val confidence = outputBuffer.float
                 if (confidence > threshold) {
                     if (x < minX) minX = x
                     if (x > maxX) maxX = x
@@ -122,12 +121,12 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // 번호판을 아예 찾지 못한 경우 (하얀색 픽셀이 없음)
+        // 번호판을 못 찾은 경우
         if (minX > maxX || minY > maxY) {
             return "[]"
         }
 
-        // 5. 좌표 복원: 256x256 기준의 좌표를 원래 사진 크기 비율에 맞춰 확대
+        // 5. 원본 비율로 확대
         val scaleX = bitmap.width.toFloat() / inputSize
         val scaleY = bitmap.height.toFloat() / inputSize
 
@@ -136,14 +135,7 @@ class MainActivity : AppCompatActivity() {
         val realMinY = minY * scaleY
         val realMaxY = maxY * scaleY
 
-        // 6. JSON 형태로 4개 꼭짓점 반환 (Top-Left, Top-Right, Bottom-Right, Bottom-Left)
-        return """
-            [
-              {"x": $realMinX, "y": $realMinY},
-              {"x": $realMaxX, "y": $realMinY},
-              {"x": $realMaxX, "y": $realMaxY},
-              {"x": $realMinX, "y": $realMaxY}
-            ]
-        """.trimIndent()
+        // 6. JSON 반환 (🚨 절대 엔터키를 치지 않고 한 줄로 반환해야 JS 에러가 안 납니다!)
+        return "[{\"x\": $realMinX, \"y\": $realMinY}, {\"x\": $realMaxX, \"y\": $realMinY}, {\"x\": $realMaxX, \"y\": $realMaxY}, {\"x\": $realMinX, \"y\": $realMaxY}]"
     }
 }
