@@ -7,6 +7,7 @@ import android.util.Base64
 import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
+import android.webkit.WebSettings
 import android.webkit.WebView
 import androidx.appcompat.app.AppCompatActivity
 import org.tensorflow.lite.Interpreter
@@ -22,7 +23,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        // 1. AI 모델 로드
+        // 1. AI 모델 로드 (fairscan-segmentation-model.tflite)
         try {
             val modelBuffer = FileUtil.loadMappedFile(this, "fairscan-segmentation-model.tflite")
             tflite = Interpreter(modelBuffer)
@@ -35,6 +36,10 @@ class MainActivity : AppCompatActivity() {
         webView.settings.mediaPlaybackRequiresUserGesture = false
         webView.settings.domStorageEnabled = true
         
+        // 🚨 안드로이드의 고집스러운 캐시 완전 차단 (무조건 Vercel의 최신 코드만 로드!)
+        webView.settings.cacheMode = WebSettings.LOAD_NO_CACHE
+        
+        // 카메라 권한 자동 승인
         webView.webChromeClient = object : WebChromeClient() {
             override fun onPermissionRequest(request: PermissionRequest) {
                 request.grant(request.resources)
@@ -42,25 +47,27 @@ class MainActivity : AppCompatActivity() {
         }
 
         webView.addJavascriptInterface(WebAppInterface(), "JiSeKaNative")
-        webView.loadUrl("https://ziseka-app.vercel.app")
+        
+        // 뒤에 타임스탬프를 붙여서 매번 새로운 주소인 것처럼 폰을 속임 (캐시 우회 끝판왕)
+        val cacheBusterUrl = "https://ziseka-app.vercel.app?refresh=" + System.currentTimeMillis()
+        webView.loadUrl(cacheBusterUrl)
     }
 
     inner class WebAppInterface {
         @JavascriptInterface
         fun sendImageData(base64Str: String) {
-            // 🚨 [핵심 수술] 무거운 AI 연산을 백그라운드 스레드로 던져서 화면 멈춤(Freeze) 원천 차단!
+            // 🚨 UI 스레드 마비(Freeze) 방지를 위한 백그라운드 스레드 분리!
             Thread {
                 try {
                     val pureBase64 = base64Str.substringAfter(",")
                     val decodedByteArray = Base64.decode(pureBase64, Base64.DEFAULT)
                     
-                    // 웹에서 가이드 박스 크기만큼 잘라서 보내주므로, 화질 저하 없이 원본 그대로 압축 해제
                     val bitmap = BitmapFactory.decodeByteArray(decodedByteArray, 0, decodedByteArray.size) 
                         ?: throw Exception("비트맵 변환 실패")
 
                     val cornersJson = runInference(bitmap)
 
-                    // UI(화면) 업데이트는 다시 메인 스레드에서 안전하게 실행
+                    // 추론 결과를 다시 메인 스레드(UI)로 안전하게 전달
                     runOnUiThread {
                         webView.evaluateJavascript("window.receiveAICorners('$cornersJson')", null)
                     }
@@ -70,7 +77,7 @@ class MainActivity : AppCompatActivity() {
                         webView.evaluateJavascript("alert('AI 에러 발생: $safeMsg'); window.receiveAICorners('[]');", null)
                     }
                 }
-            }.start() // 스레드 실행
+            }.start()
         }
     }
 
@@ -133,7 +140,6 @@ class MainActivity : AppCompatActivity() {
         val realMinY = minY * scaleY
         val realMaxY = maxY * scaleY
 
-        // 🚨 줄바꿈(엔터) 없이 한 줄의 JSON으로 반환하여 웹 통신 에러 방지
         return "[{\"x\": $realMinX, \"y\": $realMinY}, {\"x\": $realMaxX, \"y\": $realMinY}, {\"x\": $realMaxX, \"y\": $realMaxY}, {\"x\": $realMinX, \"y\": $realMaxY}]"
     }
 }
