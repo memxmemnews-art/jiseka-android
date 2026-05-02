@@ -45,20 +45,29 @@ class MainActivity : AppCompatActivity() {
         webView.loadUrl("https://ziseka-app.vercel.app")
     }
 
-    inner class WebAppInterface {
+   inner class WebAppInterface {
         @JavascriptInterface
         fun sendImageData(base64Str: String) {
-            // 웹에서 온 Base64 이미지를 비트맵으로 변환
-            val pureBase64 = base64Str.substringAfter(",")
-            val decodedString = Base64.decode(pureBase64, Base64.DEFAULT)
-            val bitmap = BitmapFactory.decodeByteArray(decodedString, 0, decodedString.size)
+            try {
+                // 웹에서 온 Base64 이미지를 비트맵으로 변환
+                val pureBase64 = base64Str.substringAfter(",")
+                val decodedString = Base64.decode(pureBase64, Base64.DEFAULT)
+                val bitmap = BitmapFactory.decodeByteArray(decodedString, 0, decodedString.size)
 
-            // AI 추론 실행
-            val cornersJson = runInference(bitmap)
+                // AI 추론 실행
+                val cornersJson = runInference(bitmap)
 
-            // 결과 웹으로 쏘기
-            runOnUiThread {
-                webView.evaluateJavascript("window.receiveAICorners('$cornersJson')", null)
+                // 결과 웹으로 쏘기
+                runOnUiThread {
+                    webView.evaluateJavascript("window.receiveAICorners('$cornersJson')", null)
+                }
+            } catch (e: Exception) {
+                // 🚨 AI 분석 중 에러가 발생하면 폰 화면에 팝업 띄우기
+                val errorMsg = e.message?.replace("'", "\\'") ?: "Unknown Error"
+                runOnUiThread {
+                    webView.evaluateJavascript("alert('AI 에러 발생: $errorMsg');", null)
+                    webView.evaluateJavascript("window.receiveAICorners('[]');", null) // UI 원상복구
+                }
             }
         }
     }
