@@ -19,6 +19,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private var tflite: Interpreter? = null
 
+    // 🚨 [핵심 변경] 대용량 조각 데이터를 안전하게 모으기 위한 동기화 보장 버퍼 (Thread-Safe)
+    private val base64Buffer = StringBuffer()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
@@ -36,10 +39,9 @@ class MainActivity : AppCompatActivity() {
         webView.settings.mediaPlaybackRequiresUserGesture = false
         webView.settings.domStorageEnabled = true
         
-        // 🚨 안드로이드의 고집스러운 캐시 완전 차단 (무조건 Vercel의 최신 코드만 로드!)
+        // 캐시 방지
         webView.settings.cacheMode = WebSettings.LOAD_NO_CACHE
         
-        // 카메라 권한 자동 승인
         webView.webChromeClient = object : WebChromeClient() {
             override fun onPermissionRequest(request: PermissionRequest) {
                 request.grant(request.resources)
@@ -48,26 +50,38 @@ class MainActivity : AppCompatActivity() {
 
         webView.addJavascriptInterface(WebAppInterface(), "JiSeKaNative")
         
-        // 뒤에 타임스탬프를 붙여서 매번 새로운 주소인 것처럼 폰을 속임 (캐시 우회 끝판왕)
         val cacheBusterUrl = "https://ziseka-app.vercel.app?refresh=" + System.currentTimeMillis()
         webView.loadUrl(cacheBusterUrl)
     }
 
     inner class WebAppInterface {
+        
+        // 🚨 [신규] 1. 스트리밍 시작 (버퍼 초기화)
         @JavascriptInterface
-        fun sendImageData(base64Str: String) {
-            // 🚨 UI 스레드 마비(Freeze) 방지를 위한 백그라운드 스레드 분리!
+        fun startImageStream() {
+            base64Buffer.setLength(0)
+        }
+
+        // 🚨 [신규] 2. 데이터 조각 수신 (차곡차곡 모으기)
+        @JavascriptInterface
+        fun appendImageChunk(chunk: String) {
+            base64Buffer.append(chunk)
+        }
+
+        // 🚨 [신규] 3. 스트리밍 종료 및 AI 추론 시작
+        @JavascriptInterface
+        fun finishImageStream() {
             Thread {
                 try {
-                    val pureBase64 = base64Str.substringAfter(",")
-                    val decodedByteArray = Base64.decode(pureBase64, Base64.DEFAULT)
+                    // 순수 Base64만 넘어오도록 JS에서 조치했으므로 substringAfter(",") 불필요
+                    val base64Str = base64Buffer.toString()
+                    val decoded = Base64.decode(base64Str, Base64.DEFAULT)
                     
-                    val bitmap = BitmapFactory.decodeByteArray(decodedByteArray, 0, decodedByteArray.size) 
+                    val bitmap = BitmapFactory.decodeByteArray(decoded, 0, decoded.size) 
                         ?: throw Exception("비트맵 변환 실패")
 
                     val cornersJson = runInference(bitmap)
 
-                    // 추론 결과를 다시 메인 스레드(UI)로 안전하게 전달
                     runOnUiThread {
                         webView.evaluateJavascript("window.receiveAICorners('$cornersJson')", null)
                     }
