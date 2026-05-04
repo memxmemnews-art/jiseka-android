@@ -12,6 +12,8 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import androidx.appcompat.app.AppCompatActivity
 import org.opencv.android.OpenCVLoader
+import org.opencv.core.*
+import org.opencv.imgproc.Imgproc
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.support.common.FileUtil
 import java.nio.ByteBuffer
@@ -25,29 +27,27 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        // 🚨 1. OpenCV 엔진 가동 (상용 앱 퀄리티의 핵심)
+        // 🚨 1. OpenCV 엔진 가동
         if (OpenCVLoader.initLocal()) {
             Log.d("JiSeKa", "OpenCV 엔진 가동 성공!")
         } else {
             Log.e("JiSeKa", "OpenCV 엔진 가동 실패!")
         }
 
-        // 🚨 2. AI 모델(TFLite) 로드
+        // 🚨 2. AI 모델 로드
         try {
             val modelBuffer = FileUtil.loadMappedFile(this, "fairscan-segmentation-model.tflite")
             tflite = Interpreter(modelBuffer)
         } catch (e: Exception) {
             e.printStackTrace()
-            Log.e("JiSeKa", "TFLite 모델 로드 실패: ${e.message}")
         }
 
-        // 🚨 3. 웹뷰 세팅 (캐시 완벽 차단)
         webView = findViewById(R.id.webView)
         webView.settings.apply {
             javaScriptEnabled = true
             mediaPlaybackRequiresUserGesture = false
             domStorageEnabled = true
-            cacheMode = WebSettings.LOAD_NO_CACHE
+            cacheMode = WebSettings.LOAD_NO_CACHE 
         }
         
         webView.webChromeClient = object : WebChromeClient() {
@@ -56,17 +56,11 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // 🚨 4. 웹과 안드로이드를 연결하는 브릿지 장착
         webView.addJavascriptInterface(WebAppInterface(), "JiSeKaNative")
-        
-        // Vercel 웹앱 호출 (항상 최신 버전 강제 로딩)
         val cacheBusterUrl = "https://ziseka-app.vercel.app?refresh=" + System.currentTimeMillis()
         webView.loadUrl(cacheBusterUrl)
     }
 
-    // ==========================================
-    // 🌐 웹 ↔ 안드로이드 스트리밍 통신 브릿지
-    // ==========================================
     inner class WebAppInterface {
         private var imageBuffer = StringBuilder()
 
@@ -83,36 +77,29 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun finishImageStream() {
             val base64Str = imageBuffer.toString()
-            
-            // UI가 멈추지 않도록 무거운 연산은 백그라운드 스레드에서 실행
             Thread {
                 try {
                     val decodedByteArray = Base64.decode(base64Str, Base64.DEFAULT)
                     val bitmap = BitmapFactory.decodeByteArray(decodedByteArray, 0, decodedByteArray.size) 
                         ?: throw Exception("비트맵 변환 실패")
 
-                    // AI 마스킹 연산 시작!
                     val cornersJson = runInference(bitmap)
-                    
-                    // 연산 결과를 웹으로 돌려주기 (UI 스레드에서 실행 필수)
+
                     runOnUiThread {
                         webView.evaluateJavascript("window.receiveAICorners('$cornersJson')", null)
                     }
                 } catch (e: Throwable) { 
                     val safeMsg = e.message?.replace(Regex("[^a-zA-Z0-9가-힣 ]"), "_") ?: "Error"
                     runOnUiThread {
-                        webView.evaluateJavascript("alert('AI 마스킹 오류: $safeMsg'); window.receiveAICorners('[]');", null)
+                        webView.evaluateJavascript("alert('AI 연산 오류: $safeMsg'); window.receiveAICorners('[]');", null)
                     }
                 }
             }.start()
         }
     }
 
-    // ==========================================
-    // 🧠 AI 연산 및 OpenCV 정밀 마스킹 (Masterpiece)
-    // ==========================================
     private fun runInference(bitmap: Bitmap): String {
-        if (tflite == null) throw Exception("TFLite 누락")
+        if (tflite == null) throw Exception("TFLite 모델 누락")
 
         val inputSize = 256
         val resizedBitmap = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
@@ -139,115 +126,61 @@ class MainActivity : AppCompatActivity() {
         tflite?.run(inputBuffer, outputBuffer)
         outputBuffer.rewind()
 
-        val maskMat = org.opencv.core.Mat(inputSize, inputSize, org.opencv.core.CvType.CV_8UC1)
-        val hierarchy = org.opencv.core.Mat()
-        var contour2f: org.opencv.core.MatOfPoint2f? = null
+        // OpenCV Mat 객체들 선언 (메모리 해제를 위해 밖으로 분리)
+        val maskMat = Mat(inputSize, inputSize, CvType.CV_8UC1)
+        val hierarchy = Mat()
+        var contour2f: MatOfPoint2f? = null
+        var box2f: MatOfPoint2f? = null
 
         try {
-            // 🔥 1. Binary mask 생성
+            // 🔥 1. 마스크 → Mat 변환
             val maskData = ByteArray(inputSize * inputSize)
             var idx = 0
             for (y in 0 until inputSize) {
                 for (x in 0 until inputSize) {
                     val conf = outputBuffer.float
-                    maskData[idx++] = if (conf > 0.45f) 255.toByte() else 0
+                    maskData[idx++] = if (conf > 0.45f) 255.toByte() else 0.toByte()
                 }
             }
             maskMat.put(0, 0, maskData)
 
-            // 🔥 2. 노이즈 제거 + 형태 보정
-            org.opencv.imgproc.Imgproc.medianBlur(maskMat, maskMat, 5)
-
-            val kernel = org.opencv.imgproc.Imgproc.getStructuringElement(
-                org.opencv.imgproc.Imgproc.MORPH_RECT,
-                org.opencv.core.Size(5.0, 5.0)
-            )
-            org.opencv.imgproc.Imgproc.morphologyEx(
-                maskMat, maskMat,
-                org.opencv.imgproc.Imgproc.MORPH_CLOSE,
-                kernel
-            )
+            // 🔥 2. 노이즈 제거 (ChatGPT 추천 반영)
+            Imgproc.medianBlur(maskMat, maskMat, 5)
 
             // 🔥 3. Contour 추출
-            val contours = ArrayList<org.opencv.core.MatOfPoint>()
-            org.opencv.imgproc.Imgproc.findContours(
+            val contours = ArrayList<MatOfPoint>()
+            Imgproc.findContours(
                 maskMat,
                 contours,
                 hierarchy,
-                org.opencv.imgproc.Imgproc.RETR_EXTERNAL,
-                org.opencv.imgproc.Imgproc.CHAIN_APPROX_SIMPLE
+                Imgproc.RETR_EXTERNAL,
+                Imgproc.CHAIN_APPROX_SIMPLE
             )
 
             if (contours.isEmpty()) return "[]"
 
             // 🔥 4. 가장 큰 contour 선택
-            val largest = contours.maxByOrNull {
-                org.opencv.imgproc.Imgproc.contourArea(it)
-            } ?: return "[]"
+            val largestContour = contours.maxByOrNull { Imgproc.contourArea(it) } ?: return "[]"
+            contour2f = MatOfPoint2f(*largestContour.toArray())
 
-            val area = org.opencv.imgproc.Imgproc.contourArea(largest)
-            if (area < 400) return "[]"
+            // 🔥 5. minAreaRect (ChatGPT 핵심 로직 반영)
+            val rect = Imgproc.minAreaRect(contour2f)
+            box2f = MatOfPoint2f()
+            Imgproc.boxPoints(rect, box2f)
+            val points = box2f.toArray()
 
-            // 🔥 5. 비율 필터 (번호판 형태 확인)
-            val rect = org.opencv.imgproc.Imgproc.boundingRect(largest)
-            val ratio = rect.width.toFloat() / rect.height.toFloat()
-            if (ratio < 2.0f || ratio > 6.0f) return "[]"
+            // 🚨 제미나이 보완: 텍스처 꼬임 방지를 위한 기하학적 정렬 (atan2)
+            val center = points.reduce { acc, p -> Point(acc.x + p.x, acc.y + p.y) }
+                .let { Point(it.x / 4, it.y / 4) }
 
-            // 🔥 6. convex hull로 contour 안정화 (잔굴곡 제거)
-            val hull = org.opencv.core.MatOfInt()
-            org.opencv.imgproc.Imgproc.convexHull(largest, hull)
-
-            val hullPoints = mutableListOf<org.opencv.core.Point>()
-            for (i in 0 until hull.rows()) {
-                val index = hull.get(i, 0)[0].toInt()
-                hullPoints.add(largest.toArray()[index])
-            }
-
-            contour2f = org.opencv.core.MatOfPoint2f(*hullPoints.toTypedArray())
-
-            // 🔥 7. epsilon 자동 튜닝 (4점이 나올 때까지 루프)
-            val peri = org.opencv.imgproc.Imgproc.arcLength(contour2f, true)
-            var finalPoints: Array<org.opencv.core.Point>? = null
-
-            for (ratioEps in listOf(0.01, 0.02, 0.03, 0.04)) {
-                val approx = org.opencv.core.MatOfPoint2f()
-                org.opencv.imgproc.Imgproc.approxPolyDP(
-                    contour2f, approx, ratioEps * peri, true
-                )
-
-                if (approx.total() == 4L) {
-                    finalPoints = approx.toArray()
-                    approx.release()
-                    break
-                }
-                approx.release()
-            }
-
-            val scaleX = bitmap.width.toFloat() / inputSize
-            val scaleY = bitmap.height.toFloat() / inputSize
-
-            // 🔥 8. fallback (끝내 4점을 찾지 못한 경우 기본 사각형 반환)
-            if (finalPoints == null) {
-                val minX = rect.x * scaleX
-                val minY = rect.y * scaleY
-                val maxX = (rect.x + rect.width) * scaleX
-                val maxY = (rect.y + rect.height) * scaleY
-
-                return "[{\"x\": $minX, \"y\": $minY}, {\"x\": $maxX, \"y\": $minY}, {\"x\": $maxX, \"y\": $maxY}, {\"x\": $minX, \"y\": $maxY}]"
-            }
-
-            // 🔥 9. robust point ordering (각도 기반으로 좌상/우상/우하/좌하 정렬)
-            val center = finalPoints.reduce { acc, p ->
-                org.opencv.core.Point(acc.x + p.x, acc.y + p.y)
-            }.let {
-                org.opencv.core.Point(it.x / 4, it.y / 4)
-            }
-
-            val ordered = finalPoints.sortedBy {
+            val ordered = points.sortedBy {
                 kotlin.math.atan2(it.y - center.y, it.x - center.x)
             }
 
-            // 🔥 10. 원본 사진 크기로 좌표 변환 후 JSON 변환
+            // 🔥 6. 원본 크기로 스케일 복원 및 JSON 직렬화
+            val scaleX = bitmap.width.toFloat() / inputSize
+            val scaleY = bitmap.height.toFloat() / inputSize
+
             return ordered.joinToString(
                 separator = ", ",
                 prefix = "[",
@@ -257,10 +190,11 @@ class MainActivity : AppCompatActivity() {
             }
 
         } finally {
-            // 메모리 누수 방지를 위한 자원 해제 (매우 중요)
+            // 🚨 제미나이 보완: 네이티브 메모리 누수 완벽 방어 (매우 중요)
             maskMat.release()
             hierarchy.release()
             contour2f?.release()
+            box2f?.release()
         }
     }
 }
