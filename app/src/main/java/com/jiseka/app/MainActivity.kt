@@ -27,14 +27,14 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        // 🚨 1. OpenCV 엔진 가동
+        // 1. OpenCV 엔진 가동
         if (OpenCVLoader.initLocal()) {
             Log.d("JiSeKa", "OpenCV 엔진 가동 성공!")
         } else {
             Log.e("JiSeKa", "OpenCV 엔진 가동 실패!")
         }
 
-        // 🚨 2. AI 모델 로드
+        // 2. AI 모델(TFLite) 로드
         try {
             val modelBuffer = FileUtil.loadMappedFile(this, "fairscan-segmentation-model.tflite")
             tflite = Interpreter(modelBuffer)
@@ -43,7 +43,7 @@ class MainActivity : AppCompatActivity() {
             Log.e("JiSeKa", "TFLite 모델 로드 실패: ${e.message}")
         }
 
-        // 🚨 3. 웹뷰 세팅 (캐시 완벽 차단)
+        // 3. 웹뷰 세팅 (캐시 완벽 차단 및 성능 최적화)
         webView = findViewById(R.id.webView)
         webView.settings.apply {
             javaScriptEnabled = true
@@ -59,6 +59,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         webView.addJavascriptInterface(WebAppInterface(), "JiSeKaNative")
+        
+        // Vercel 웹앱 호출 (항상 최신 버전 강제 로딩)
         val cacheBusterUrl = "https://ziseka-app.vercel.app?refresh=" + System.currentTimeMillis()
         webView.loadUrl(cacheBusterUrl)
     }
@@ -84,10 +86,12 @@ class MainActivity : AppCompatActivity() {
             val base64Str = imageBuffer.toString()
             Thread {
                 try {
+                    // Base64 문자열을 바이너리로 복원
                     val decodedByteArray = Base64.decode(base64Str, Base64.DEFAULT)
                     val bitmap = BitmapFactory.decodeByteArray(decodedByteArray, 0, decodedByteArray.size) 
                         ?: throw Exception("비트맵 변환 실패")
 
+                    // AI 및 OpenCV 연산 실행
                     val cornersJson = runInference(bitmap)
 
                     runOnUiThread {
@@ -104,13 +108,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ==========================================
-    // 🧠 AI 연산 및 OpenCV 정밀 마스킹 (궁극의 튜닝 버전)
+    // 🧠 AI 연산 및 OpenCV 정밀 마스킹
     // ==========================================
     private fun runInference(bitmap: Bitmap): String {
         if (tflite == null) throw Exception("TFLite 누락")
 
         val inputSize = 256
-        val resizedBitmap = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
+        
+        // 1. 비율 왜곡 방지를 위한 패딩 리사이즈 (정확도 향상의 핵심)
+        val resizedBitmap = resizeWithPadding(bitmap, inputSize, inputSize)
 
         val inputBuffer = ByteBuffer.allocateDirect(4 * inputSize * inputSize * 3)
         inputBuffer.order(ByteOrder.nativeOrder())
@@ -141,54 +147,49 @@ class MainActivity : AppCompatActivity() {
         var box2f: MatOfPoint2f? = null
 
         try {
-            // 🔥 1. Binary mask 생성 (어두운 주차장 대응: 0.25f)
+            // 2. Threshold (그릴 오인식 방지를 위해 0.45f로 상향 튜닝)
             val maskData = ByteArray(inputSize * inputSize)
             var idx = 0
             for (y in 0 until inputSize) {
                 for (x in 0 until inputSize) {
                     val conf = outputBuffer.float
-                    maskData[idx++] = if (conf > 0.25f) 255.toByte() else 0.toByte()
+                    maskData[idx++] = if (conf > 0.45f) 255.toByte() else 0.toByte()
                 }
             }
             maskMat.put(0, 0, maskData)
 
-            // 🔥 2. 노이즈 제거 (디테일 뭉개짐 방지: 3x3 커널)
+            // 3. 노이즈 제거 및 형태 보정
             Imgproc.medianBlur(maskMat, maskMat, 3)
             val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
             Imgproc.morphologyEx(maskMat, maskMat, Imgproc.MORPH_CLOSE, kernel)
 
-            // 🔥 3. Contour 추출
             val contours = ArrayList<MatOfPoint>()
-            Imgproc.findContours(
-                maskMat, contours, hierarchy,
-                Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE
-            )
+            Imgproc.findContours(maskMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
             if (contours.isEmpty()) return "[]"
 
-            // 🔥 4. 비율 필터링: 가로가 세로보다 1.5배~7배 긴 "번호판 모양"만 통과!
+            // 번호판 비율 필터링 (가로가 세로보다 1.5~7배 긴 것)
             val filteredContours = contours.filter {
                 val rect = Imgproc.boundingRect(it)
                 val ratio = rect.width.toFloat() / rect.height.toFloat()
                 ratio in 1.5f..7.0f 
             }
 
-            // 필터링 통과한 것 중 가장 큰 영역 선택 (없으면 전체 중 가장 큰 것)
             val targetContour = if (filteredContours.isNotEmpty()) {
                 filteredContours.maxByOrNull { Imgproc.contourArea(it) }!!
             } else {
                 contours.maxByOrNull { Imgproc.contourArea(it) }!!
             }
 
-            // 🔥 5. approxPolyDP로 예리하게 4점 깎아내기 (가장 정확한 윤곽선)
+            // 4. approxPolyDP 정밀 추출 (0.015 계수 적용)
             contour2f = MatOfPoint2f(*targetContour.toArray())
             val peri = Imgproc.arcLength(contour2f, true)
             approx2f = MatOfPoint2f()
-            Imgproc.approxPolyDP(contour2f, approx2f, 0.02 * peri, true)
+            Imgproc.approxPolyDP(contour2f, approx2f, 0.015 * peri, true)
 
             var points = approx2f.toArray()
 
-            // 🔥 6. 4점이 안 나올 경우의 최후의 보루: minAreaRect 자동 방어
+            // 5. 4점이 안 나올 경우 fallback (minAreaRect로 보정)
             if (points.size != 4) {
                 val rect = Imgproc.minAreaRect(contour2f)
                 box2f = MatOfPoint2f()
@@ -196,35 +197,44 @@ class MainActivity : AppCompatActivity() {
                 points = box2f.toArray()
             }
 
-            // 🔥 7. 꼬임 원천 차단: 물리적 4점 정렬 (atan2 제거, 순수 위치 기반)
+            // 6. 물리적 위치 기반 정렬 (좌상 -> 우상 -> 우하 -> 좌하)
             val sortedByY = points.sortedBy { it.y }
-            // 상단 2점: X가 작은 게 좌상, 큰 게 우상
             val top = sortedByY.take(2).sortedBy { it.x } 
-            // 하단 2점: X가 큰 게 우하, 작은 게 좌하
             val bottom = sortedByY.takeLast(2).sortedByDescending { it.x } 
-            
-            // OpenCV.js가 요구하는 완벽한 순서: [좌상, 우상, 우하, 좌하]
             val orderedPoints = listOf(top[0], top[1], bottom[0], bottom[1])
 
-            // 🔥 8. 원본 해상도 스케일로 복원 및 JSON 직렬화
-            val scaleX = bitmap.width.toFloat() / inputSize
-            val scaleY = bitmap.height.toFloat() / inputSize
+            // 7. 패딩을 감안한 원본 좌표 스케일 복원
+            val scale = Math.max(bitmap.width.toFloat() / inputSize, bitmap.height.toFloat() / inputSize)
+            val padX = (inputSize - (bitmap.width / scale)) / 2f
+            val padY = (inputSize - (bitmap.height / scale)) / 2f
 
-            return orderedPoints.joinToString(
-                separator = ", ",
-                prefix = "[",
-                postfix = "]"
-            ) {
-                "{\"x\": ${it.x * scaleX}, \"y\": ${it.y * scaleY}}"
+            return orderedPoints.joinToString(separator = ", ", prefix = "[", postfix = "]") {
+                "{\"x\": ${(it.x - padX) * scale}, \"y\": ${(it.y - padY) * scale}}"
             }
 
         } finally {
-            // 메모리 누수 완벽 차단
+            // 메모리 누수 방지
             maskMat.release()
             hierarchy.release()
             contour2f?.release()
             approx2f?.release()
             box2f?.release()
         }
+    }
+
+    // 비율 왜곡을 방지하면서 검은색 여백을 채우는 리사이즈 함수
+    private fun resizeWithPadding(bitmap: Bitmap, width: Int, height: Int): Bitmap {
+        val scale = Math.min(width.toFloat() / bitmap.width, height.toFloat() / bitmap.height)
+        val scaledWidth = Math.round(scale * bitmap.width)
+        val scaledHeight = Math.round(scale * bitmap.height)
+
+        val scaledBitmap = Bitmap.createScaledBitmap(bitmap, scaledWidth, scaledHeight, true)
+        val paddedBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+
+        val canvas = android.graphics.Canvas(paddedBitmap)
+        canvas.drawColor(android.graphics.Color.BLACK) 
+        canvas.drawBitmap(scaledBitmap, (width - scaledWidth) / 2f, (height - scaledHeight) / 2f, null)
+
+        return paddedBitmap
     }
 }
