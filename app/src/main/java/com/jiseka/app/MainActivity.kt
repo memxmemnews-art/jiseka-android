@@ -104,7 +104,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ==========================================
-    // 🧠 AI 연산 및 OpenCV 정밀 마스킹 (ChatGPT 피드백 완벽 반영)
+    // 🧠 AI 연산 및 OpenCV 정밀 마스킹 (궁극의 튜닝 버전)
     // ==========================================
     private fun runInference(bitmap: Bitmap): String {
         if (tflite == null) throw Exception("TFLite 누락")
@@ -137,10 +137,11 @@ class MainActivity : AppCompatActivity() {
         val maskMat = Mat(inputSize, inputSize, CvType.CV_8UC1)
         val hierarchy = Mat()
         var contour2f: MatOfPoint2f? = null
+        var approx2f: MatOfPoint2f? = null
         var box2f: MatOfPoint2f? = null
 
         try {
-            // 🔥 1. Binary mask 생성 (어두운 곳 대응을 위해 0.25f로 파격 인하)
+            // 🔥 1. Binary mask 생성 (어두운 주차장 대응: 0.25f)
             val maskData = ByteArray(inputSize * inputSize)
             var idx = 0
             for (y in 0 until inputSize) {
@@ -151,7 +152,7 @@ class MainActivity : AppCompatActivity() {
             }
             maskMat.put(0, 0, maskData)
 
-            // 🔥 2. 노이즈 제거 (ChatGPT 권고: 5x5 커널 ➔ 3x3 커널로 축소하여 디테일 보존)
+            // 🔥 2. 노이즈 제거 (디테일 뭉개짐 방지: 3x3 커널)
             Imgproc.medianBlur(maskMat, maskMat, 3)
             val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
             Imgproc.morphologyEx(maskMat, maskMat, Imgproc.MORPH_CLOSE, kernel)
@@ -163,45 +164,49 @@ class MainActivity : AppCompatActivity() {
                 Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE
             )
 
-            if (contours.isEmpty()) {
-                Log.d("JiSeKa", "Contour 0개 검출")
-                return "[]"
-            }
+            if (contours.isEmpty()) return "[]"
 
-            // 🔥 4. 비율 필터링: 무조건 큰 게 아니라, 번호판처럼 "길쭉한" 녀석들만 남긴다!
+            // 🔥 4. 비율 필터링: 가로가 세로보다 1.5배~7배 긴 "번호판 모양"만 통과!
             val filteredContours = contours.filter {
                 val rect = Imgproc.boundingRect(it)
-                // 한국 번호판은 보통 가로가 세로보다 2~6배 길다
                 val ratio = rect.width.toFloat() / rect.height.toFloat()
                 ratio in 1.5f..7.0f 
             }
 
-            // 필터링 후 남은 것들 중 가장 큰 것을 선택 (다 걸러졌으면 그냥 제일 큰 거 선택)
+            // 필터링 통과한 것 중 가장 큰 영역 선택 (없으면 전체 중 가장 큰 것)
             val targetContour = if (filteredContours.isNotEmpty()) {
                 filteredContours.maxByOrNull { Imgproc.contourArea(it) }!!
             } else {
                 contours.maxByOrNull { Imgproc.contourArea(it) }!!
             }
 
-            // 🚨 5. minAreaRect (기울어진 사각형)
+            // 🔥 5. approxPolyDP로 예리하게 4점 깎아내기 (가장 정확한 윤곽선)
             contour2f = MatOfPoint2f(*targetContour.toArray())
-            val rect = Imgproc.minAreaRect(contour2f)
-            
-            box2f = MatOfPoint2f()
-            Imgproc.boxPoints(rect, box2f)
-            val points = box2f.toArray()
+            val peri = Imgproc.arcLength(contour2f, true)
+            approx2f = MatOfPoint2f()
+            Imgproc.approxPolyDP(contour2f, approx2f, 0.02 * peri, true)
 
-            // 🔥 6. 가장 치명적이었던 꼬임 버그 해결: 확실한 물리적 좌표 정렬 (ChatGPT 방식)
+            var points = approx2f.toArray()
+
+            // 🔥 6. 4점이 안 나올 경우의 최후의 보루: minAreaRect 자동 방어
+            if (points.size != 4) {
+                val rect = Imgproc.minAreaRect(contour2f)
+                box2f = MatOfPoint2f()
+                Imgproc.boxPoints(rect, box2f)
+                points = box2f.toArray()
+            }
+
+            // 🔥 7. 꼬임 원천 차단: 물리적 4점 정렬 (atan2 제거, 순수 위치 기반)
             val sortedByY = points.sortedBy { it.y }
-            // 위쪽 2개 점 중 x가 작은게 좌상, 큰게 우상
+            // 상단 2점: X가 작은 게 좌상, 큰 게 우상
             val top = sortedByY.take(2).sortedBy { it.x } 
-            // 아래쪽 2개 점 중 x가 큰게 우하, 작은게 좌하
+            // 하단 2점: X가 큰 게 우하, 작은 게 좌하
             val bottom = sortedByY.takeLast(2).sortedByDescending { it.x } 
             
-            // OpenCV.js가 사랑하는 완벽한 순서: [좌상, 우상, 우하, 좌하]
+            // OpenCV.js가 요구하는 완벽한 순서: [좌상, 우상, 우하, 좌하]
             val orderedPoints = listOf(top[0], top[1], bottom[0], bottom[1])
 
-            // 🔥 7. 원본 크기 좌표로 복원 및 JSON 변환
+            // 🔥 8. 원본 해상도 스케일로 복원 및 JSON 직렬화
             val scaleX = bitmap.width.toFloat() / inputSize
             val scaleY = bitmap.height.toFloat() / inputSize
 
@@ -214,9 +219,11 @@ class MainActivity : AppCompatActivity() {
             }
 
         } finally {
+            // 메모리 누수 완벽 차단
             maskMat.release()
             hierarchy.release()
             contour2f?.release()
+            approx2f?.release()
             box2f?.release()
         }
     }
