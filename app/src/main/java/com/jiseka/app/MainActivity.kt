@@ -60,8 +60,8 @@ class MainActivity : AppCompatActivity() {
             domStorageEnabled = true // Vercel 앱 내 로컬 저장소 버그 방지
         }
         
-        // 🚨 본인의 실제 Vercel 주소로 변경하세요!
-        webView.loadUrl("https://your-vercel-app-url.vercel.app") 
+        // 
+        webView.loadUrl("https://ziseka-app.vercel.app")
 
         cameraExecutor = Executors.newSingleThreadExecutor()
 
