@@ -1,15 +1,19 @@
 package com.jiseka.app
 
+import android.Manifest
 import android.annotation.SuppressLint
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.PointF
 import android.os.Bundle
 import android.util.Log
 import android.webkit.WebView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
@@ -25,37 +29,68 @@ class MainActivity : AppCompatActivity() {
     private lateinit var viewFinder: PreviewView
     private lateinit var cameraExecutor: ExecutorService
 
-    // Throttling: 초당 약 5~6회 OCR 및 JS 호출
     private var lastAnalysisTime = 0L
     private val analysisInterval = 180L
 
-    // EMA Smoothing 및 Persistence
     private var smoothedPoints = Array(4) { PointF(0f, 0f) }
     private val alpha = 0.25f 
     private var isFirstDetection = true
     private var lastDetectionTime = 0L
     private val persistenceTimeout = 600L
 
-    // ML Kit 인식기
     private val recognizer by lazy {
         TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
+    }
+
+    companion object {
+        private const val CAMERA_PERMISSION_REQUEST_CODE = 1001
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        // 🚨 이 부분이 추가되어야 에러가 발생하지 않습니다!
         viewFinder = findViewById(R.id.viewFinder)
         webView = findViewById(R.id.webView)
 
+        // WebView 설정 최적화 (Vercel React 앱 연동용)
         webView.setBackgroundColor(Color.TRANSPARENT)
-        webView.settings.javaScriptEnabled = true
-        // 🚨 Vercel 주소가 맞는지 꼭 확인하세요!
+        webView.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true // Vercel 앱 내 로컬 저장소 버그 방지
+        }
+        
+        // 🚨 본인의 실제 Vercel 주소로 변경하세요!
         webView.loadUrl("https://your-vercel-app-url.vercel.app") 
 
         cameraExecutor = Executors.newSingleThreadExecutor()
-        startCamera()
+
+        // 런타임 카메라 권한 체크
+        if (allPermissionsGranted()) {
+            startCamera()
+        } else {
+            ActivityCompat.requestPermissions(
+                this, arrayOf(Manifest.permission.CAMERA), CAMERA_PERMISSION_REQUEST_CODE
+            )
+        }
+    }
+
+    private fun allPermissionsGranted() = arrayOf(Manifest.permission.CAMERA).all {
+        ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == CAMERA_PERMISSION_REQUEST_CODE) {
+            if (allPermissionsGranted()) {
+                startCamera()
+            } else {
+                Toast.makeText(this, "카메라 권한이 필요합니다.", Toast.LENGTH_SHORT).show()
+                finish()
+            }
+        }
     }
 
     private fun startCamera() {
@@ -171,10 +206,8 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             }
-            .addOnFailureListener {
-                imageProxy.close() 
-            }
             .addOnCompleteListener {
+                // 성공하든 실패하든 무조건 닫히도록 하나로 정리
                 imageProxy.close() 
             }
     }
