@@ -3,7 +3,6 @@ package com.jiseka.app
 import android.annotation.SuppressLint
 import android.graphics.Color
 import android.graphics.PointF
-import android.graphics.Rect
 import android.os.Bundle
 import android.util.Log
 import android.webkit.WebView
@@ -26,18 +25,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var viewFinder: PreviewView
     private lateinit var cameraExecutor: ExecutorService
 
-    // 🛡️ [방어막 1] Throttling: 초당 약 5~6회 OCR 및 JS 호출
+    // Throttling: 초당 약 5~6회 OCR 및 JS 호출
     private var lastAnalysisTime = 0L
     private val analysisInterval = 180L
 
-    // 🛡️ [방어막 2] EMA Smoothing 및 Persistence(유지)
+    // EMA Smoothing 및 Persistence
     private var smoothedPoints = Array(4) { PointF(0f, 0f) }
-    private val alpha = 0.25f // 살짝 더 빠르게 따라오도록 0.25로 조정
+    private val alpha = 0.25f 
     private var isFirstDetection = true
     private var lastDetectionTime = 0L
-    private val persistenceTimeout = 600L // 0.6초 동안 안 보이면 마스크 지우기
+    private val persistenceTimeout = 600L
 
-    // ML Kit 인식기 싱글톤
+    // ML Kit 인식기
     private val recognizer by lazy {
         TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
     }
@@ -46,12 +45,14 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        // 🚨 이 부분이 추가되어야 에러가 발생하지 않습니다!
         viewFinder = findViewById(R.id.viewFinder)
         webView = findViewById(R.id.webView)
 
         webView.setBackgroundColor(Color.TRANSPARENT)
         webView.settings.javaScriptEnabled = true
-        webView.loadUrl("https://your-vercel-app-url.vercel.app")
+        // 🚨 Vercel 주소가 맞는지 꼭 확인하세요!
+        webView.loadUrl("https://your-vercel-app-url.vercel.app") 
 
         cameraExecutor = Executors.newSingleThreadExecutor()
         startCamera()
@@ -73,13 +74,10 @@ class MainActivity : AppCompatActivity() {
                 .also {
                     it.setAnalyzer(cameraExecutor) { imageProxy ->
                         val currentTime = System.currentTimeMillis()
-                        
-                        // 1. OCR 횟수 제한 (발열 방지)
                         if (currentTime - lastAnalysisTime >= analysisInterval) {
                             processImageProxy(imageProxy)
                             lastAnalysisTime = currentTime
                         } else {
-                            // 🚨 [치명적 버그 해결 1] 분석 안 할 때 무조건 close!
                             imageProxy.close() 
                         }
                     }
@@ -96,7 +94,6 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("UnsafeOptInUsageError")
     private fun processImageProxy(imageProxy: ImageProxy) {
-        // 🚨 [치명적 버그 해결 2] image가 null일 때도 무조건 close() 호출하고 return
         val mediaImage = imageProxy.image
         if (mediaImage == null) {
             imageProxy.close()
@@ -108,8 +105,6 @@ class MainActivity : AppCompatActivity() {
 
         recognizer.process(image)
             .addOnSuccessListener { result ->
-                
-                // 🚨 [치명적 버그 해결 3] ROI 기반 탐색 (화면 중앙에서 가장 가까운 거대한 텍스트 찾기)
                 var bestBlock: Text.TextBlock? = null
                 var bestScore = Float.MAX_VALUE
 
@@ -122,15 +117,11 @@ class MainActivity : AppCompatActivity() {
                 for (block in result.textBlocks) {
                     val box = block.boundingBox ?: continue
                     
-                    // 가이드 박스 영역(중앙)과의 거리 계산
                     val blockCenterX = box.exactCenterX()
                     val blockCenterY = box.exactCenterY()
                     val distToCenter = abs(centerX - blockCenterX) + abs(centerY - blockCenterY)
                     
                     val area = box.width() * box.height()
-                    
-                    // 크기가 크고(면적), 화면 중앙에 가까울수록 점수가 낮음(좋은 점수)
-                    // (임의의 가중치 공식: 거리에 벌점, 면적에 보너스)
                     val score = distToCenter - (area * 0.1f) 
 
                     if (score < bestScore) {
@@ -141,14 +132,12 @@ class MainActivity : AppCompatActivity() {
 
                 val points = bestBlock?.cornerPoints
 
-                // 🚨 [치명적 버그 해결 4] Convex & Clockwise 검증 (순서 꼬임 방지)
                 if (points != null && points.size == 4) {
                     lastDetectionTime = System.currentTimeMillis()
 
                     val viewWidth = viewFinder.width.toFloat()
                     val viewHeight = viewFinder.height.toFloat()
 
-                    // PreviewView의 OutputTransform 기반 비율 계산 (가장 안전한 Scale 공식)
                     val scale = maxOf(viewWidth / imgW, viewHeight / imgH)
                     val offsetX = (viewWidth - imgW * scale) / 2f
                     val offsetY = (viewHeight - imgH * scale) / 2f
@@ -161,7 +150,6 @@ class MainActivity : AppCompatActivity() {
                         )
                     }
 
-                    // 🚨 [치명적 버그 해결 5] 깊은 복사(Deep Copy)를 통한 EMA 보정
                     if (isFirstDetection) {
                         for (i in 0..3) {
                             smoothedPoints[i] = PointF(currentPoints[i].x, currentPoints[i].y)
@@ -177,25 +165,23 @@ class MainActivity : AppCompatActivity() {
                     pushToWebView(smoothedPoints)
 
                 } else {
-                    // 🚨 [치명적 버그 해결 6] Persistence: 못 찾았더라도 0.6초간은 이전 마스크 유지
                     if (System.currentTimeMillis() - lastDetectionTime > persistenceTimeout) {
-                        isFirstDetection = true // 0.6초 넘게 안 보이면 초기화하고 화면에서 지움
+                        isFirstDetection = true 
                         pushToWebView(null)
                     }
                 }
             }
             .addOnFailureListener {
-                imageProxy.close() // 에러 나도 닫기
+                imageProxy.close() 
             }
             .addOnCompleteListener {
-                imageProxy.close() // 성공해도 닫기 (절대 멈춤 없음)
+                imageProxy.close() 
             }
     }
 
     private fun pushToWebView(points: Array<PointF>?) {
         runOnUiThread {
             if (points == null) {
-                // 0.6초 이상 놓치면 마스크 지우기
                 webView.evaluateJavascript("javascript:if(window.drawCarbonMask) window.drawCarbonMask([]);", null)
             } else {
                 val jsonCoords = """[
@@ -205,7 +191,6 @@ class MainActivity : AppCompatActivity() {
                     {"x": ${points[3].x}, "y": ${points[3].y}}
                 ]""".trimIndent()
                 
-                // 🚨 [치명적 버그 해결 7] JS Ready 체크 (window.drawCarbonMask가 있을 때만 호출)
                 webView.evaluateJavascript("javascript:if(window.drawCarbonMask) window.drawCarbonMask($jsonCoords);", null)
             }
         }
@@ -214,6 +199,6 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         cameraExecutor.shutdown()
-        recognizer.close() // 🚨 [치명적 버그 해결 8] 메모리 누수 방지
+        recognizer.close() 
     }
 }
