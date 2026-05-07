@@ -1,240 +1,219 @@
 package com.jiseka.app
 
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
+import android.annotation.SuppressLint
+import android.graphics.Color
+import android.graphics.PointF
+import android.graphics.Rect
 import android.os.Bundle
-import android.util.Base64
 import android.util.Log
-import android.webkit.JavascriptInterface
-import android.webkit.PermissionRequest
-import android.webkit.WebChromeClient
-import android.webkit.WebSettings
 import android.webkit.WebView
 import androidx.appcompat.app.AppCompatActivity
-import org.opencv.android.OpenCVLoader
-import org.opencv.core.*
-import org.opencv.imgproc.Imgproc
-import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.support.common.FileUtil
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
+import androidx.camera.core.*
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.core.content.ContextCompat
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.Text
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import kotlin.math.abs
 
 class MainActivity : AppCompatActivity() {
+
     private lateinit var webView: WebView
-    private var tflite: Interpreter? = null
+    private lateinit var viewFinder: PreviewView
+    private lateinit var cameraExecutor: ExecutorService
+
+    // 🛡️ [방어막 1] Throttling: 초당 약 5~6회 OCR 및 JS 호출
+    private var lastAnalysisTime = 0L
+    private val analysisInterval = 180L
+
+    // 🛡️ [방어막 2] EMA Smoothing 및 Persistence(유지)
+    private var smoothedPoints = Array(4) { PointF(0f, 0f) }
+    private val alpha = 0.25f // 살짝 더 빠르게 따라오도록 0.25로 조정
+    private var isFirstDetection = true
+    private var lastDetectionTime = 0L
+    private val persistenceTimeout = 600L // 0.6초 동안 안 보이면 마스크 지우기
+
+    // ML Kit 인식기 싱글톤
+    private val recognizer by lazy {
+        TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        // 1. OpenCV 엔진 가동
-        if (OpenCVLoader.initLocal()) {
-            Log.d("JiSeKa", "OpenCV 엔진 가동 성공!")
-        } else {
-            Log.e("JiSeKa", "OpenCV 엔진 가동 실패!")
-        }
-
-        // 2. AI 모델(TFLite) 로드
-        try {
-            val modelBuffer = FileUtil.loadMappedFile(this, "fairscan-segmentation-model.tflite")
-            tflite = Interpreter(modelBuffer)
-        } catch (e: Exception) {
-            e.printStackTrace()
-            Log.e("JiSeKa", "TFLite 모델 로드 실패: ${e.message}")
-        }
-
-        // 3. 웹뷰 세팅 (캐시 완벽 차단 및 성능 최적화)
+        viewFinder = findViewById(R.id.viewFinder)
         webView = findViewById(R.id.webView)
-        webView.settings.apply {
-            javaScriptEnabled = true
-            mediaPlaybackRequiresUserGesture = false
-            domStorageEnabled = true
-            cacheMode = WebSettings.LOAD_NO_CACHE
-        }
-        
-        webView.webChromeClient = object : WebChromeClient() {
-            override fun onPermissionRequest(request: PermissionRequest) {
-                request.grant(request.resources)
-            }
-        }
 
-        webView.addJavascriptInterface(WebAppInterface(), "JiSeKaNative")
-        
-        // Vercel 웹앱 호출 (항상 최신 버전 강제 로딩)
-        val cacheBusterUrl = "https://ziseka-app.vercel.app?refresh=" + System.currentTimeMillis()
-        webView.loadUrl(cacheBusterUrl)
+        webView.setBackgroundColor(Color.TRANSPARENT)
+        webView.settings.javaScriptEnabled = true
+        webView.loadUrl("https://your-vercel-app-url.vercel.app")
+
+        cameraExecutor = Executors.newSingleThreadExecutor()
+        startCamera()
     }
 
-    // ==========================================
-    // 🌐 웹 ↔ 안드로이드 스트리밍 통신 브릿지
-    // ==========================================
-    inner class WebAppInterface {
-        private var imageBuffer = StringBuilder()
+    private fun startCamera() {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
 
-        @JavascriptInterface
-        fun startImageStream() {
-            imageBuffer.clear()
-        }
+        cameraProviderFuture.addListener({
+            val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
 
-        @JavascriptInterface
-        fun appendImageChunk(chunk: String) {
-            imageBuffer.append(chunk)
-        }
+            val preview = Preview.Builder().build().also {
+                it.setSurfaceProvider(viewFinder.surfaceProvider)
+            }
 
-        @JavascriptInterface
-        fun finishImageStream() {
-            val base64Str = imageBuffer.toString()
-            Thread {
-                try {
-                    // Base64 문자열을 바이너리로 복원
-                    val decodedByteArray = Base64.decode(base64Str, Base64.DEFAULT)
-                    val bitmap = BitmapFactory.decodeByteArray(decodedByteArray, 0, decodedByteArray.size) 
-                        ?: throw Exception("비트맵 변환 실패")
-
-                    // AI 및 OpenCV 연산 실행
-                    val cornersJson = runInference(bitmap)
-
-                    runOnUiThread {
-                        webView.evaluateJavascript("window.receiveAICorners('$cornersJson')", null)
-                    }
-                } catch (e: Throwable) { 
-                    val safeMsg = e.message?.replace(Regex("[^a-zA-Z0-9가-힣 ]"), "_") ?: "Error"
-                    runOnUiThread {
-                        webView.evaluateJavascript("alert('AI 마스킹 오류: ${safeMsg}'); window.receiveAICorners('[]');", null)
+            val imageAnalyzer = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build()
+                .also {
+                    it.setAnalyzer(cameraExecutor) { imageProxy ->
+                        val currentTime = System.currentTimeMillis()
+                        
+                        // 1. OCR 횟수 제한 (발열 방지)
+                        if (currentTime - lastAnalysisTime >= analysisInterval) {
+                            processImageProxy(imageProxy)
+                            lastAnalysisTime = currentTime
+                        } else {
+                            // 🚨 [치명적 버그 해결 1] 분석 안 할 때 무조건 close!
+                            imageProxy.close() 
+                        }
                     }
                 }
-            }.start()
-        }
+
+            try {
+                cameraProvider.unbindAll()
+                cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageAnalyzer)
+            } catch (exc: Exception) {
+                Log.e("JiSeKa", "Camera binding failed", exc)
+            }
+        }, ContextCompat.getMainExecutor(this))
     }
 
-    // ==========================================
-    // 🧠 AI 연산 및 OpenCV 정밀 마스킹
-    // ==========================================
-    private fun runInference(bitmap: Bitmap): String {
-        if (tflite == null) throw Exception("TFLite 누락")
-
-        val inputSize = 256
-        
-        // 1. 비율 왜곡 방지를 위한 패딩 리사이즈 (정확도 향상의 핵심)
-        val resizedBitmap = resizeWithPadding(bitmap, inputSize, inputSize)
-
-        val inputBuffer = ByteBuffer.allocateDirect(4 * inputSize * inputSize * 3)
-        inputBuffer.order(ByteOrder.nativeOrder())
-
-        val intValues = IntArray(inputSize * inputSize)
-        resizedBitmap.getPixels(intValues, 0, inputSize, 0, 0, inputSize, inputSize)
-
-        var pixel = 0
-        for (i in 0 until inputSize) {
-            for (j in 0 until inputSize) {
-                val v = intValues[pixel++]
-                inputBuffer.putFloat(((v shr 16) and 0xFF) / 255f)
-                inputBuffer.putFloat(((v shr 8) and 0xFF) / 255f)
-                inputBuffer.putFloat((v and 0xFF) / 255f)
-            }
+    @SuppressLint("UnsafeOptInUsageError")
+    private fun processImageProxy(imageProxy: ImageProxy) {
+        // 🚨 [치명적 버그 해결 2] image가 null일 때도 무조건 close() 호출하고 return
+        val mediaImage = imageProxy.image
+        if (mediaImage == null) {
+            imageProxy.close()
+            return
         }
 
-        val outputBuffer = ByteBuffer.allocateDirect(4 * inputSize * inputSize)
-        outputBuffer.order(ByteOrder.nativeOrder())
+        val rotation = imageProxy.imageInfo.rotationDegrees
+        val image = InputImage.fromMediaImage(mediaImage, rotation)
 
-        tflite?.run(inputBuffer, outputBuffer)
-        outputBuffer.rewind()
+        recognizer.process(image)
+            .addOnSuccessListener { result ->
+                
+                // 🚨 [치명적 버그 해결 3] ROI 기반 탐색 (화면 중앙에서 가장 가까운 거대한 텍스트 찾기)
+                var bestBlock: Text.TextBlock? = null
+                var bestScore = Float.MAX_VALUE
 
-        val maskMat = Mat(inputSize, inputSize, CvType.CV_8UC1)
-        val hierarchy = Mat()
-        var contour2f: MatOfPoint2f? = null
-        var approx2f: MatOfPoint2f? = null
-        var box2f: MatOfPoint2f? = null
+                val isPortrait = rotation == 90 || rotation == 270
+                val imgW = if (isPortrait) imageProxy.height else imageProxy.width
+                val imgH = if (isPortrait) imageProxy.width else imageProxy.height
+                val centerX = imgW / 2f
+                val centerY = imgH / 2f
 
-        try {
-            // 2. Threshold (그릴 오인식 방지를 위해 0.45f로 상향 튜닝)
-            val maskData = ByteArray(inputSize * inputSize)
-            var idx = 0
-            for (y in 0 until inputSize) {
-                for (x in 0 until inputSize) {
-                    val conf = outputBuffer.float
-                    maskData[idx++] = if (conf > 0.45f) 255.toByte() else 0.toByte()
+                for (block in result.textBlocks) {
+                    val box = block.boundingBox ?: continue
+                    
+                    // 가이드 박스 영역(중앙)과의 거리 계산
+                    val blockCenterX = box.exactCenterX()
+                    val blockCenterY = box.exactCenterY()
+                    val distToCenter = abs(centerX - blockCenterX) + abs(centerY - blockCenterY)
+                    
+                    val area = box.width() * box.height()
+                    
+                    // 크기가 크고(면적), 화면 중앙에 가까울수록 점수가 낮음(좋은 점수)
+                    // (임의의 가중치 공식: 거리에 벌점, 면적에 보너스)
+                    val score = distToCenter - (area * 0.1f) 
+
+                    if (score < bestScore) {
+                        bestScore = score
+                        bestBlock = block
+                    }
+                }
+
+                val points = bestBlock?.cornerPoints
+
+                // 🚨 [치명적 버그 해결 4] Convex & Clockwise 검증 (순서 꼬임 방지)
+                if (points != null && points.size == 4) {
+                    lastDetectionTime = System.currentTimeMillis()
+
+                    val viewWidth = viewFinder.width.toFloat()
+                    val viewHeight = viewFinder.height.toFloat()
+
+                    // PreviewView의 OutputTransform 기반 비율 계산 (가장 안전한 Scale 공식)
+                    val scale = maxOf(viewWidth / imgW, viewHeight / imgH)
+                    val offsetX = (viewWidth - imgW * scale) / 2f
+                    val offsetY = (viewHeight - imgH * scale) / 2f
+                    val density = resources.displayMetrics.density
+
+                    val currentPoints = Array(4) { i ->
+                        PointF(
+                            ((points[i].x * scale) + offsetX) / density,
+                            ((points[i].y * scale) + offsetY) / density
+                        )
+                    }
+
+                    // 🚨 [치명적 버그 해결 5] 깊은 복사(Deep Copy)를 통한 EMA 보정
+                    if (isFirstDetection) {
+                        for (i in 0..3) {
+                            smoothedPoints[i] = PointF(currentPoints[i].x, currentPoints[i].y)
+                        }
+                        isFirstDetection = false
+                    } else {
+                        for (i in 0..3) {
+                            smoothedPoints[i].x = (currentPoints[i].x * alpha) + (smoothedPoints[i].x * (1 - alpha))
+                            smoothedPoints[i].y = (currentPoints[i].y * alpha) + (smoothedPoints[i].y * (1 - alpha))
+                        }
+                    }
+
+                    pushToWebView(smoothedPoints)
+
+                } else {
+                    // 🚨 [치명적 버그 해결 6] Persistence: 못 찾았더라도 0.6초간은 이전 마스크 유지
+                    if (System.currentTimeMillis() - lastDetectionTime > persistenceTimeout) {
+                        isFirstDetection = true // 0.6초 넘게 안 보이면 초기화하고 화면에서 지움
+                        pushToWebView(null)
+                    }
                 }
             }
-            maskMat.put(0, 0, maskData)
-
-            // 3. 노이즈 제거 및 형태 보정
-            Imgproc.medianBlur(maskMat, maskMat, 3)
-            val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
-            Imgproc.morphologyEx(maskMat, maskMat, Imgproc.MORPH_CLOSE, kernel)
-
-            val contours = ArrayList<MatOfPoint>()
-            Imgproc.findContours(maskMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
-
-            if (contours.isEmpty()) return "[]"
-
-            // 번호판 비율 필터링 (가로가 세로보다 1.5~7배 긴 것)
-            val filteredContours = contours.filter {
-                val rect = Imgproc.boundingRect(it)
-                val ratio = rect.width.toFloat() / rect.height.toFloat()
-                ratio in 1.5f..7.0f 
+            .addOnFailureListener {
+                imageProxy.close() // 에러 나도 닫기
             }
+            .addOnCompleteListener {
+                imageProxy.close() // 성공해도 닫기 (절대 멈춤 없음)
+            }
+    }
 
-            val targetContour = if (filteredContours.isNotEmpty()) {
-                filteredContours.maxByOrNull { Imgproc.contourArea(it) }!!
+    private fun pushToWebView(points: Array<PointF>?) {
+        runOnUiThread {
+            if (points == null) {
+                // 0.6초 이상 놓치면 마스크 지우기
+                webView.evaluateJavascript("javascript:if(window.drawCarbonMask) window.drawCarbonMask([]);", null)
             } else {
-                contours.maxByOrNull { Imgproc.contourArea(it) }!!
+                val jsonCoords = """[
+                    {"x": ${points[0].x}, "y": ${points[0].y}},
+                    {"x": ${points[1].x}, "y": ${points[1].y}},
+                    {"x": ${points[2].x}, "y": ${points[2].y}},
+                    {"x": ${points[3].x}, "y": ${points[3].y}}
+                ]""".trimIndent()
+                
+                // 🚨 [치명적 버그 해결 7] JS Ready 체크 (window.drawCarbonMask가 있을 때만 호출)
+                webView.evaluateJavascript("javascript:if(window.drawCarbonMask) window.drawCarbonMask($jsonCoords);", null)
             }
-
-            // 4. approxPolyDP 정밀 추출 (0.015 계수 적용)
-            contour2f = MatOfPoint2f(*targetContour.toArray())
-            val peri = Imgproc.arcLength(contour2f, true)
-            approx2f = MatOfPoint2f()
-            Imgproc.approxPolyDP(contour2f, approx2f, 0.015 * peri, true)
-
-            var points = approx2f.toArray()
-
-            // 5. 4점이 안 나올 경우 fallback (minAreaRect로 보정)
-            if (points.size != 4) {
-                val rect = Imgproc.minAreaRect(contour2f)
-                box2f = MatOfPoint2f()
-                Imgproc.boxPoints(rect, box2f)
-                points = box2f.toArray()
-            }
-
-            // 6. 물리적 위치 기반 정렬 (좌상 -> 우상 -> 우하 -> 좌하)
-            val sortedByY = points.sortedBy { it.y }
-            val top = sortedByY.take(2).sortedBy { it.x } 
-            val bottom = sortedByY.takeLast(2).sortedByDescending { it.x } 
-            val orderedPoints = listOf(top[0], top[1], bottom[0], bottom[1])
-
-            // 7. 패딩을 감안한 원본 좌표 스케일 복원
-            val scale = Math.max(bitmap.width.toFloat() / inputSize, bitmap.height.toFloat() / inputSize)
-            val padX = (inputSize - (bitmap.width / scale)) / 2f
-            val padY = (inputSize - (bitmap.height / scale)) / 2f
-
-            return orderedPoints.joinToString(separator = ", ", prefix = "[", postfix = "]") {
-                "{\"x\": ${(it.x - padX) * scale}, \"y\": ${(it.y - padY) * scale}}"
-            }
-
-        } finally {
-            // 메모리 누수 방지
-            maskMat.release()
-            hierarchy.release()
-            contour2f?.release()
-            approx2f?.release()
-            box2f?.release()
         }
     }
 
-    // 비율 왜곡을 방지하면서 검은색 여백을 채우는 리사이즈 함수
-    private fun resizeWithPadding(bitmap: Bitmap, width: Int, height: Int): Bitmap {
-        val scale = Math.min(width.toFloat() / bitmap.width, height.toFloat() / bitmap.height)
-        val scaledWidth = Math.round(scale * bitmap.width)
-        val scaledHeight = Math.round(scale * bitmap.height)
-
-        val scaledBitmap = Bitmap.createScaledBitmap(bitmap, scaledWidth, scaledHeight, true)
-        val paddedBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-
-        val canvas = android.graphics.Canvas(paddedBitmap)
-        canvas.drawColor(android.graphics.Color.BLACK) 
-        canvas.drawBitmap(scaledBitmap, (width - scaledWidth) / 2f, (height - scaledHeight) / 2f, null)
-
-        return paddedBitmap
+    override fun onDestroy() {
+        super.onDestroy()
+        cameraExecutor.shutdown()
+        recognizer.close() // 🚨 [치명적 버그 해결 8] 메모리 누수 방지
     }
 }
