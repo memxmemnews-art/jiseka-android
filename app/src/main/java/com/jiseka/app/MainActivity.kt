@@ -203,7 +203,6 @@ class MainActivity : AppCompatActivity() {
                         originalBmp = rotated
                     }
 
-                    // 🚨 이전 Bitmap 해제하여 연속 촬영 메모리 누수 완벽 방어
                     lastCapturedBitmap?.recycle()
                     lastCapturedBitmap = downscaleBitmapIfNeeded(originalBmp, 800)
                     
@@ -211,7 +210,6 @@ class MainActivity : AppCompatActivity() {
                     lastCapturedBitmap!!.compress(Bitmap.CompressFormat.JPEG, 60, baos)
                     val base64Img = "data:image/jpeg;base64," + Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
 
-                    // 🚨 치명적 버그 수정: 문자열 직접 보간 대신 JSONObject.quote 사용
                     val safeBase64 = JSONObject.quote(base64Img)
                     val js = "javascript:window.onPhotoCaptured($safeBase64)"
                     
@@ -258,7 +256,6 @@ class MainActivity : AppCompatActivity() {
 
         val inputImage = InputImage.fromBitmap(rectifiedBmp, 0)
         recognizer.process(inputImage).addOnCompleteListener { task ->
-            // 🚨 번호판 정규식 기반 강력한 OCR 검증 (공백 제거 후 검사)
             val text = task.result.text.replace(Regex("\\s+"), "")
             val plateRegex = Regex("\\d{2,3}[가-힣]\\d{4}")
             
@@ -292,7 +289,7 @@ class MainActivity : AppCompatActivity() {
         if (isFinishing || isDestroyed) return
 
         runOnUiThread {
-            val js = "window.onNativeSuccess(${JSONObject.quote(payload.toString())})"
+            val js = "javascript:window.onNativeSuccess(${JSONObject.quote(payload.toString())})"
             webView.evaluateJavascript(js, null)
         }
     }
@@ -318,7 +315,7 @@ class MainActivity : AppCompatActivity() {
             if (roiW <= 0 || roiH <= 0) return null
             roiMat = org.opencv.core.Mat(mat, org.opencv.core.Rect(roiX, roiY, roiW, roiH))
             
-            val roiArea = roiW * roiH // 🚨 가이드 영역의 전체 면적
+            val roiArea = roiW * roiH 
             
             gray = org.opencv.core.Mat(); org.opencv.imgproc.Imgproc.cvtColor(roiMat, gray, org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY)
             edges = org.opencv.core.Mat(); org.opencv.imgproc.Imgproc.Canny(gray, edges, 50.0, 150.0)
@@ -330,7 +327,6 @@ class MainActivity : AppCompatActivity() {
                 val rw = minRect.size.width; val rh = minRect.size.height
                 val rectArea = rw * rh
                 
-                // 🚨 면적 제한: 가이드 박스의 5% 미만인 자잘한 외곽선(라디에이터 그릴 등) 원천 무시
                 if (rectArea < roiArea * 0.05) continue
                 
                 val actualArea = org.opencv.imgproc.Imgproc.contourArea(contour)
@@ -379,8 +375,22 @@ class MainActivity : AppCompatActivity() {
         finally { bgMat?.release(); dest?.release() }
     }
 
+    // 🚨 핵심 수정: ImageFormat.JPEG 포맷 정상 디코딩 로직 추가!
     @SuppressLint("UnsafeOptInUsageError")
     private fun ImageProxy.toBitmapExt(): Bitmap {
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = 2
+            inPreferredConfig = Bitmap.Config.RGB_565
+        }
+
+        if (format == ImageFormat.JPEG) {
+            val buffer = planes[0].buffer
+            val bytes = ByteArray(buffer.remaining())
+            buffer.get(bytes)
+            return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options) 
+                ?: throw IllegalStateException("JPEG Bitmap decode failed")
+        } 
+        
         val yBuffer = planes[0].buffer; val uBuffer = planes[1].buffer; val vBuffer = planes[2].buffer
         val ySize = yBuffer.remaining(); val uSize = uBuffer.remaining(); val vSize = vBuffer.remaining()
         val nv21 = ByteArray(ySize + uSize + vSize)
@@ -390,12 +400,7 @@ class MainActivity : AppCompatActivity() {
         yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 100, out)
         val imageBytes = out.toByteArray()
         
-        val options = BitmapFactory.Options().apply {
-            inSampleSize = 2
-            inPreferredConfig = Bitmap.Config.RGB_565
-        }
-        
         return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, options) 
-            ?: throw IllegalStateException("Bitmap decode failed")
+            ?: throw IllegalStateException("YUV Bitmap decode failed")
     }
 }
