@@ -32,14 +32,6 @@ import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
 import org.json.JSONArray
 import org.json.JSONObject
-import org.opencv.android.OpenCVLoader
-import org.opencv.android.Utils
-import org.opencv.core.Mat
-import org.opencv.core.MatOfPoint
-import org.opencv.core.MatOfPoint2f
-import org.opencv.core.Point // 🚨 에러 해결의 핵심! OpenCV Point 명시
-import org.opencv.core.Size
-import org.opencv.imgproc.Imgproc
 import java.io.ByteArrayOutputStream
 import java.util.Collections
 import java.util.concurrent.ExecutorService
@@ -49,6 +41,16 @@ import kotlin.math.*
 
 import com.jiseka.app.BuildConfig
 import com.jiseka.app.R
+
+// 🚨 아까 날아갔던 OpenCV 필수 수입(import) 코드들! (에러의 원인)
+import org.opencv.android.OpenCVLoader
+import org.opencv.android.Utils
+import org.opencv.core.Mat
+import org.opencv.core.MatOfPoint
+import org.opencv.core.MatOfPoint2f
+import org.opencv.core.Point
+import org.opencv.core.Size
+import org.opencv.imgproc.Imgproc
 
 class MainActivity : AppCompatActivity() {
 
