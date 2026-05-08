@@ -36,29 +36,30 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.*
 
-import com.jiseka.app.R
-
 class MainActivity : AppCompatActivity() {
 
     private lateinit var viewFinder: PreviewView
     private lateinit var resultImageView: ImageView
     private lateinit var cameraExecutor: ExecutorService
     
+    // 🚨 개선: 멀티스레드 Race Condition 방지를 위한 Volatile 적용 및 OOM 방지 구조 
+    @Volatile
     private var plateTextureBmp: Bitmap? = null
+    
     private var imageCapture: ImageCapture? = null
     private val isCapturing = AtomicBoolean(false)
     private val recognizer by lazy { TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build()) }
 
     companion object {
         private const val CAMERA_PERMISSION_REQUEST_CODE = 1001
-        private const val TEXTURE_URL = "https://your-project.vercel.app/plate_sample.png"
+        // 🚨 개선: 캐싱 우회를 위한 버전 파라미터 적용 (실서비스 구조)
+        private const val TEXTURE_URL = "https://your-project.vercel.app/plate_sample.png?v=1"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        // 🚨 필수: OpenCV 네이티브 라이브러리 초기화 (런타임 크래시 방지)
         if (!OpenCVLoader.initDebug()) {
             Log.e("JiSeKa", "OpenCV 초기화 실패")
             Toast.makeText(this, "엔진 초기화에 실패했습니다.", Toast.LENGTH_LONG).show()
@@ -72,6 +73,7 @@ class MainActivity : AppCompatActivity() {
         
         cameraExecutor = Executors.newSingleThreadExecutor()
 
+        // 앱 실행 시 즉시 웹에서 텍스처 최신화
         loadTextureFromWeb(TEXTURE_URL)
 
         shutterBtn.setOnClickListener { captureAndProcess() }
@@ -83,20 +85,42 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ── 🚨 개선된 웹 텍스처 다운로드 시스템 (안정화) ──
     private fun loadTextureFromWeb(urlString: String) {
         Executors.newSingleThreadExecutor().execute {
             try {
-                val url = java.net.URL(urlString)
-                val connection = url.openConnection() as java.net.HttpURLConnection
+                val connection = java.net.URL(urlString).openConnection() as java.net.HttpURLConnection
                 connection.connectTimeout = 5000
-                connection.readTimeout = 5000 // 🚨 보완: 네트워크 무한 대기 방지
+                connection.readTimeout = 5000 
+                connection.doInput = true
+                connection.useCaches = false // 최신 버전 강제 확보
                 connection.connect()
-                plateTextureBmp = BitmapFactory.decodeStream(connection.inputStream)
+
+                // OOM 방어 및 해상도 최적화
+                val options = BitmapFactory.Options().apply {
+                    inPreferredConfig = Bitmap.Config.ARGB_8888
+                }
+
+                val bitmap = BitmapFactory.decodeStream(connection.inputStream, null, options)
+                if (bitmap == null) {
+                    Log.e("JiSeKa", "Bitmap decode 실패")
+                    return@execute
+                }
+
+                // 🚨 기존 Bitmap 메모리 누수(Leak) 방어 및 안전한 교체
+                val old = plateTextureBmp
+                plateTextureBmp = downscaleBitmapIfNeeded(bitmap, 1024) 
+                
+                old?.let {
+                    if (!it.isRecycled) it.recycle()
+                }
+
+                Log.d("JiSeKa", "웹 가림막 로드 성공")
             } catch (e: Exception) {
-                try {
-                    plateTextureBmp = BitmapFactory.decodeResource(resources, R.drawable.plate_sample)
-                } catch (resEx: Exception) {
-                    Log.e("JiSeKa", "가림막 리소스 로드 실패", resEx)
+                // 🚨 로컬 폴백(R.drawable...) 완벽 제거. 철저히 웹 CDN 의존.
+                Log.e("JiSeKa", "웹 가림막 다운로드 실패", e)
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "가림막을 불러오지 못했습니다. 네트워크를 확인하세요.", Toast.LENGTH_SHORT).show()
                 }
             }
         }
@@ -146,7 +170,6 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("UnsafeOptInUsageError")
     private fun processEngineBackground(imageProxy: ImageProxy) {
-        // 🚨 보완: 공식 API의 버그를 우회하는 안전한 NV21 변환 함수 사용
         val bitmap = imageProxy.toBitmapExt()
         val rotation = imageProxy.imageInfo.rotationDegrees
         imageProxy.close() 
@@ -159,7 +182,6 @@ class MainActivity : AppCompatActivity() {
             originalBmp = rotated
         }
 
-        // 🚨 보완: 12MP 이상 고해상도 기기에서의 OOM 방지 (최대 1920 픽셀로 제한)
         originalBmp = downscaleBitmapIfNeeded(originalBmp, 1920)
 
         val viewW = viewFinder.width.toFloat(); val viewH = viewFinder.height.toFloat()
@@ -206,7 +228,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ── OOM 방지를 위한 다운스케일 ──
     private fun downscaleBitmapIfNeeded(bitmap: Bitmap, maxDimension: Int): Bitmap {
         val maxDim = max(bitmap.width, bitmap.height)
         if (maxDim <= maxDimension) return bitmap
@@ -325,6 +346,7 @@ class MainActivity : AppCompatActivity() {
             mask3Ch = Mat(); Imgproc.cvtColor(maskF, mask3Ch, Imgproc.COLOR_GRAY2RGB)
             bgF = Mat(); bgMat.convertTo(bgF, CvType.CV_32FC3)
             
+            // 🚨 안전한 OpenCV Core.subtract 연산 유지
             ones = Mat(bgMat.size(), mask3Ch.type(), Scalar(1.0, 1.0, 1.0))
             invMask = Mat()
             Core.subtract(ones, mask3Ch, invMask)
@@ -348,7 +370,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ── 🚨 안드로이드 카메라 파편화 방어용 YUV to NV21 안전 변환기 ──
     @SuppressLint("UnsafeOptInUsageError")
     private fun ImageProxy.toBitmapExt(): Bitmap {
         val yBuffer = planes[0].buffer
