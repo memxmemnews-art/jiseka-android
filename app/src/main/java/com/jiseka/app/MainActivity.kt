@@ -57,12 +57,14 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        // OpenCV 초기화 확인 [cite: 53]
         if (!org.opencv.android.OpenCVLoader.initDebug()) Log.e("JiSeKa", "OpenCV 초기화 실패")
 
         viewFinder = findViewById(R.id.viewFinder)
         webView = findViewById(R.id.webView)
         cameraExecutor = Executors.newSingleThreadExecutor()
 
+        // WebView 설정 및 캐시 제거 [cite: 53, 54]
         webView.clearCache(true)
         webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
         webView.setBackgroundColor(Color.TRANSPARENT)
@@ -73,6 +75,7 @@ class MainActivity : AppCompatActivity() {
             cacheMode = WebSettings.LOAD_NO_CACHE 
         }
 
+        // JS 경고창 및 브릿지 등록
         webView.webChromeClient = WebChromeClient()
         webView.addJavascriptInterface(WebAppInterface(), "AndroidBridge")
         
@@ -94,18 +97,20 @@ class MainActivity : AppCompatActivity() {
 
     inner class WebAppInterface {
         
+        // 1단계: 사진만 촬영하여 웹으로 전송 [cite: 81]
         @JavascriptInterface
         fun takePhotoOnly() {
             if (!isWebReady) return
             runOnUiThread { capturePhoto() }
         }
 
+        // 2단계: 웹에서 지정한 ROI 영역을 바탕으로 번호판 분석 [cite: 84-86]
         @JavascriptInterface
         fun analyzePlate(left: Float, top: Float, right: Float, bottom: Float) {
             runOnUiThread { 
                 lastCapturedBitmap?.let { bmp ->
                     processPlateAnalysis(bmp, RectF(left, top, right, bottom))
-                } ?: sendErrorToWeb("저장된 사진이 없습니다.")
+                } ?: sendErrorToWeb("분석할 사진이 메모리에 없습니다.")
             }
         }
 
@@ -116,6 +121,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // 최종 합성 이미지 저장 [cite: 57-78]
         @JavascriptInterface
         fun saveImageToGallery(base64Data: String) {
             Thread {
@@ -123,7 +129,8 @@ class MainActivity : AppCompatActivity() {
                 try {
                     val base64Image = base64Data.substringAfter(",")
                     val imageBytes = Base64.decode(base64Image, Base64.DEFAULT)
-                    bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size) ?: throw IllegalStateException("Bitmap decode failed")
+                    bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size) 
+                        ?: throw IllegalStateException("Bitmap decode failed")
 
                     val filename = "JiSeKa_${System.currentTimeMillis()}.jpg"
                     var outputStream: java.io.OutputStream? = null
@@ -192,37 +199,46 @@ class MainActivity : AppCompatActivity() {
             @SuppressLint("UnsafeOptInUsageError")
             override fun onCaptureSuccess(imageProxy: ImageProxy) {
                 try {
+                    // 이전 비트맵 해제 (메모리 관리)
+                    lastCapturedBitmap?.recycle()
+                    lastCapturedBitmap = null 
+
                     val bitmap = imageProxy.toBitmapExt()
                     val rotation = imageProxy.imageInfo.rotationDegrees
 
-                    var originalBmp = bitmap
+                    var rotatedBmp = bitmap
                     if (rotation != 0) {
                         val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
-                        val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-                        if (rotated != bitmap) bitmap.recycle()
-                        originalBmp = rotated
+                        rotatedBmp = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+                        if (rotatedBmp != bitmap) bitmap.recycle()
                     }
 
-                    lastCapturedBitmap?.recycle()
-                    lastCapturedBitmap = downscaleBitmapIfNeeded(originalBmp, 800)
+                    lastCapturedBitmap = downscaleBitmapIfNeeded(rotatedBmp, 1024)
+                    if (lastCapturedBitmap != rotatedBmp) rotatedBmp.recycle()
                     
                     val baos = ByteArrayOutputStream()
-                    lastCapturedBitmap!!.compress(Bitmap.CompressFormat.JPEG, 60, baos)
+                    lastCapturedBitmap!!.compress(Bitmap.CompressFormat.JPEG, 70, baos)
                     val base64Img = "data:image/jpeg;base64," + Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
 
-                    val safeBase64 = JSONObject.quote(base64Img)
-                    val js = "javascript:window.onPhotoCaptured($safeBase64)"
+                    // JSONObject.quote를 사용하여 특수문자 및 용량 문제 해결
+                    val safeJS = "javascript:window.onPhotoCaptured(${JSONObject.quote(base64Img)})"
                     
-                    runOnUiThread { webView.evaluateJavascript(js, null) }
+                    runOnUiThread { 
+                        webView.evaluateJavascript(safeJS, null)
+                    }
                 } catch (e: Exception) {
-                    Log.e("JiSeKa", "Capture processing failed", e)
-                    sendErrorToWeb("사진 처리 중 오류가 발생했습니다.")
+                    Log.e("JiSeKa", "Capture error", e)
+                    sendErrorToWeb("사진 처리 중 내부 오류 발생")
                 } finally {
-                    imageProxy.close()
+                    imageProxy.close() // CameraX 프리징 방지
                     isCapturing.set(false)
                 }
             }
-            override fun onError(exception: ImageCaptureException) { isCapturing.set(false) }
+
+            override fun onError(exception: ImageCaptureException) {
+                isCapturing.set(false)
+                sendErrorToWeb("카메라 캡처 실패: ${exception.message}")
+            }
         })
     }
 
@@ -230,6 +246,7 @@ class MainActivity : AppCompatActivity() {
         val imgW = bitmap.width.toFloat()
         val imgH = bitmap.height.toFloat()
         
+        // 실제 Bitmap 크기에 맞춘 ROI 계산 [cite: 84-86]
         val guideRectImg = Rect(
             kotlin.math.max(0, (guideRectF.left * imgW).toInt()),
             kotlin.math.max(0, (guideRectF.top * imgH).toInt()),
@@ -244,20 +261,21 @@ class MainActivity : AppCompatActivity() {
 
         val corners = extractGeometryCorners(bitmap, guideRectImg)
         if (corners == null) {
-            sendErrorToWeb("해당 영역에서 번호판을 찾을 수 없습니다.")
+            sendErrorToWeb("번호판을 찾을 수 없습니다.")
             return
         }
 
         val rectifiedBmp = rectifyToFlatPlate(bitmap, corners)
         if (rectifiedBmp == null) {
-            sendErrorToWeb("평면화에 실패했습니다.")
+            sendErrorToWeb("이미지 보정에 실패했습니다.")
             return
         }
 
+        // ML Kit OCR 검증 [cite: 88-89]
         val inputImage = InputImage.fromBitmap(rectifiedBmp, 0)
         recognizer.process(inputImage).addOnCompleteListener { task ->
             val text = task.result.text.replace(Regex("\\s+"), "")
-            val plateRegex = Regex("\\d{2,3}[가-힣]\\d{4}")
+            val plateRegex = Regex("\\d{2,3}[가-힣]\\d{4}") // 한국 번호판 표준 정규식
             
             val ocrValid = task.isSuccessful && plateRegex.containsMatchIn(text)
             if (!ocrValid) {
@@ -271,7 +289,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun sendErrorToWeb(msg: String) {
-        if (isFinishing || isDestroyed) return
         runOnUiThread {
             val js = "javascript:window.onNativeError(${JSONObject.quote(msg)})"
             webView.evaluateJavascript(js, null)
@@ -282,12 +299,14 @@ class MainActivity : AppCompatActivity() {
         val payload = JSONObject().apply {
             put("version", 1)
             put("corners", JSONArray().apply {
-                corners.forEach { put(JSONObject().apply { put("x", it.x / imgW); put("y", it.y / imgH) }) }
+                corners.forEach { 
+                    put(JSONObject().apply { 
+                        put("x", it.x / imgW) // 정규화된 좌표로 전송
+                        put("y", it.y / imgH) 
+                    }) 
+                }
             })
         }
-
-        if (isFinishing || isDestroyed) return
-
         runOnUiThread {
             val js = "javascript:window.onNativeSuccess(${JSONObject.quote(payload.toString())})"
             webView.evaluateJavascript(js, null)
@@ -306,15 +325,13 @@ class MainActivity : AppCompatActivity() {
         val contours = ArrayList<org.opencv.core.MatOfPoint>()
         try {
             mat = org.opencv.core.Mat(); org.opencv.android.Utils.bitmapToMat(bitmap, mat)
-            
             val roiX = kotlin.math.max(0, guideRect.left)
             val roiY = kotlin.math.max(0, guideRect.top)
-            val roiW = kotlin.math.min(guideRect.width().toInt(), (mat.cols() - roiX).toInt())
-            val roiH = kotlin.math.min(guideRect.height().toInt(), (mat.rows() - roiY).toInt())
+            val roiW = kotlin.math.min(guideRect.width(), (mat.cols() - roiX))
+            val roiH = kotlin.math.min(guideRect.height(), (mat.rows() - roiY))
             
             if (roiW <= 0 || roiH <= 0) return null
             roiMat = org.opencv.core.Mat(mat, org.opencv.core.Rect(roiX, roiY, roiW, roiH))
-            
             val roiArea = roiW * roiH 
             
             gray = org.opencv.core.Mat(); org.opencv.imgproc.Imgproc.cvtColor(roiMat, gray, org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY)
@@ -326,8 +343,7 @@ class MainActivity : AppCompatActivity() {
                 val minRect = org.opencv.imgproc.Imgproc.minAreaRect(org.opencv.core.MatOfPoint2f(*contour.toArray()))
                 val rw = minRect.size.width; val rh = minRect.size.height
                 val rectArea = rw * rh
-                
-                if (rectArea < roiArea * 0.05) continue
+                if (rectArea < roiArea * 0.05) continue // 최소 면적 검증 [cite: 104]
                 
                 val actualArea = org.opencv.imgproc.Imgproc.contourArea(contour)
                 val rectangularity = if (rectArea > 0) actualArea / rectArea else 0.0
@@ -347,10 +363,10 @@ class MainActivity : AppCompatActivity() {
             
             bestBox?.let { pts ->
                 val sorted = Array(4) { PointF(0f, 0f) }
-                sorted[0] = pts.minByOrNull { it.x + it.y } ?: pts[0]
-                sorted[2] = pts.maxByOrNull { it.x + it.y } ?: pts[0]
-                sorted[1] = pts.maxByOrNull { it.x - it.y } ?: pts[0]
-                sorted[3] = pts.minByOrNull { it.x - it.y } ?: pts[0]
+                sorted[0] = pts.minByOrNull { it.x + it.y } ?: pts[0] // TL
+                sorted[2] = pts.maxByOrNull { it.x + it.y } ?: pts[0] // BR
+                sorted[1] = pts.maxByOrNull { it.x - it.y } ?: pts[0] // TR
+                sorted[3] = pts.minByOrNull { it.x - it.y } ?: pts[0] // BL
                 return sorted
             }
             return null
@@ -375,14 +391,12 @@ class MainActivity : AppCompatActivity() {
         finally { bgMat?.release(); dest?.release() }
     }
 
-    // 🚨 핵심 수정: ImageFormat.JPEG 포맷 정상 디코딩 로직 추가!
     @SuppressLint("UnsafeOptInUsageError")
     private fun ImageProxy.toBitmapExt(): Bitmap {
         val options = BitmapFactory.Options().apply {
             inSampleSize = 2
             inPreferredConfig = Bitmap.Config.RGB_565
         }
-
         if (format == ImageFormat.JPEG) {
             val buffer = planes[0].buffer
             val bytes = ByteArray(buffer.remaining())
@@ -390,7 +404,6 @@ class MainActivity : AppCompatActivity() {
             return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options) 
                 ?: throw IllegalStateException("JPEG Bitmap decode failed")
         } 
-        
         val yBuffer = planes[0].buffer; val uBuffer = planes[1].buffer; val vBuffer = planes[2].buffer
         val ySize = yBuffer.remaining(); val uSize = uBuffer.remaining(); val vSize = vBuffer.remaining()
         val nv21 = ByteArray(ySize + uSize + vSize)
@@ -399,7 +412,6 @@ class MainActivity : AppCompatActivity() {
         val out = ByteArrayOutputStream()
         yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 100, out)
         val imageBytes = out.toByteArray()
-        
         return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, options) 
             ?: throw IllegalStateException("YUV Bitmap decode failed")
     }
