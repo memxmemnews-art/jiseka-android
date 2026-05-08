@@ -10,6 +10,7 @@ import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.PointF
 import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.YuvImage
 import android.net.Uri
 import android.os.Bundle
@@ -42,7 +43,6 @@ import kotlin.math.*
 import com.jiseka.app.BuildConfig
 import com.jiseka.app.R
 
-// 🚨 아까 날아갔던 OpenCV 필수 수입(import) 코드들! (에러의 원인)
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
 import org.opencv.core.Mat
@@ -72,13 +72,16 @@ class MainActivity : AppCompatActivity() {
         webView = findViewById(R.id.webView)
         cameraExecutor = Executors.newSingleThreadExecutor()
 
+        // 🚨 WebView 캐시 완벽 제거 (GitHub 업데이트 즉각 반영)
+        webView.clearCache(true)
+        
         webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
         webView.setBackgroundColor(Color.TRANSPARENT)
         
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
-            cacheMode = WebSettings.LOAD_DEFAULT
+            cacheMode = WebSettings.LOAD_NO_CACHE 
         }
 
         webView.addJavascriptInterface(WebAppInterface(), "AndroidBridge")
@@ -99,7 +102,72 @@ class MainActivity : AppCompatActivity() {
 
     inner class WebAppInterface {
         @JavascriptInterface
-        fun takePicture() { runOnUiThread { captureAndProcess() } }
+        fun takePicture(left: Float, top: Float, right: Float, bottom: Float) { 
+            runOnUiThread { captureAndProcess(RectF(left, top, right, bottom)) } 
+        }
+
+        // 🚨 웹에서 만든 합성 이미지를 받아 안드로이드 갤러리에 저장
+        @JavascriptInterface
+        fun saveImageToGallery(base64Data: String) {
+            Thread {
+                try {
+                    val base64Image = base64Data.substringAfter(",")
+                    val imageBytes = android.util.Base64.decode(base64Image, android.util.Base64.DEFAULT)
+                    val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+
+                    // 비트맵 디코드 실패 시 크래시 방어
+                    if (bitmap == null) {
+                        throw IllegalStateException("Bitmap decode failed")
+                    }
+
+                    val filename = "JiSeKa_${System.currentTimeMillis()}.jpg"
+                    var fos: java.io.OutputStream? = null
+                    var savedLegacyFile: java.io.File? = null
+
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                        val resolver = contentResolver
+                        val contentValues = android.content.ContentValues().apply {
+                            put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, filename)
+                            put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+                            put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, android.os.Environment.DIRECTORY_PICTURES + "/JiSeKa")
+                        }
+                        val imageUri = resolver.insert(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
+                        fos = imageUri?.let { resolver.openOutputStream(it) }
+                    } else {
+                        val imagesDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_PICTURES).toString()
+                        val imageDir = java.io.File(imagesDir, "JiSeKa")
+                        if (!imageDir.exists()) imageDir.mkdirs()
+                        val imageFile = java.io.File(imageDir, filename)
+                        savedLegacyFile = imageFile
+                        fos = java.io.FileOutputStream(imageFile)
+                    }
+
+                    fos?.use {
+                        // JPEG 형식으로 압축하여 저장
+                        bitmap.compress(Bitmap.CompressFormat.JPEG, 92, it)
+                        
+                        // Android 9 이하 기기에서 저장 직후 갤러리에 즉시 표시되도록 스캐닝
+                        savedLegacyFile?.let { file ->
+                            android.media.MediaScannerConnection.scanFile(
+                                this@MainActivity,
+                                arrayOf(file.absolutePath),
+                                arrayOf("image/jpeg"),
+                                null
+                            )
+                        }
+
+                        runOnUiThread {
+                            android.widget.Toast.makeText(this@MainActivity, "사진이 갤러리에 저장되었습니다.", android.widget.Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    runOnUiThread {
+                        android.widget.Toast.makeText(this@MainActivity, "사진 저장에 실패했습니다.", android.widget.Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }.start()
+        }
     }
 
     private fun allPermissionsGranted() = arrayOf(Manifest.permission.CAMERA).all {
@@ -121,19 +189,19 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    private fun captureAndProcess() {
+    private fun captureAndProcess(guideRectF: RectF) {
         val capture = imageCapture ?: return
         if (!isCapturing.compareAndSet(false, true)) return
 
         capture.takePicture(cameraExecutor, object : ImageCapture.OnImageCapturedCallback() {
             @SuppressLint("UnsafeOptInUsageError")
-            override fun onCaptureSuccess(imageProxy: ImageProxy) { processEngineBackground(imageProxy) }
+            override fun onCaptureSuccess(imageProxy: ImageProxy) { processEngineBackground(imageProxy, guideRectF) }
             override fun onError(exception: ImageCaptureException) { isCapturing.set(false) }
         })
     }
 
     @SuppressLint("UnsafeOptInUsageError")
-    private fun processEngineBackground(imageProxy: ImageProxy) {
+    private fun processEngineBackground(imageProxy: ImageProxy, guideRectF: RectF) {
         val bitmap = imageProxy.toBitmapExt()
         val rotation = imageProxy.imageInfo.rotationDegrees
         imageProxy.close() 
@@ -147,30 +215,45 @@ class MainActivity : AppCompatActivity() {
         }
 
         val safeBmp = downscaleBitmapIfNeeded(originalBmp, 800)
-        val viewW = viewFinder.width.toFloat(); val viewH = viewFinder.height.toFloat()
-        val imgW = safeBmp.width.toFloat(); val imgH = safeBmp.height.toFloat()
+        val viewW = viewFinder.width.toFloat()
+        val viewH = viewFinder.height.toFloat()
+        val imgW = safeBmp.width.toFloat()
+        val imgH = safeBmp.height.toFloat()
         
         val scale = max(viewW / imgW, viewH / imgH)
-        val scaledW = imgW * scale; val scaledH = imgH * scale
-        val offsetX = (viewW - scaledW) / 2f; val offsetY = (viewH - scaledH) / 2f
+        val scaledW = imgW * scale
+        val scaledH = imgH * scale
+        val offsetX = (viewW - scaledW) / 2f
+        val offsetY = (viewH - scaledH) / 2f
 
-        val guideViewW = viewW * 0.8f; val guideViewH = guideViewW / 3f
+        // 웹에서 넘겨받은 비율 좌표를 안드로이드 원본 이미지 좌표로 변환
+        val webLeft = guideRectF.left * viewW
+        val webTop = guideRectF.top * viewH
+        val webRight = guideRectF.right * viewW
+        val webBottom = guideRectF.bottom * viewH
+
         val guideRectImg = Rect(
-            ((viewW / 2f - guideViewW / 2f - offsetX) / scale).toInt(),
-            ((viewH / 2f - guideViewH / 2f - offsetY) / scale).toInt(),
-            ((viewW / 2f + guideViewW / 2f - offsetX) / scale).toInt(),
-            ((viewH / 2f + guideViewH / 2f - offsetY) / scale).toInt()
+            max(0, ((webLeft - offsetX) / scale).toInt()),
+            max(0, ((webTop - offsetY) / scale).toInt()),
+            min(imgW.toInt(), ((webRight - offsetX) / scale).toInt()),
+            min(imgH.toInt(), ((webBottom - offsetY) / scale).toInt())
         )
+
+        // 🚨 ROI(관심영역) 오류 시 Mat 크래시 방어
+        if (guideRectImg.width() <= 0 || guideRectImg.height() <= 0) {
+            sendErrorToWeb("가이드 영역 계산 오류입니다. 다시 시도해주세요.", safeBmp)
+            return
+        }
 
         val corners = extractGeometryCorners(safeBmp, guideRectImg)
         if (corners == null) {
-            sendErrorToWeb("번호판을 찾을 수 없습니다.")
+            sendErrorToWeb("번호판을 찾을 수 없습니다.", safeBmp)
             return
         }
 
         val rectifiedBmp = rectifyToFlatPlate(safeBmp, corners)
         if (rectifiedBmp == null) {
-            sendErrorToWeb("평면화에 실패했습니다.")
+            sendErrorToWeb("평면화에 실패했습니다.", safeBmp)
             return
         }
 
@@ -178,7 +261,7 @@ class MainActivity : AppCompatActivity() {
         recognizer.process(inputImage).addOnCompleteListener { task ->
             val ocrValid = task.isSuccessful && task.result.text.isNotEmpty()
             if (!ocrValid) {
-                sendErrorToWeb("번호판 검증 실패")
+                sendErrorToWeb("번호판 검증 실패", safeBmp)
                 rectifiedBmp.recycle()
                 return@addOnCompleteListener
             }
@@ -187,34 +270,47 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun sendErrorToWeb(msg: String) {
+    private fun sendErrorToWeb(msg: String, safeBmp: Bitmap) {
+        if (isFinishing || isDestroyed) return
+        
         runOnUiThread {
             val js = "javascript:window.onNativeError(${JSONObject.quote(msg)})"
             webView.evaluateJavascript(js, null)
             isCapturing.set(false)
+            delayRecycle(safeBmp)
         }
     }
 
-    private fun sendSuccessToWeb(bitmap: Bitmap, corners: Array<PointF>) {
+    private fun sendSuccessToWeb(safeBmp: Bitmap, corners: Array<PointF>) {
         val baos = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 60, baos)
+        safeBmp.compress(Bitmap.CompressFormat.JPEG, 60, baos)
         val base64Img = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
         
         val payload = JSONObject().apply {
             put("version", 1)
             put("image", "data:image/jpeg;base64,$base64Img")
             put("corners", JSONArray().apply {
-                corners.forEach { 
-                    put(JSONObject().apply { put("x", it.x); put("y", it.y) })
-                }
+                corners.forEach { put(JSONObject().apply { put("x", it.x); put("y", it.y) }) }
             })
         }
+
+        if (isFinishing || isDestroyed) return
 
         runOnUiThread {
             val js = "window.onNativeSuccess(${JSONObject.quote(payload.toString())})"
             webView.evaluateJavascript(js, null)
             isCapturing.set(false)
+            delayRecycle(safeBmp)
         }
+    }
+
+    // 🚨 웹뷰가 이미지를 읽는 동안 발생하는 메모리 해제 충돌(SIGSEGV) 원천 차단
+    private fun delayRecycle(bitmap: Bitmap) {
+        viewFinder.postDelayed({
+            if (!bitmap.isRecycled) {
+                bitmap.recycle()
+            }
+        }, 1500)
     }
 
     private fun downscaleBitmapIfNeeded(bitmap: Bitmap, maxDimension: Int): Bitmap {
@@ -282,22 +378,4 @@ class MainActivity : AppCompatActivity() {
             val transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
             dest = Mat(); Imgproc.warpPerspective(bgMat, dest, transform, Size(400.0, 100.0))
             val res = Bitmap.createBitmap(400, 100, Bitmap.Config.ARGB_8888)
-            Utils.matToBitmap(dest, res)
-            return res
-        } catch (e: Exception) { return null } 
-        finally { bgMat?.release(); dest?.release() }
-    }
-
-    @SuppressLint("UnsafeOptInUsageError")
-    private fun ImageProxy.toBitmapExt(): Bitmap {
-        val yBuffer = planes[0].buffer; val uBuffer = planes[1].buffer; val vBuffer = planes[2].buffer
-        val ySize = yBuffer.remaining(); val uSize = uBuffer.remaining(); val vSize = vBuffer.remaining()
-        val nv21 = ByteArray(ySize + uSize + vSize)
-        yBuffer.get(nv21, 0, ySize); vBuffer.get(nv21, ySize, vSize); uBuffer.get(nv21, ySize + vSize, uSize)
-        val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
-        val out = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 100, out)
-        val imageBytes = out.toByteArray()
-        return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
-    }
-}
+            Utils.matTo
