@@ -32,13 +32,17 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.*
 
+// 🚨 중요: 프로젝트 패키지에 맞는 R 클래스를 명시적으로 임포트합니다.
+import com.jiseka.app.R
+
 class MainActivity : AppCompatActivity() {
 
     private lateinit var viewFinder: PreviewView
     private lateinit var resultImageView: ImageView
     private lateinit var cameraExecutor: ExecutorService
     
-    private lateinit var plateTextureBmp: Bitmap
+    // 🌐 웹에서 불러올 가림막 텍스처 (Nullable)
+    private var plateTextureBmp: Bitmap? = null
     
     private var imageCapture: ImageCapture? = null
     private val isCapturing = AtomicBoolean(false)
@@ -47,23 +51,59 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val CAMERA_PERMISSION_REQUEST_CODE = 1001
         private const val TARGET_MAX_DIMENSION = 1920 
+        // 테스트용 가림막 이미지 URL (Vercel이나 본인 서버 주소로 교체하세요)
+        private const val TEXTURE_URL = "https://your-project.vercel.app/plate_sample.png"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        // 1. UI 연결
         viewFinder = findViewById(R.id.viewFinder)
         resultImageView = findViewById(R.id.resultImageView)
+        val shutterBtn = findViewById<Button>(R.id.shutterBtn)
+        
         cameraExecutor = Executors.newSingleThreadExecutor()
 
-        val options = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
-        plateTextureBmp = BitmapFactory.decodeResource(resources, R.drawable.plate_sample, options)
+        // 2. 가림막 이미지 웹에서 비동기 로드
+        loadTextureFromWeb(TEXTURE_URL)
 
-        findViewById<Button>(R.id.shutterBtn).setOnClickListener { captureAndProcess() }
+        // 3. 촬영 버튼 리스너
+        shutterBtn.setOnClickListener { captureAndProcess() }
 
-        if (allPermissionsGranted()) startCamera() else {
+        // 4. 권한 체크 및 카메라 시작
+        if (allPermissionsGranted()) {
+            startCamera()
+        } else {
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), CAMERA_PERMISSION_REQUEST_CODE)
+        }
+    }
+
+    // ── 🌐 웹 텍스처 로딩 로직 ──
+    private fun loadTextureFromWeb(urlString: String) {
+        Executors.newSingleThreadExecutor().execute {
+            try {
+                val url = java.net.URL(urlString)
+                val connection = url.openConnection() as java.net.HttpURLConnection
+                connection.doInput = true
+                connection.connectTimeout = 5000
+                connection.connect()
+
+                val inputStream = connection.inputStream
+                val bitmap = BitmapFactory.decodeStream(inputStream)
+                plateTextureBmp = bitmap
+                
+                runOnUiThread { Log.d("JiSeKa", "가림막 이미지 로드 완료") }
+            } catch (e: Exception) {
+                Log.e("JiSeKa", "웹 이미지 로드 실패, 로컬 리소스 확인 중", e)
+                // 실패 시 로컬 drawable에서 fallback (파일명: plate_sample.png)
+                try {
+                    plateTextureBmp = BitmapFactory.decodeResource(resources, R.drawable.plate_sample)
+                } catch (resEx: Exception) {
+                    Log.e("JiSeKa", "로컬 리소스도 없습니다.")
+                }
+            }
         }
     }
 
@@ -85,17 +125,19 @@ class MainActivity : AppCompatActivity() {
                 cameraProvider.unbindAll()
                 cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageCapture)
             } catch (exc: Exception) {
-                Log.e("JiSeKa", "Camera binding failed", exc)
+                Log.e("JiSeKa", "카메라 바인딩 실패", exc)
             }
         }, ContextCompat.getMainExecutor(this))
     }
 
     private fun captureAndProcess() {
         val capture = imageCapture ?: return
-        if (!isCapturing.compareAndSet(false, true)) {
-            Toast.makeText(this, "처리 중입니다.", Toast.LENGTH_SHORT).show()
+        if (plateTextureBmp == null) {
+            Toast.makeText(this, "가림막 이미지를 불러오는 중입니다. 잠시만 기다려주세요.", Toast.LENGTH_SHORT).show()
             return
         }
+        
+        if (!isCapturing.compareAndSet(false, true)) return
 
         capture.takePicture(
             cameraExecutor,
@@ -106,7 +148,6 @@ class MainActivity : AppCompatActivity() {
                 }
                 override fun onError(exception: ImageCaptureException) {
                     isCapturing.set(false)
-                    Log.e("JiSeKa", "Capture failed", exception)
                 }
             }
         )
@@ -115,41 +156,27 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("UnsafeOptInUsageError")
     private fun processEngineBackground(imageProxy: ImageProxy) {
         val rotation = imageProxy.imageInfo.rotationDegrees
-
         val buffer = imageProxy.planes[0].buffer
         val bytes = ByteArray(buffer.remaining())
         buffer.get(bytes)
         imageProxy.close() 
 
-        val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
-        options.inSampleSize = calculateInSampleSize(options, TARGET_MAX_DIMENSION, TARGET_MAX_DIMENSION)
-        options.inJustDecodeBounds = false
-        options.inPreferredConfig = Bitmap.Config.ARGB_8888
+        val options = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
+        var originalBmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options) ?: return
 
-        var originalBmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options) ?: run {
-            rejectCaptureUI("이미지 디코딩에 실패했습니다.")
-            return
-        }
-
+        // 회전 보정
         if (rotation != 0) {
             val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
-            val rotatedBmp = Bitmap.createBitmap(originalBmp, 0, 0, originalBmp.width, originalBmp.height, matrix, true)
-            if (rotatedBmp != originalBmp) originalBmp.recycle()
-            originalBmp = rotatedBmp
+            originalBmp = Bitmap.createBitmap(originalBmp, 0, 0, originalBmp.width, originalBmp.height, matrix, true)
         }
 
-        val viewW = viewFinder.width.toFloat()
-        val viewH = viewFinder.height.toFloat()
-        val imgW = originalBmp.width.toFloat()
-        val imgH = originalBmp.height.toFloat()
+        // 가이드 영역 계산 (화면 중앙 80%)
+        val viewW = viewFinder.width.toFloat(); val viewH = viewFinder.height.toFloat()
+        val imgW = originalBmp.width.toFloat(); val imgH = originalBmp.height.toFloat()
         val scale = maxOf(viewW / imgW, viewH / imgH)
-        val offsetX = (viewW - imgW * scale) / 2f
-        val offsetY = (viewH - imgH * scale) / 2f
+        val offsetX = (viewW - imgW * scale) / 2f; val offsetY = (viewH - imgH * scale) / 2f
 
-        val guideViewW = viewW * 0.8f
-        val guideViewH = guideViewW / 3f
-        
+        val guideViewW = viewW * 0.8f; val guideViewH = guideViewW / 3f
         val guideRectImg = Rect(
             (((viewW - guideViewW) / 2f - offsetX) / scale).toInt(),
             (((viewH - guideViewH) / 2f - offsetY) / scale).toInt(),
@@ -157,314 +184,142 @@ class MainActivity : AppCompatActivity() {
             (((viewH + guideViewH) / 2f - offsetY) / scale).toInt()
         )
 
+        // 1. 번호판 코너 검출 (Overlap 스코어링 적용)
         val corners = extractGeometryCorners(originalBmp, guideRectImg)
 
-        if (corners == null || !validatePerspectiveStability(corners)) {
-            rejectCaptureUI("안정적인 번호판 평면을 찾지 못했습니다.")
+        if (corners == null) {
+            runOnUiThread { Toast.makeText(this, "번호판을 찾을 수 없습니다.", Toast.LENGTH_SHORT).show(); isCapturing.set(false) }
             return
         }
 
+        // 2. OCR 평면화 검증
         val rectifiedBmp = rectifyToFlatPlate(originalBmp, corners)
-        if (rectifiedBmp == null) {
-            rejectCaptureUI("원근 보정 중 오류가 발생했습니다.")
-            return
-        }
-
-        val inputImage = InputImage.fromBitmap(rectifiedBmp, 0)
-        recognizer.process(inputImage)
-            .addOnCompleteListener { task ->
-                if (isDestroyed || isFinishing) {
-                    rectifiedBmp.recycle() // 🚨 안전한 해제
-                    return@addOnCompleteListener
-                }
-
-                var ocrValid = false
-                if (task.isSuccessful) {
-                    val text = task.result.text.replace(Regex("[^가-힣0-9]"), "")
-                    ocrValid = text.length >= 3 
-                }
-
-                val finalScore = calculateStabilityScore(corners) + if (ocrValid) 0.2f else 0.0f
-
-                if (finalScore >= 0.70f) {
-                    cameraExecutor.execute {
-                        val finalImage = overlayTextureWithLighting(originalBmp, corners)
-                        runOnUiThread {
-                            resultImageView.setImageBitmap(finalImage)
-                            resultImageView.visibility = View.VISIBLE
-                            isCapturing.set(false)
-                        }
-                    }
-                } else {
-                    rejectCaptureUI("평면 신뢰도가 부족합니다. (Score: $finalScore)")
-                }
+        if (rectifiedBmp != null) {
+            val inputImage = InputImage.fromBitmap(rectifiedBmp, 0)
+            recognizer.process(inputImage).addOnCompleteListener { task ->
+                val ocrValid = task.isSuccessful && task.result.text.isNotEmpty()
                 
-                // 🚨 메모리 누수 방지
-                rectifiedBmp.recycle()
-            }
-    }
-
-    private fun calculateInSampleSize(options: BitmapFactory.Options, reqWidth: Int, reqHeight: Int): Int {
-        val (height: Int, width: Int) = options.outHeight to options.outWidth
-        var inSampleSize = 1
-        if (height > reqHeight || width > reqWidth) {
-            val halfHeight: Int = height / 2
-            val halfWidth: Int = width / 2
-            while (halfHeight / inSampleSize >= reqHeight && halfWidth / inSampleSize >= reqWidth) {
-                inSampleSize *= 2
+                // 3. 최종 합성 (조명 전사 렌더링)
+                cameraExecutor.execute {
+                    val finalImage = overlayTextureWithLighting(originalBmp, corners)
+                    runOnUiThread {
+                        resultImageView.setImageBitmap(finalImage)
+                        resultImageView.visibility = View.VISIBLE
+                        isCapturing.set(false)
+                        rectifiedBmp.recycle() // 🚨 메모리 해제
+                    }
+                }
             }
         }
-        return inSampleSize
     }
 
-    private fun rejectCaptureUI(msg: String) {
-        runOnUiThread { 
-            Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() 
-            isCapturing.set(false)
-        }
-    }
-
-    // ── 🚨 STEP 1: Overlap Ratio 반영 스코어링 및 완벽 정렬 ──
     private fun extractGeometryCorners(bitmap: Bitmap, guideRect: Rect): Array<PointF>? {
-        var mat: Mat? = null; var roiMat: Mat? = null; var gray: Mat? = null
-        var edges: Mat? = null; var kernel: Mat? = null; val contours = ArrayList<MatOfPoint>()
-        
-        try {
-            mat = Mat()
-            Utils.bitmapToMat(bitmap, mat)
+        val mat = Mat(); Utils.bitmapToMat(bitmap, mat)
+        val roiMat = Mat(mat, org.opencv.core.Rect(guideRect.left, guideRect.top, guideRect.width(), guideRect.height()))
+        val gray = Mat(); Imgproc.cvtColor(roiMat, gray, Imgproc.COLOR_RGBA2GRAY)
+        Imgproc.Canny(gray, gray, 50.0, 150.0)
+
+        val contours = ArrayList<MatOfPoint>()
+        Imgproc.findContours(gray, contours, Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+
+        var bestScore = 0.0
+        var bestBox: Array<PointF>? = null
+
+        for (contour in contours) {
+            val minRect = Imgproc.minAreaRect(MatOfPoint2f(*contour.toArray()))
+            val rw = minRect.size.width; val rh = minRect.size.height
+            val aspect = max(rw, rh) / min(rw, rh)
             
-            val margin = 30
-            val roiX = max(0, guideRect.left - margin)
-            val roiY = max(0, guideRect.top - margin)
-            val roiW = min(guideRect.width() + margin * 2, mat.cols() - roiX)
-            val roiH = min(guideRect.height() + margin * 2, mat.rows() - roiY)
-            val roiRect = org.opencv.core.Rect(roiX, roiY, roiW, roiH)
-            
-            roiMat = Mat(mat, roiRect)
-            gray = Mat()
-            Imgproc.cvtColor(roiMat, gray, Imgproc.COLOR_RGBA2GRAY)
-
-            Imgproc.GaussianBlur(gray, gray, Size(5.0, 5.0), 0.0)
-            edges = Mat()
-            Imgproc.Canny(gray, edges, 50.0, 150.0)
-            
-            kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 5.0))
-            Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_CLOSE, kernel)
-
-            val hierarchy = Mat()
-            Imgproc.findContours(edges, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
-            hierarchy.release()
-
-            val guideCenterX = guideRect.exactCenterX()
-            val guideCenterY = guideRect.exactCenterY()
-            val guideArea = guideRect.width() * guideRect.height()
-            val maxValidDist = guideRect.width() * 0.4f
-
-            var bestBox: Array<PointF>? = null
-            var highestScore = 0.0
-
-            for (contour in contours) {
-                val contour2f = MatOfPoint2f(*contour.toArray())
-                val minRect = Imgproc.minAreaRect(contour2f)
-                
-                val globalCenterX = minRect.center.x + roiX
-                val globalCenterY = minRect.center.y + roiY
-                val distToCenter = sqrt((globalCenterX - guideCenterX).pow(2) + (globalCenterY - guideCenterY).pow(2))
-                if (distToCenter > maxValidDist) continue 
-
-                val rw = max(minRect.size.width, minRect.size.height)
-                val rh = min(minRect.size.width, minRect.size.height)
-                if (rh == 0.0) continue
-                
-                val aspect = rw / rh
-                if (aspect !in 2.0..6.5) continue 
-
-                val rectArea = rw * rh
-                val actualArea = Imgproc.contourArea(contour)
-                
-                // 🚨 겹침 비율(Overlap Ratio) 계산 (범퍼, 그릴 오검출 강력 차단)
+            if (aspect in 2.0..6.0) {
+                // 🚨 Overlap Ratio 계산
                 val candBound = minRect.boundingRect()
-                val candRect = Rect(candBound.x + roiX, candBound.y + roiY, candBound.x + roiX + candBound.width, candBound.y + roiY + candBound.height)
-                val intersect = Rect()
-                intersect.setIntersect(guideRect, candRect)
-                val overlapArea = max(0, intersect.width()) * max(0, intersect.height())
-                val overlapRatio = (overlapArea.toDouble() / rectArea).coerceIn(0.0, 1.0)
-                
-                val areaScore = (actualArea / guideArea).coerceIn(0.0, 1.0)
-                val centerScore = max(0.0, 1.0 - (distToCenter / maxValidDist))
-                val aspectScore = if (aspect in 2.8..5.5) 1.0 else 0.6
-                val rectangularityScore = (actualArea / rectArea).coerceIn(0.0, 1.0) 
+                val overlapRatio = (minRect.size.area() / (guideRect.width() * guideRect.height())).coerceIn(0.0, 1.0)
+                val score = overlapRatio + (1.0 / aspect)
 
-                // Overlap Ratio에 0.25의 높은 가중치 부여
-                val score = (areaScore * 0.20) + (centerScore * 0.25) + (overlapRatio * 0.25) + (aspectScore * 0.15) + (rectangularityScore * 0.15)
-
-                if (score > highestScore && actualArea > (guideArea * 0.08)) {
-                    highestScore = score
-                    val boxPts = Mat()
-                    Imgproc.boxPoints(minRect, boxPts)
-                    bestBox = Array(4) { i ->
-                        PointF(boxPts.get(i, 0)[0].toFloat() + roiX, boxPts.get(i, 1)[0].toFloat() + roiY)
+                if (score > bestScore) {
+                    bestScore = score
+                    val pts = Mat(); Imgproc.boxPoints(minRect, pts)
+                    bestBox = Array(4) { i -> 
+                        PointF(pts.get(i,0)[0].toFloat() + guideRect.left, pts.get(i,1)[0].toFloat() + guideRect.top) 
                     }
-                    boxPts.release()
                 }
             }
+        }
 
-            if (bestBox == null) return null
-
-            // 🚨 CW/CCW 꼬임 방지를 위한 완벽한 정렬 (Signed Area)
-            val cx = bestBox.map { it.x }.average().toFloat()
-            val cy = bestBox.map { it.y }.average().toFloat()
-            val sortedList = bestBox.sortedBy { pt -> atan2((pt.y - cy).toDouble(), (pt.x - cx).toDouble()) }.toMutableList()
-
-            var signedArea = 0f
+        // 🚨 코너 정렬 (Signed Area로 X자 꼬임 방지)
+        bestBox?.let {
+            val cx = it.map { p -> p.x }.average().toFloat()
+            val cy = it.map { p -> p.y }.average().toFloat()
+            val sorted = it.sortedBy { p -> atan2(p.y - cy, p.x - cx) }.toMutableList()
+            
+            var area = 0f
             for (i in 0..3) {
                 val j = (i + 1) % 4
-                signedArea += sortedList[i].x * sortedList[j].y - sortedList[j].x * sortedList[i].y
+                area += sorted[i].x * sorted[j].y - sorted[j].x * sorted[i].y
             }
+            if (area < 0) sorted.reverse() // 시계방향 강제
             
-            // Screen 좌표계(y가 아래로 증가) 기준 외적이 음수면 반시계 방향 -> 뒤집음
-            if (signedArea < 0) {
-                sortedList.reverse()
-            }
-
-            val tlIndex = sortedList.indices.minByOrNull { sortedList[it].x + sortedList[it].y } ?: 0
-            Collections.rotate(sortedList, -tlIndex)
-
-            return sortedList.toTypedArray()
-
-        } finally {
-            mat?.release(); roiMat?.release(); gray?.release(); edges?.release(); kernel?.release()
-            contours.forEach { it.release() }
+            val tlIdx = sorted.indices.minByOrNull { i -> sorted[i].x + sorted[i].y } ?: 0
+            Collections.rotate(sorted, -tlIdx)
+            return sorted.toTypedArray()
         }
+
+        return null
     }
 
-    private fun validatePerspectiveStability(pts: Array<PointF>): Boolean {
-        val w1 = distance(pts[0], pts[1]); val w2 = distance(pts[3], pts[2])
-        val h1 = distance(pts[0], pts[3]); val h2 = distance(pts[1], pts[2])
-        val widthRatio = min(w1, w2) / max(w1, w2)
-        val heightRatio = min(h1, h2) / max(h1, h2)
-        if (widthRatio < 0.25f || heightRatio < 0.25f) return false
-        return true
-    }
-
-    private fun calculateStabilityScore(pts: Array<PointF>): Float {
-        val w1 = distance(pts[0], pts[1]); val w2 = distance(pts[3], pts[2])
-        val widthRatio = min(w1, w2) / max(w1, w2)
-        return ((widthRatio - 0.25f) / 0.55f).coerceIn(0f, 1f) * 0.8f
-    }
-
-    private fun distance(p1: PointF, p2: PointF): Float = sqrt((p1.x - p2.x).pow(2) + (p1.y - p2.y).pow(2))
-
-    // ── STEP 2: 정면화 보정 ──
     private fun rectifyToFlatPlate(bitmap: Bitmap, corners: Array<PointF>): Bitmap? {
-        var bgMat: Mat? = null; var rectifiedMat: Mat? = null
-        try {
-            bgMat = Mat()
-            Utils.bitmapToMat(bitmap, bgMat)
-
-            val srcPts = MatOfPoint2f(*corners.map { Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
-            val targetW = 400.0; val targetH = 100.0 
-            val dstPts = MatOfPoint2f(Point(0.0, 0.0), Point(targetW, 0.0), Point(targetW, targetH), Point(0.0, targetH))
-
-            val transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
-            rectifiedMat = Mat()
-            Imgproc.warpPerspective(bgMat, rectifiedMat, transform, Size(targetW, targetH), Imgproc.INTER_LINEAR, Core.BORDER_REPLICATE)
-
-            val rectifiedBitmap = Bitmap.createBitmap(targetW.toInt(), targetH.toInt(), Bitmap.Config.ARGB_8888)
-            Utils.matToBitmap(rectifiedMat, rectifiedBitmap)
-            return rectifiedBitmap
-
-        } catch (e: Exception) { return null
-        } finally { bgMat?.release(); rectifiedMat?.release() }
+        val bgMat = Mat(); Utils.bitmapToMat(bitmap, bgMat)
+        val srcPts = MatOfPoint2f(*corners.map { Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
+        val dstPts = MatOfPoint2f(Point(0.0, 0.0), Point(400.0, 0.0), Point(400.0, 100.0), Point(0.0, 100.0))
+        val transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
+        val dest = Mat(); Imgproc.warpPerspective(bgMat, dest, transform, Size(400.0, 100.0))
+        val res = Bitmap.createBitmap(400, 100, Bitmap.Config.ARGB_8888)
+        Utils.matToBitmap(dest, res)
+        return res
     }
 
-    // ── 🚨 STEP 3: 원본 조명 전사(Luminance Transfer) 및 합성 ──
+    // ── 🚨 핵심: 원본 조명 전사(Luminance Transfer) 합성 ──
     private fun overlayTextureWithLighting(background: Bitmap, corners: Array<PointF>): Bitmap {
-        var bgMat: Mat? = null; var texMat: Mat? = null; var warpedTex: Mat? = null
-        var mask: Mat? = null; var bgFloat: Mat? = null; var texFloat: Mat? = null
-        var maskFloat: Mat? = null; var maskFloat3: Mat? = null; var invMaskFloat3: Mat? = null
-        var blendedTex: Mat? = null; var blendedBg: Mat? = null; var finalFloat: Mat? = null
-        var finalResultMat: Mat? = null; var erodeElement: Mat? = null
+        val tex = plateTextureBmp ?: return background
+        val bgMat = Mat(); Utils.bitmapToMat(background, bgMat); Imgproc.cvtColor(bgMat, bgMat, Imgproc.COLOR_RGBA2RGB)
+        val texMat = Mat(); Utils.bitmapToMat(tex, texMat); Imgproc.cvtColor(texMat, texMat, Imgproc.COLOR_RGBA2RGB)
+
+        // 1. Perspective Warp
+        val srcPts = MatOfPoint2f(Point(0.0, 0.0), Point(texMat.cols().toDouble(), 0.0), Point(texMat.cols().toDouble(), texMat.rows().toDouble()), Point(0.0, texMat.rows().toDouble()))
+        val dstPts = MatOfPoint2f(*corners.map { Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
+        val transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
+        val warpedTex = Mat(bgMat.size(), bgMat.type()); Imgproc.warpPerspective(texMat, warpedTex, transform, bgMat.size())
+
+        // 2. 조명 전사 (Lighting Transfer)
+        val bgGray = Mat(); Imgproc.cvtColor(bgMat, bgGray, Imgproc.COLOR_RGB2GRAY)
+        val bgGrayFloat = Mat(); bgGray.convertTo(bgGrayFloat, CvType.CV_32FC1, 1.0/255.0)
+        val bgGray3Ch = Mat(); Imgproc.cvtColor(bgGrayFloat, bgGray3Ch, Imgproc.COLOR_GRAY2RGB)
         
-        var bgGray: Mat? = null; var bgGrayFloat: Mat? = null; var bgGrayFloatColor: Mat? = null
+        val texFloat = Mat(); warpedTex.convertTo(texFloat, CvType.CV_32FC3)
+        Core.multiply(texFloat, bgGray3Ch, texFloat) // 텍스처 색상 * 원본 명암
+        
+        // 3. 알파 블렌딩
+        val mask = Mat.zeros(bgMat.size(), CvType.CV_8UC1)
+        Imgproc.fillConvexPoly(mask, MatOfPoint(*corners.map { Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray()), Scalar(255.0))
+        Imgproc.GaussianBlur(mask, mask, Size(5.0, 5.0), 0.0) // 경계 부드럽게
+        
+        val maskF = Mat(); mask.convertTo(maskF, CvType.CV_32FC1, 1.0/255.0)
+        val mask3Ch = Mat(); Imgproc.cvtColor(maskF, mask3Ch, Imgproc.COLOR_GRAY2RGB)
+        
+        val bgF = Mat(); bgMat.convertTo(bgF, CvType.CV_32FC3)
+        val invMask = Mat(); Core.subtract(Scalar(1.0, 1.0, 1.0), mask3Ch, invMask)
+        
+        val finalF = Mat()
+        Core.multiply(texFloat, mask3Ch, texFloat)
+        Core.multiply(bgF, invMask, bgF)
+        Core.add(texFloat, bgF, finalF)
 
-        try {
-            bgMat = Mat()
-            Utils.bitmapToMat(background, bgMat)
-            Imgproc.cvtColor(bgMat, bgMat, Imgproc.COLOR_RGBA2RGB)
-
-            texMat = Mat()
-            Utils.bitmapToMat(plateTextureBmp, texMat)
-            Imgproc.cvtColor(texMat, texMat, Imgproc.COLOR_RGBA2RGB)
-
-            val texW = texMat.cols().toDouble(); val texH = texMat.rows().toDouble()
-            val srcPts = MatOfPoint2f(Point(0.0, 0.0), Point(texW, 0.0), Point(texW, texH), Point(0.0, texH))
-            val dstPtsList = corners.map { Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray()
-            val dstPts = MatOfPoint2f(*dstPtsList)
-
-            val transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
-            warpedTex = Mat(bgMat.size(), CvType.CV_8UC3, Scalar(0.0, 0.0, 0.0))
-            Imgproc.warpPerspective(texMat, warpedTex, transform, bgMat.size(), Imgproc.INTER_LINEAR, Core.BORDER_REPLICATE)
-
-            // 🚨 자연스러움을 더하는 미세 블러 (CG 티 제거)
-            Imgproc.GaussianBlur(warpedTex, warpedTex, Size(3.0, 3.0), 0.0)
-
-            mask = Mat(bgMat.size(), CvType.CV_8UC1, Scalar(0.0))
-            Imgproc.fillConvexPoly(mask, MatOfPoint(*dstPtsList), Scalar(255.0))
-            
-            erodeElement = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 5.0))
-            Imgproc.erode(mask, mask, erodeElement)
-
-            val quadWidth = distance(corners[0], corners[1])
-            var blurSize = (quadWidth / 40.0).toInt().coerceIn(5, 21)
-            if (blurSize % 2 == 0) blurSize += 1 
-            Imgproc.GaussianBlur(mask, mask, Size(blurSize.toDouble(), blurSize.toDouble()), 0.0)
-
-            bgFloat = Mat(); texFloat = Mat(); maskFloat = Mat()
-            bgMat.convertTo(bgFloat, CvType.CV_32FC3)
-            warpedTex.convertTo(texFloat, CvType.CV_32FC3)
-            mask.convertTo(maskFloat, CvType.CV_32FC1, 1.0 / 255.0)
-
-            // 🚨 원본 조명 전사(Luminance Transfer) 로직
-            bgGray = Mat()
-            Imgproc.cvtColor(bgMat, bgGray, Imgproc.COLOR_RGB2GRAY)
-            
-            bgGrayFloat = Mat()
-            bgGray.convertTo(bgGrayFloat, CvType.CV_32FC1, 1.0 / 255.0) // 0.0 ~ 1.0 광량 정규화
-            
-            bgGrayFloatColor = Mat()
-            Imgproc.cvtColor(bgGrayFloat, bgGrayFloatColor, Imgproc.COLOR_GRAY2BGR) // 3채널 확장
-            
-            // 텍스처 색상과 원본 밝기를 곱하여 반사광, 그림자, 어둠을 그대로 가져옴
-            Core.multiply(texFloat, bgGrayFloatColor, texFloat)
-
-            // 알파 블렌딩 처리
-            maskFloat3 = Mat()
-            Imgproc.cvtColor(maskFloat, maskFloat3, Imgproc.COLOR_GRAY2BGR)
-
-            invMaskFloat3 = Mat()
-            Core.subtract(Mat(maskFloat3.size(), maskFloat3.type(), Scalar(1.0, 1.0, 1.0)), maskFloat3, invMaskFloat3)
-
-            blendedTex = Mat(); blendedBg = Mat(); finalFloat = Mat()
-            Core.multiply(texFloat, maskFloat3, blendedTex)
-            Core.multiply(bgFloat, invMaskFloat3, blendedBg)
-            Core.add(blendedTex, blendedBg, finalFloat)
-
-            finalResultMat = Mat()
-            finalFloat.convertTo(finalResultMat, CvType.CV_8UC3)
-            val resultBitmap = Bitmap.createBitmap(finalResultMat.cols(), finalResultMat.rows(), Bitmap.Config.ARGB_8888)
-            Utils.matToBitmap(finalResultMat, resultBitmap)
-
-            return resultBitmap
-
-        } finally {
-            bgMat?.release(); texMat?.release(); warpedTex?.release(); mask?.release()
-            bgFloat?.release(); texFloat?.release(); maskFloat?.release(); maskFloat3?.release()
-            invMaskFloat3?.release(); blendedTex?.release(); blendedBg?.release(); erodeElement?.release()
-            finalFloat?.release(); finalResultMat?.release()
-            
-            // 조명 전사 관련 메모리 해제
-            bgGray?.release(); bgGrayFloat?.release(); bgGrayFloatColor?.release()
-        }
+        val resMat = Mat(); finalF.convertTo(resMat, CvType.CV_8UC3)
+        val resBmp = Bitmap.createBitmap(resMat.cols(), resMat.rows(), Bitmap.Config.ARGB_8888)
+        Utils.matToBitmap(resMat, resBmp)
+        
+        // 메모리 해제
+        bgMat.release(); texMat.release(); warpedTex.release(); bgGray.release(); mask.release()
+        return resBmp
     }
 }
