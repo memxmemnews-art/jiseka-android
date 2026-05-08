@@ -11,8 +11,8 @@
         android:label="JiSeKa"
         android:supportsRtl="true"
         android:theme="@style/Theme.AppCompat.Light.NoActionBar"
-        android:hardwareAccelerated="true"> 
-
+        android:hardwareAccelerated="true">
+        
         <activity
             android:name=".MainActivity"
             android:exported="true">
