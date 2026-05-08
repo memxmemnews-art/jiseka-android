@@ -3,13 +3,24 @@ package com.jiseka.app
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.pm.PackageManager
-import android.graphics.*
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Color
+import android.graphics.ImageFormat
+import android.graphics.Matrix
+import android.graphics.PointF
+import android.graphics.Rect
+import android.graphics.YuvImage
 import android.net.Uri
 import android.os.Bundle
 import android.util.Base64
 import android.util.Log
 import android.view.View
-import android.webkit.*
+import android.webkit.JavascriptInterface
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -23,7 +34,11 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
-import org.opencv.core.*
+import org.opencv.core.Mat
+import org.opencv.core.MatOfPoint
+import org.opencv.core.MatOfPoint2f
+import org.opencv.core.Point // 🚨 에러 해결의 핵심! OpenCV Point 명시
+import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 import java.io.ByteArrayOutputStream
 import java.util.Collections
@@ -129,8 +144,9 @@ class MainActivity : AppCompatActivity() {
             originalBmp = rotated
         }
 
+        val safeBmp = downscaleBitmapIfNeeded(originalBmp, 800)
         val viewW = viewFinder.width.toFloat(); val viewH = viewFinder.height.toFloat()
-        val imgW = originalBmp.width.toFloat(); val imgH = originalBmp.height.toFloat()
+        val imgW = safeBmp.width.toFloat(); val imgH = safeBmp.height.toFloat()
         
         val scale = max(viewW / imgW, viewH / imgH)
         val scaledW = imgW * scale; val scaledH = imgH * scale
@@ -144,13 +160,13 @@ class MainActivity : AppCompatActivity() {
             ((viewH / 2f + guideViewH / 2f - offsetY) / scale).toInt()
         )
 
-        val corners = extractGeometryCorners(originalBmp, guideRectImg)
+        val corners = extractGeometryCorners(safeBmp, guideRectImg)
         if (corners == null) {
             sendErrorToWeb("번호판을 찾을 수 없습니다.")
             return
         }
 
-        val rectifiedBmp = rectifyToFlatPlate(originalBmp, corners)
+        val rectifiedBmp = rectifyToFlatPlate(safeBmp, corners)
         if (rectifiedBmp == null) {
             sendErrorToWeb("평면화에 실패했습니다.")
             return
@@ -164,7 +180,7 @@ class MainActivity : AppCompatActivity() {
                 rectifiedBmp.recycle()
                 return@addOnCompleteListener
             }
-            sendSuccessToWeb(originalBmp, corners)
+            sendSuccessToWeb(safeBmp, corners)
             rectifiedBmp.recycle()
         }
     }
@@ -178,11 +194,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun sendSuccessToWeb(bitmap: Bitmap, corners: Array<PointF>) {
-        val safeBmp = downscaleBitmapIfNeeded(bitmap, 800)
         val baos = ByteArrayOutputStream()
-        safeBmp.compress(Bitmap.CompressFormat.JPEG, 60, baos)
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 60, baos)
         val base64Img = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
-        if (safeBmp != bitmap) safeBmp.recycle()
         
         val payload = JSONObject().apply {
             put("version", 1)
