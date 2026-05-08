@@ -105,7 +105,6 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread { captureAndProcess(RectF(left, top, right, bottom)) } 
         }
 
-        // 🚨 중괄호 오류 해결 및 구조가 개선된 갤러리 저장 로직
         @JavascriptInterface
         fun saveImageToGallery(base64Data: String) {
             Thread {
@@ -251,7 +250,8 @@ class MainActivity : AppCompatActivity() {
         val imgW = safeBmp.width.toFloat()
         val imgH = safeBmp.height.toFloat()
         
-        val scale = max(viewW / imgW, viewH / imgH)
+        // 🚨 kotlin.math 명시적 사용
+        val scale = kotlin.math.max(viewW / imgW, viewH / imgH)
         val scaledW = imgW * scale
         val scaledH = imgH * scale
         val offsetX = (viewW - scaledW) / 2f
@@ -262,11 +262,12 @@ class MainActivity : AppCompatActivity() {
         val webRight = guideRectF.right * viewW
         val webBottom = guideRectF.bottom * viewH
 
+        // 🚨 kotlin.math 명시적 사용
         val guideRectImg = Rect(
-            max(0, ((webLeft - offsetX) / scale).toInt()),
-            max(0, ((webTop - offsetY) / scale).toInt()),
-            min(imgW.toInt(), ((webRight - offsetX) / scale).toInt()),
-            min(imgH.toInt(), ((webBottom - offsetY) / scale).toInt())
+            kotlin.math.max(0, ((webLeft - offsetX) / scale).toInt()),
+            kotlin.math.max(0, ((webTop - offsetY) / scale).toInt()),
+            kotlin.math.min(imgW.toInt(), ((webRight - offsetX) / scale).toInt()),
+            kotlin.math.min(imgH.toInt(), ((webBottom - offsetY) / scale).toInt())
         )
 
         if (guideRectImg.width() <= 0 || guideRectImg.height() <= 0) {
@@ -306,4 +307,139 @@ class MainActivity : AppCompatActivity() {
             val js = "javascript:window.onNativeError(${JSONObject.quote(msg)})"
             webView.evaluateJavascript(js, null)
             isCapturing.set(false)
-            delayRecycle
+            delayRecycle(safeBmp)
+        }
+    }
+
+    private fun sendSuccessToWeb(safeBmp: Bitmap, corners: Array<PointF>) {
+        val baos = ByteArrayOutputStream()
+        safeBmp.compress(Bitmap.CompressFormat.JPEG, 60, baos)
+        val base64Img = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+        
+        val payload = JSONObject().apply {
+            put("version", 1)
+            put("image", "data:image/jpeg;base64,$base64Img")
+            put("corners", JSONArray().apply {
+                corners.forEach { put(JSONObject().apply { put("x", it.x); put("y", it.y) }) }
+            })
+        }
+
+        if (isFinishing || isDestroyed) return
+
+        runOnUiThread {
+            val js = "window.onNativeSuccess(${JSONObject.quote(payload.toString())})"
+            webView.evaluateJavascript(js, null)
+            isCapturing.set(false)
+            delayRecycle(safeBmp)
+        }
+    }
+
+    private fun delayRecycle(bitmap: Bitmap) {
+        viewFinder.postDelayed({
+            if (!bitmap.isRecycled) {
+                bitmap.recycle()
+            }
+        }, 1500)
+    }
+
+    private fun downscaleBitmapIfNeeded(bitmap: Bitmap, maxDimension: Int): Bitmap {
+        // 🚨 kotlin.math 명시적 사용
+        val maxDim = kotlin.math.max(bitmap.width, bitmap.height)
+        if (maxDim <= maxDimension) return bitmap
+        val scale = maxDimension.toFloat() / maxDim
+        return Bitmap.createScaledBitmap(bitmap, (bitmap.width * scale).toInt(), (bitmap.height * scale).toInt(), true)
+    }
+
+    private fun extractGeometryCorners(bitmap: Bitmap, guideRect: Rect): Array<PointF>? {
+        var mat: Mat? = null; var roiMat: Mat? = null; var gray: Mat? = null; var edges: Mat? = null
+        val contours = ArrayList<MatOfPoint>()
+        try {
+            mat = Mat(); Utils.bitmapToMat(bitmap, mat)
+            
+            // 🚨 타입 추론 혼란 방어: kotlin.math 명시적 사용 및 타입 캐스팅 강화
+            val roiX = kotlin.math.max(0, guideRect.left)
+            val roiY = kotlin.math.max(0, guideRect.top)
+            val roiW = kotlin.math.min(guideRect.width().toInt(), (mat.cols() - roiX).toInt())
+            val roiH = kotlin.math.min(guideRect.height().toInt(), (mat.rows() - roiY).toInt())
+            
+            if (roiW <= 0 || roiH <= 0) return null
+            roiMat = Mat(mat, org.opencv.core.Rect(roiX, roiY, roiW, roiH))
+            gray = Mat(); Imgproc.cvtColor(roiMat, gray, Imgproc.COLOR_RGBA2GRAY)
+            edges = Mat(); Imgproc.Canny(gray, edges, 50.0, 150.0)
+            Imgproc.findContours(edges, contours, Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+
+            var bestScore = 0.0; var bestBox: Array<PointF>? = null
+            for (contour in contours) {
+                val minRect = Imgproc.minAreaRect(MatOfPoint2f(*contour.toArray()))
+                val rw = minRect.size.width; val rh = minRect.size.height
+                
+                // 🚨 kotlin.math 명시적 사용
+                val aspect = kotlin.math.max(rw, rh) / kotlin.math.min(rw, rh).coerceAtLeast(1.0)
+                
+                if (aspect in 2.0..6.0) {
+                    val overlapRatio = (minRect.size.area() / (guideRect.width() * guideRect.height())).coerceIn(0.0, 1.0)
+                    val score = overlapRatio + (1.0 / aspect)
+                    if (score > bestScore) {
+                        bestScore = score
+                        val pts = Mat(); Imgproc.boxPoints(minRect, pts)
+                        bestBox = Array(4) { i -> PointF(pts.get(i,0)[0].toFloat() + roiX, pts.get(i,1)[0].toFloat() + roiY) }
+                        pts.release()
+                    }
+                }
+            }
+            bestBox?.let {
+                val cx = it.map { p -> p.x }.average().toFloat(); val cy = it.map { p -> p.y }.average().toFloat()
+                val sorted = it.sortedBy { p -> atan2(p.y - cy, p.x - cx) }.toMutableList()
+                var area = 0f
+                for (i in 0..3) {
+                    val j = (i + 1) % 4
+                    area += sorted[i].x * sorted[j].y - sorted[j].x * sorted[i].y
+                }
+                if (area < 0) sorted.reverse()
+                val tlIdx = sorted.indices.minByOrNull { i -> sorted[i].x + sorted[i].y } ?: 0
+                Collections.rotate(sorted, -tlIdx)
+                return sorted.toTypedArray()
+            }
+            return null
+        } finally {
+            mat?.release(); roiMat?.release(); gray?.release(); edges?.release()
+            for (c in contours) c.release()
+        }
+    }
+
+    private fun rectifyToFlatPlate(bitmap: Bitmap, corners: Array<PointF>): Bitmap? {
+        var bgMat: Mat? = null; var dest: Mat? = null
+        try {
+            bgMat = Mat(); Utils.bitmapToMat(bitmap, bgMat)
+            val srcPts = MatOfPoint2f(*corners.map { Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
+            val dstPts = MatOfPoint2f(Point(0.0, 0.0), Point(400.0, 0.0), Point(400.0, 100.0), Point(0.0, 100.0))
+            val transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
+            dest = Mat(); Imgproc.warpPerspective(bgMat, dest, transform, Size(400.0, 100.0))
+            val res = Bitmap.createBitmap(400, 100, Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(dest, res)
+            return res
+        } catch (e: Exception) { return null } 
+        finally { bgMat?.release(); dest?.release() }
+    }
+
+    @SuppressLint("UnsafeOptInUsageError")
+    private fun ImageProxy.toBitmapExt(): Bitmap {
+        val yBuffer = planes[0].buffer; val uBuffer = planes[1].buffer; val vBuffer = planes[2].buffer
+        val ySize = yBuffer.remaining(); val uSize = uBuffer.remaining(); val vSize = vBuffer.remaining()
+        val nv21 = ByteArray(ySize + uSize + vSize)
+        yBuffer.get(nv21, 0, ySize); vBuffer.get(nv21, ySize, vSize); uBuffer.get(nv21, ySize + vSize, uSize)
+        val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+        val out = ByteArrayOutputStream()
+        yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 100, out)
+        val imageBytes = out.toByteArray()
+        
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = 2
+            inPreferredConfig = Bitmap.Config.RGB_565
+        }
+        
+        // 🚨 Null 검증 추가: 디코드 실패 시 컴파일러 멈춤 및 연쇄 오류 방지
+        return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, options) 
+            ?: throw IllegalStateException("Bitmap decode failed")
+    }
+}
