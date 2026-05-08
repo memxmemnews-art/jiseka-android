@@ -18,6 +18,7 @@ import android.util.Base64
 import android.util.Log
 import android.view.View
 import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
@@ -49,7 +50,7 @@ class MainActivity : AppCompatActivity() {
     private val recognizer by lazy { TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build()) }
 
     private var lastCapturedBitmap: Bitmap? = null 
-    private var isWebReady = false // 웹뷰 로딩 완료 플래그
+    private var isWebReady = false 
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -72,6 +73,7 @@ class MainActivity : AppCompatActivity() {
             cacheMode = WebSettings.LOAD_NO_CACHE 
         }
 
+        webView.webChromeClient = WebChromeClient()
         webView.addJavascriptInterface(WebAppInterface(), "AndroidBridge")
         
         webView.webViewClient = object : WebViewClient() {
@@ -79,7 +81,6 @@ class MainActivity : AppCompatActivity() {
                 val host = request?.url?.host ?: return true
                 return host != Uri.parse(BuildConfig.VERCEL_URL).host
             }
-            // 웹 로드 완료 확인
             override fun onPageFinished(view: WebView?, url: String?) {
                 isWebReady = true
             }
@@ -109,14 +110,20 @@ class MainActivity : AppCompatActivity() {
         }
 
         @JavascriptInterface
+        fun showToast(msg: String) {
+            runOnUiThread {
+                android.widget.Toast.makeText(this@MainActivity, msg, android.widget.Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        @JavascriptInterface
         fun saveImageToGallery(base64Data: String) {
             Thread {
                 var bitmap: Bitmap? = null
                 try {
                     val base64Image = base64Data.substringAfter(",")
                     val imageBytes = Base64.decode(base64Image, Base64.DEFAULT)
-                    bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size) 
-                        ?: throw IllegalStateException("Bitmap decode failed")
+                    bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size) ?: throw IllegalStateException("Bitmap decode failed")
 
                     val filename = "JiSeKa_${System.currentTimeMillis()}.jpg"
                     var outputStream: java.io.OutputStream? = null
@@ -148,9 +155,9 @@ class MainActivity : AppCompatActivity() {
                         android.media.MediaScannerConnection.scanFile(this@MainActivity, arrayOf(file.absolutePath), arrayOf("image/jpeg"), null)
                     }
 
-                    runOnUiThread { android.widget.Toast.makeText(this@MainActivity, "사진이 저장되었습니다.", android.widget.Toast.LENGTH_SHORT).show() }
+                    showToast("사진이 갤러리에 저장되었습니다.")
                 } catch (e: Exception) {
-                    runOnUiThread { android.widget.Toast.makeText(this@MainActivity, "사진 저장 실패", android.widget.Toast.LENGTH_SHORT).show() }
+                    showToast("사진 저장 실패")
                 } finally {
                     bitmap?.let { if (!it.isRecycled) it.recycle() }
                 }
@@ -177,7 +184,6 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    // 🚨 사진 촬영 및 Web 전송 로직 (finally 블록에서 imageProxy 안전 종료)
     private fun capturePhoto() {
         val capture = imageCapture ?: return
         if (!isCapturing.compareAndSet(false, true)) return
@@ -197,32 +203,31 @@ class MainActivity : AppCompatActivity() {
                         originalBmp = rotated
                     }
 
+                    // 🚨 이전 Bitmap 해제하여 연속 촬영 메모리 누수 완벽 방어
+                    lastCapturedBitmap?.recycle()
                     lastCapturedBitmap = downscaleBitmapIfNeeded(originalBmp, 800)
                     
                     val baos = ByteArrayOutputStream()
                     lastCapturedBitmap!!.compress(Bitmap.CompressFormat.JPEG, 60, baos)
                     val base64Img = "data:image/jpeg;base64," + Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
 
-                    runOnUiThread {
-                        val js = "javascript:window.onPhotoCaptured('${base64Img}')"
-                        webView.evaluateJavascript(js, null)
-                    }
+                    // 🚨 치명적 버그 수정: 문자열 직접 보간 대신 JSONObject.quote 사용
+                    val safeBase64 = JSONObject.quote(base64Img)
+                    val js = "javascript:window.onPhotoCaptured($safeBase64)"
+                    
+                    runOnUiThread { webView.evaluateJavascript(js, null) }
                 } catch (e: Exception) {
                     Log.e("JiSeKa", "Capture processing failed", e)
                     sendErrorToWeb("사진 처리 중 오류가 발생했습니다.")
                 } finally {
-                    // 🚨 CameraX 프리징을 막는 핵심 방어 로직
                     imageProxy.close()
                     isCapturing.set(false)
                 }
             }
-            override fun onError(exception: ImageCaptureException) { 
-                isCapturing.set(false) 
-            }
+            override fun onError(exception: ImageCaptureException) { isCapturing.set(false) }
         })
     }
 
-    // 🚨 저장된 비트맵을 이용해 ROI 분석 수행 (기존 processEngineBackground 대체)
     private fun processPlateAnalysis(bitmap: Bitmap, guideRectF: RectF) {
         val imgW = bitmap.width.toFloat()
         val imgH = bitmap.height.toFloat()
@@ -241,7 +246,7 @@ class MainActivity : AppCompatActivity() {
 
         val corners = extractGeometryCorners(bitmap, guideRectImg)
         if (corners == null) {
-            sendErrorToWeb("번호판을 찾을 수 없습니다.")
+            sendErrorToWeb("해당 영역에서 번호판을 찾을 수 없습니다.")
             return
         }
 
@@ -253,9 +258,13 @@ class MainActivity : AppCompatActivity() {
 
         val inputImage = InputImage.fromBitmap(rectifiedBmp, 0)
         recognizer.process(inputImage).addOnCompleteListener { task ->
-            val ocrValid = task.isSuccessful && task.result.text.isNotEmpty()
+            // 🚨 번호판 정규식 기반 강력한 OCR 검증 (공백 제거 후 검사)
+            val text = task.result.text.replace(Regex("\\s+"), "")
+            val plateRegex = Regex("\\d{2,3}[가-힣]\\d{4}")
+            
+            val ocrValid = task.isSuccessful && plateRegex.containsMatchIn(text)
             if (!ocrValid) {
-                sendErrorToWeb("번호판 검증 실패")
+                sendErrorToWeb("번호판 텍스트를 인식할 수 없습니다.")
                 rectifiedBmp.recycle()
                 return@addOnCompleteListener
             }
@@ -308,6 +317,9 @@ class MainActivity : AppCompatActivity() {
             
             if (roiW <= 0 || roiH <= 0) return null
             roiMat = org.opencv.core.Mat(mat, org.opencv.core.Rect(roiX, roiY, roiW, roiH))
+            
+            val roiArea = roiW * roiH // 🚨 가이드 영역의 전체 면적
+            
             gray = org.opencv.core.Mat(); org.opencv.imgproc.Imgproc.cvtColor(roiMat, gray, org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY)
             edges = org.opencv.core.Mat(); org.opencv.imgproc.Imgproc.Canny(gray, edges, 50.0, 150.0)
             org.opencv.imgproc.Imgproc.findContours(edges, contours, org.opencv.core.Mat(), org.opencv.imgproc.Imgproc.RETR_EXTERNAL, org.opencv.imgproc.Imgproc.CHAIN_APPROX_SIMPLE)
@@ -316,13 +328,17 @@ class MainActivity : AppCompatActivity() {
             for (contour in contours) {
                 val minRect = org.opencv.imgproc.Imgproc.minAreaRect(org.opencv.core.MatOfPoint2f(*contour.toArray()))
                 val rw = minRect.size.width; val rh = minRect.size.height
-                val actualArea = org.opencv.imgproc.Imgproc.contourArea(contour)
                 val rectArea = rw * rh
+                
+                // 🚨 면적 제한: 가이드 박스의 5% 미만인 자잘한 외곽선(라디에이터 그릴 등) 원천 무시
+                if (rectArea < roiArea * 0.05) continue
+                
+                val actualArea = org.opencv.imgproc.Imgproc.contourArea(contour)
                 val rectangularity = if (rectArea > 0) actualArea / rectArea else 0.0
                 val aspect = kotlin.math.max(rw, rh) / kotlin.math.min(rw, rh).coerceAtLeast(1.0)
                 
                 if (aspect in 2.0..6.0 && rectangularity > 0.6) {
-                    val overlapRatio = (rectArea / (guideRect.width() * guideRect.height())).coerceIn(0.0, 1.0)
+                    val overlapRatio = (rectArea / roiArea.toDouble()).coerceIn(0.0, 1.0)
                     val score = (overlapRatio * 1.5) + (1.0 / aspect) + rectangularity
                     if (score > bestScore) {
                         bestScore = score
