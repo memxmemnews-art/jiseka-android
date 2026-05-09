@@ -56,10 +56,15 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        if (!org.opencv.android.OpenCVLoader.initDebug()) Log.e("JiSeKa", "OpenCV 초기화 실패")
+        // 🚨 치명적 버그 방지: OpenCV 초기화 실패 시 즉시 앱 종료
+        if (!org.opencv.android.OpenCVLoader.initDebug()) {
+            Log.e("JiSeKa", "OpenCV 초기화 실패")
+            android.widget.Toast.makeText(this, "OpenCV 엔진 초기화에 실패했습니다. 앱을 종료합니다.", android.widget.Toast.LENGTH_LONG).show()
+            finish()
+            return
+        }
 
         viewFinder = findViewById(R.id.viewFinder)
-        // 🚨 좌표계 통일을 위한 PreviewView ScaleType 강제 설정
         viewFinder.scaleType = PreviewView.ScaleType.FILL_CENTER
 
         webView = findViewById(R.id.webView)
@@ -73,6 +78,7 @@ class MainActivity : AppCompatActivity() {
             javaScriptEnabled = true
             domStorageEnabled = true
             cacheMode = WebSettings.LOAD_NO_CACHE 
+            allowFileAccess = true // 로컬 에셋 로딩을 위해 추가
         }
 
         webView.webChromeClient = WebChromeClient()
@@ -88,13 +94,14 @@ class MainActivity : AppCompatActivity() {
             }
         }
         
-        webView.loadUrl(BuildConfig.VERCEL_URL)
+        // 🚨 원인 추적을 위해 Vercel 로딩을 임시 차단하고 Local 로딩으로 변경
+        // webView.loadUrl(BuildConfig.VERCEL_URL) 
+        webView.loadUrl("file:///android_asset/index.html")
 
         if (allPermissionsGranted()) startCamera() 
         else ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 1001)
     }
 
-    // 🚨 Activity Lifecycle 안전 접근 함수
     private fun safeEvaluateJavascript(script: String) {
         if (isFinishing || isDestroyed) return
         runOnUiThread {
@@ -117,7 +124,6 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun analyzePlate(left: Float, top: Float, right: Float, bottom: Float) {
             cameraExecutor.execute { 
-                // 🚨 Bitmap Recycle 충돌 방지를 위한 안전 복사본 사용
                 lastCapturedBitmap?.let { bmp ->
                     val safeBitmap = bmp.copy(Bitmap.Config.ARGB_8888, false)
                     try {
@@ -142,7 +148,6 @@ class MainActivity : AppCompatActivity() {
 
         @JavascriptInterface
         fun saveImageToGallery(base64Data: String) {
-            // (임시 유지) 향후 Native Canvas 합성으로 전환 시 이곳을 수정합니다.
             Thread {
                 var bitmap: Bitmap? = null
                 try {
@@ -216,7 +221,6 @@ class MainActivity : AppCompatActivity() {
             @SuppressLint("UnsafeOptInUsageError")
             override fun onCaptureSuccess(imageProxy: ImageProxy) {
                 try {
-                    // 🚨 백그라운드 스레드와 충돌 방지를 위해 recycle() 대신 GC에 위임
                     lastCapturedBitmap = null 
                     System.gc()
 
@@ -387,7 +391,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 🚨 OCR 비율 동적 계산 적용 (고정 400x100 해제)
     private fun rectifyToFlatPlate(bitmap: Bitmap, corners: Array<PointF>): Bitmap? {
         var bgMat: org.opencv.core.Mat? = null
         var dest: org.opencv.core.Mat? = null
