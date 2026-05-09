@@ -35,7 +35,6 @@ import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
-import java.util.Collections
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -57,14 +56,14 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        // OpenCV 초기화 확인 [cite: 53]
+        // OpenCV 초기화 확인
         if (!org.opencv.android.OpenCVLoader.initDebug()) Log.e("JiSeKa", "OpenCV 초기화 실패")
 
         viewFinder = findViewById(R.id.viewFinder)
         webView = findViewById(R.id.webView)
         cameraExecutor = Executors.newSingleThreadExecutor()
 
-        // WebView 설정 및 캐시 제거 [cite: 53, 54]
+        // WebView 설정 및 캐시 제거
         webView.clearCache(true)
         webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
         webView.setBackgroundColor(Color.TRANSPARENT)
@@ -97,17 +96,18 @@ class MainActivity : AppCompatActivity() {
 
     inner class WebAppInterface {
         
-        // 1단계: 사진만 촬영하여 웹으로 전송 [cite: 81]
+        // 1단계: 사진만 촬영하여 웹으로 전송
         @JavascriptInterface
         fun takePhotoOnly() {
             if (!isWebReady) return
             runOnUiThread { capturePhoto() }
         }
 
-        // 2단계: 웹에서 지정한 ROI 영역을 바탕으로 번호판 분석 [cite: 84-86]
+        // 2단계: 웹에서 지정한 ROI 영역을 바탕으로 번호판 분석
         @JavascriptInterface
         fun analyzePlate(left: Float, top: Float, right: Float, bottom: Float) {
-            runOnUiThread { 
+            // 🚨 절대 원칙 준수: 메인 스레드 블로킹 금지 (백그라운드 스레드 사용)
+            cameraExecutor.execute { 
                 lastCapturedBitmap?.let { bmp ->
                     processPlateAnalysis(bmp, RectF(left, top, right, bottom))
                 } ?: sendErrorToWeb("분석할 사진이 메모리에 없습니다.")
@@ -121,7 +121,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // 최종 합성 이미지 저장 [cite: 57-78]
+        // 최종 합성 이미지 저장
         @JavascriptInterface
         fun saveImageToGallery(base64Data: String) {
             Thread {
@@ -246,7 +246,7 @@ class MainActivity : AppCompatActivity() {
         val imgW = bitmap.width.toFloat()
         val imgH = bitmap.height.toFloat()
         
-        // 실제 Bitmap 크기에 맞춘 ROI 계산 [cite: 84-86]
+        // 실제 Bitmap 크기에 맞춘 ROI 계산
         val guideRectImg = Rect(
             kotlin.math.max(0, (guideRectF.left * imgW).toInt()),
             kotlin.math.max(0, (guideRectF.top * imgH).toInt()),
@@ -271,7 +271,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // ML Kit OCR 검증 [cite: 88-89]
+        // ML Kit OCR 검증
         val inputImage = InputImage.fromBitmap(rectifiedBmp, 0)
         recognizer.process(inputImage).addOnCompleteListener { task ->
             val text = task.result.text.replace(Regex("\\s+"), "")
@@ -321,10 +321,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun extractGeometryCorners(bitmap: Bitmap, guideRect: Rect): Array<PointF>? {
-        var mat: org.opencv.core.Mat? = null; var roiMat: org.opencv.core.Mat? = null; var gray: org.opencv.core.Mat? = null; var edges: org.opencv.core.Mat? = null
+        var mat: org.opencv.core.Mat? = null; var roiMat: org.opencv.core.Mat? = null;
+        var gray: org.opencv.core.Mat? = null; var edges: org.opencv.core.Mat? = null
         val contours = ArrayList<org.opencv.core.MatOfPoint>()
         try {
-            mat = org.opencv.core.Mat(); org.opencv.android.Utils.bitmapToMat(bitmap, mat)
+            mat = org.opencv.core.Mat();
+            org.opencv.android.Utils.bitmapToMat(bitmap, mat)
             val roiX = kotlin.math.max(0, guideRect.left)
             val roiY = kotlin.math.max(0, guideRect.top)
             val roiW = kotlin.math.min(guideRect.width(), (mat.cols() - roiX))
@@ -334,16 +336,24 @@ class MainActivity : AppCompatActivity() {
             roiMat = org.opencv.core.Mat(mat, org.opencv.core.Rect(roiX, roiY, roiW, roiH))
             val roiArea = roiW * roiH 
             
-            gray = org.opencv.core.Mat(); org.opencv.imgproc.Imgproc.cvtColor(roiMat, gray, org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY)
-            edges = org.opencv.core.Mat(); org.opencv.imgproc.Imgproc.Canny(gray, edges, 50.0, 150.0)
+            gray = org.opencv.core.Mat();
+            org.opencv.imgproc.Imgproc.cvtColor(roiMat, gray, org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY)
+            edges = org.opencv.core.Mat();
+            org.opencv.imgproc.Imgproc.Canny(gray, edges, 50.0, 150.0)
             org.opencv.imgproc.Imgproc.findContours(edges, contours, org.opencv.core.Mat(), org.opencv.imgproc.Imgproc.RETR_EXTERNAL, org.opencv.imgproc.Imgproc.CHAIN_APPROX_SIMPLE)
 
-            var bestScore = 0.0; var bestBox: Array<PointF>? = null
+            var bestScore = 0.0;
+            var bestBox: Array<PointF>? = null
             for (contour in contours) {
-                val minRect = org.opencv.imgproc.Imgproc.minAreaRect(org.opencv.core.MatOfPoint2f(*contour.toArray()))
-                val rw = minRect.size.width; val rh = minRect.size.height
+                // 🚨 절대 원칙 준수: 메모리 누수 방지를 위한 MatOfPoint2f 즉시 해제 적용
+                val contour2f = org.opencv.core.MatOfPoint2f(*contour.toArray())
+                val minRect = org.opencv.imgproc.Imgproc.minAreaRect(contour2f)
+                contour2f.release()
+
+                val rw = minRect.size.width;
+                val rh = minRect.size.height
                 val rectArea = rw * rh
-                if (rectArea < roiArea * 0.05) continue // 최소 면적 검증 [cite: 104]
+                if (rectArea < roiArea * 0.05) continue // 최소 면적 검증
                 
                 val actualArea = org.opencv.imgproc.Imgproc.contourArea(contour)
                 val rectangularity = if (rectArea > 0) actualArea / rectArea else 0.0
@@ -354,7 +364,8 @@ class MainActivity : AppCompatActivity() {
                     val score = (overlapRatio * 1.5) + (1.0 / aspect) + rectangularity
                     if (score > bestScore) {
                         bestScore = score
-                        val pts = org.opencv.core.Mat(); org.opencv.imgproc.Imgproc.boxPoints(minRect, pts)
+                        val pts = org.opencv.core.Mat();
+                        org.opencv.imgproc.Imgproc.boxPoints(minRect, pts)
                         bestBox = Array(4) { i -> PointF(pts.get(i,0)[0].toFloat() + roiX, pts.get(i,1)[0].toFloat() + roiY) }
                         pts.release()
                     }
@@ -371,7 +382,8 @@ class MainActivity : AppCompatActivity() {
             }
             return null
         } finally {
-            mat?.release(); roiMat?.release(); gray?.release(); edges?.release()
+            mat?.release();
+            roiMat?.release(); gray?.release(); edges?.release()
             for (c in contours) c.release()
         }
     }
@@ -379,16 +391,19 @@ class MainActivity : AppCompatActivity() {
     private fun rectifyToFlatPlate(bitmap: Bitmap, corners: Array<PointF>): Bitmap? {
         var bgMat: org.opencv.core.Mat? = null; var dest: org.opencv.core.Mat? = null
         try {
-            bgMat = org.opencv.core.Mat(); org.opencv.android.Utils.bitmapToMat(bitmap, bgMat)
+            bgMat = org.opencv.core.Mat();
+            org.opencv.android.Utils.bitmapToMat(bitmap, bgMat)
             val srcPts = org.opencv.core.MatOfPoint2f(*corners.map { org.opencv.core.Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
             val dstPts = org.opencv.core.MatOfPoint2f(org.opencv.core.Point(0.0, 0.0), org.opencv.core.Point(400.0, 0.0), org.opencv.core.Point(400.0, 100.0), org.opencv.core.Point(0.0, 100.0))
             val transform = org.opencv.imgproc.Imgproc.getPerspectiveTransform(srcPts, dstPts)
-            dest = org.opencv.core.Mat(); org.opencv.imgproc.Imgproc.warpPerspective(bgMat, dest, transform, org.opencv.core.Size(400.0, 100.0))
+            dest = org.opencv.core.Mat();
+            org.opencv.imgproc.Imgproc.warpPerspective(bgMat, dest, transform, org.opencv.core.Size(400.0, 100.0))
             val res = Bitmap.createBitmap(400, 100, Bitmap.Config.ARGB_8888)
             org.opencv.android.Utils.matToBitmap(dest, res)
             return res
         } catch (e: Exception) { return null } 
-        finally { bgMat?.release(); dest?.release() }
+        finally { bgMat?.release();
+            dest?.release() }
     }
 
     @SuppressLint("UnsafeOptInUsageError")
@@ -404,10 +419,13 @@ class MainActivity : AppCompatActivity() {
             return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options) 
                 ?: throw IllegalStateException("JPEG Bitmap decode failed")
         } 
-        val yBuffer = planes[0].buffer; val uBuffer = planes[1].buffer; val vBuffer = planes[2].buffer
-        val ySize = yBuffer.remaining(); val uSize = uBuffer.remaining(); val vSize = vBuffer.remaining()
+        val yBuffer = planes[0].buffer;
+        val uBuffer = planes[1].buffer; val vBuffer = planes[2].buffer
+        val ySize = yBuffer.remaining();
+        val uSize = uBuffer.remaining(); val vSize = vBuffer.remaining()
         val nv21 = ByteArray(ySize + uSize + vSize)
-        yBuffer.get(nv21, 0, ySize); vBuffer.get(nv21, ySize, vSize); uBuffer.get(nv21, ySize + vSize, uSize)
+        yBuffer.get(nv21, 0, ySize);
+        vBuffer.get(nv21, ySize, vSize); uBuffer.get(nv21, ySize + vSize, uSize)
         val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
         val out = ByteArrayOutputStream()
         yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 100, out)
