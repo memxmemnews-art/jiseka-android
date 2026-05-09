@@ -56,15 +56,16 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        // 🚨 치명적 버그 방지: OpenCV 초기화 실패 시 즉시 앱 종료
+        // 🚨 OpenCV 초기화 실패 시 즉시 앱 종료하여 네이티브 크래시 방지
         if (!org.opencv.android.OpenCVLoader.initDebug()) {
             Log.e("JiSeKa", "OpenCV 초기화 실패")
-            android.widget.Toast.makeText(this, "OpenCV 엔진 초기화에 실패했습니다. 앱을 종료합니다.", android.widget.Toast.LENGTH_LONG).show()
+            android.widget.Toast.makeText(this, "OpenCV 엔진 초기화에 실패했습니다.", android.widget.Toast.LENGTH_LONG).show()
             finish()
             return
         }
 
         viewFinder = findViewById(R.id.viewFinder)
+        // 🚨 WebView와 좌표계를 1:1로 맞추기 위한 ScaleType 설정
         viewFinder.scaleType = PreviewView.ScaleType.FILL_CENTER
 
         webView = findViewById(R.id.webView)
@@ -78,7 +79,7 @@ class MainActivity : AppCompatActivity() {
             javaScriptEnabled = true
             domStorageEnabled = true
             cacheMode = WebSettings.LOAD_NO_CACHE 
-            allowFileAccess = true // 로컬 에셋 로딩을 위해 추가
+            allowFileAccess = true
         }
 
         webView.webChromeClient = WebChromeClient()
@@ -86,22 +87,21 @@ class MainActivity : AppCompatActivity() {
         
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                val host = request?.url?.host ?: return true
-                return host != Uri.parse(BuildConfig.VERCEL_URL).host
+                return false // 모든 링크를 WebView 내부에서 처리
             }
             override fun onPageFinished(view: WebView?, url: String?) {
                 isWebReady = true
             }
         }
         
-        // 🚨 원인 추적을 위해 Vercel 로딩을 임시 차단하고 Local 로딩으로 변경
-        // webView.loadUrl(BuildConfig.VERCEL_URL) 
-        webView.loadUrl("file:///android_asset/index.html")
+        // 🚀 Vercel에 배포된 진짜 주소로 연결
+        webView.loadUrl("https://ziseka-app.vercel.app")
 
         if (allPermissionsGranted()) startCamera() 
         else ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 1001)
     }
 
+    // 🚨 Activity가 종료된 상태에서 JS를 호출하여 발생하는 크래시 방지
     private fun safeEvaluateJavascript(script: String) {
         if (isFinishing || isDestroyed) return
         runOnUiThread {
@@ -124,14 +124,13 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun analyzePlate(left: Float, top: Float, right: Float, bottom: Float) {
             cameraExecutor.execute { 
+                // 🚨 분석 중 비트맵이 해제(Recycle)되는 것을 방지하기 위해 안전 복사본 사용
                 lastCapturedBitmap?.let { bmp ->
                     val safeBitmap = bmp.copy(Bitmap.Config.ARGB_8888, false)
                     try {
                         processPlateAnalysis(safeBitmap, RectF(left, top, right, bottom))
                     } finally {
-                        if (!safeBitmap.isRecycled) {
-                            safeBitmap.recycle()
-                        }
+                        if (!safeBitmap.isRecycled) safeBitmap.recycle()
                     }
                 } ?: sendErrorToWeb("분석할 사진이 메모리에 없습니다.")
             }
@@ -221,6 +220,7 @@ class MainActivity : AppCompatActivity() {
             @SuppressLint("UnsafeOptInUsageError")
             override fun onCaptureSuccess(imageProxy: ImageProxy) {
                 try {
+                    // 메모리 해제 대신 GC 위임으로 안정성 확보
                     lastCapturedBitmap = null 
                     System.gc()
 
