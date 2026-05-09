@@ -405,4 +405,52 @@ class MainActivity : AppCompatActivity() {
             val leftH = dist(corners[0], corners[3])
             val rightH = dist(corners[1], corners[2])
 
-            val targetW = kotlin.math.max(topW,
+            val targetW = kotlin.math.max(topW, bottomW).toInt().coerceAtLeast(200)
+            val targetH = kotlin.math.max(leftH, rightH).toInt().coerceAtLeast(60)
+
+            val srcPts = org.opencv.core.MatOfPoint2f(*corners.map { org.opencv.core.Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
+            val dstPts = org.opencv.core.MatOfPoint2f(
+                org.opencv.core.Point(0.0, 0.0),
+                org.opencv.core.Point(targetW.toDouble(), 0.0),
+                org.opencv.core.Point(targetW.toDouble(), targetH.toDouble()),
+                org.opencv.core.Point(0.0, targetH.toDouble())
+            )
+
+            val transform = org.opencv.imgproc.Imgproc.getPerspectiveTransform(srcPts, dstPts)
+            dest = org.opencv.core.Mat()
+
+            org.opencv.imgproc.Imgproc.warpPerspective(bgMat, dest, transform, org.opencv.core.Size(targetW.toDouble(), targetH.toDouble()))
+
+            val result = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
+            org.opencv.android.Utils.matToBitmap(dest, result)
+
+            srcPts.release(); dstPts.release(); transform.release()
+            return result
+
+        } catch (e: Exception) {
+            Log.e("JiSeKa", "warp 실패", e)
+            return null
+        } finally {
+            bgMat?.release(); dest?.release()
+        }
+    }
+
+    @SuppressLint("UnsafeOptInUsageError")
+    private fun ImageProxy.toBitmapExt(): Bitmap {
+        val options = BitmapFactory.Options().apply { inSampleSize = 2; inPreferredConfig = Bitmap.Config.RGB_565 }
+        if (format == ImageFormat.JPEG) {
+            val buffer = planes[0].buffer
+            val bytes = ByteArray(buffer.remaining()); buffer.get(bytes)
+            return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options) ?: throw IllegalStateException("JPEG Bitmap decode failed")
+        } 
+        val yBuffer = planes[0].buffer; val uBuffer = planes[1].buffer; val vBuffer = planes[2].buffer
+        val ySize = yBuffer.remaining(); val uSize = uBuffer.remaining(); val vSize = vBuffer.remaining()
+        val nv21 = ByteArray(ySize + uSize + vSize)
+        yBuffer.get(nv21, 0, ySize); vBuffer.get(nv21, ySize, vSize); uBuffer.get(nv21, ySize + vSize, uSize)
+        val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+        val out = ByteArrayOutputStream()
+        yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 100, out)
+        val imageBytes = out.toByteArray()
+        return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, options) ?: throw IllegalStateException("YUV Bitmap decode failed")
+    }
+}
