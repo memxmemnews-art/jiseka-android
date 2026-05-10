@@ -75,12 +75,13 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        viewFinder?.scaleType = PreviewView.ScaleType.FILL_CENTER
+        // 🚨 핵심 개선 1: 웹의 object-fit: contain과 완벽하게 1:1 좌표계를 일치시키기 위해 FIT_CENTER 채택
+        viewFinder?.scaleType = PreviewView.ScaleType.FIT_CENTER
         cameraExecutor = Executors.newSingleThreadExecutor()
 
         webView?.apply {
             clearCache(true)
-            setLayerType(View.LAYER_TYPE_HARDWARE, null)
+            setLayerType(View.LAYER_TYPE_SOFTWARE, null)
             setBackgroundColor(Color.TRANSPARENT)
             
             settings.apply {
@@ -134,7 +135,13 @@ class MainActivity : AppCompatActivity() {
                 lastCapturedBitmap?.let { bmp ->
                     val safeBitmap = bmp.copy(Bitmap.Config.ARGB_8888, false)
                     try {
-                        processPlateAnalysis(safeBitmap, RectF(left, top, right, bottom))
+                        // 🚨 개선 3: 0.0 ~ 1.0 사이로 완벽하게 안전 클램핑(Clamp)하여 네이티브로 전달
+                        val cLeft = kotlin.math.max(0f, kotlin.math.min(1f, left))
+                        val cTop = kotlin.math.max(0f, kotlin.math.min(1f, top))
+                        val cRight = kotlin.math.max(0f, kotlin.math.min(1f, right))
+                        val cBottom = kotlin.math.max(0f, kotlin.math.min(1f, bottom))
+                        
+                        processPlateAnalysis(safeBitmap, RectF(cLeft, cTop, cRight, cBottom))
                     } catch (e: Exception) {
                         Log.e("JiSeKa", "분석 에러", e)
                         sendErrorToWeb("분석 중 네이티브 에러 발생")
@@ -244,7 +251,6 @@ class MainActivity : AppCompatActivity() {
                         if (rotatedBmp != bitmap) bitmap.recycle()
                     }
 
-                    // 🚨 화질 및 작은 번호판 픽셀 보존을 위해 1600px 다운스케일 유지
                     lastCapturedBitmap = downscaleBitmapIfNeeded(rotatedBmp, 1600)
                     if (lastCapturedBitmap != rotatedBmp) rotatedBmp.recycle()
                     
@@ -274,7 +280,6 @@ class MainActivity : AppCompatActivity() {
         val imgW = bitmap.width.toFloat()
         val imgH = bitmap.height.toFloat()
         
-        // 🚨 우선순위 2위 해결책: 확장 전의 순수 원본 타이트한 좌표(baseRectImg)를 별도 추출
         val baseLeft = (guideRectF.left * imgW).toInt()
         val baseTop = (guideRectF.top * imgH).toInt()
         val baseRight = (guideRectF.right * imgW).toInt()
@@ -282,7 +287,6 @@ class MainActivity : AppCompatActivity() {
 
         val baseRectImg = Rect(baseLeft, baseTop, baseRight, baseBottom)
 
-        // 탐색 그물망 확장을 위한 25% 패딩 연산
         val paddingX = ((baseRight - baseLeft) * 0.25f).toInt()
         val paddingY = ((baseBottom - baseTop) * 0.25f).toInt()
 
@@ -298,14 +302,12 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // 🚨 원본 baseRectImg를 함께 전달하여 Fallback 발생 시 타이트한 원본 영역으로 완벽 방어
         val corners = extractGeometryCorners(bitmap, expandedRectImg, baseRectImg)
         if (corners == null) {
             sendErrorToWeb("번호판을 찾을 수 없습니다.")
             return
         }
 
-        // OCR 종속성 완전 분리 (디커플링)
         val rectifiedBmp = rectifyToFlatPlate(bitmap, corners)
         if (rectifiedBmp == null) {
             sendSuccessToWeb(corners, imgW, imgH)
@@ -350,7 +352,6 @@ class MainActivity : AppCompatActivity() {
         return Bitmap.createScaledBitmap(bitmap, (bitmap.width * scale).toInt(), (bitmap.height * scale).toInt(), true)
     }
 
-    // 🚨 파라미터에 fallbackRect 추가하여 거대화 왜곡 원천 차단
     private fun extractGeometryCorners(bitmap: Bitmap, searchRect: Rect, fallbackRect: Rect): Array<PointF>? {
         var mat: org.opencv.core.Mat? = null
         var roiMat: org.opencv.core.Mat? = null
@@ -358,7 +359,7 @@ class MainActivity : AppCompatActivity() {
         var edges: org.opencv.core.Mat? = null
         val contours = ArrayList<org.opencv.core.MatOfPoint>()
 
-        // 🚨 절대 멈춤 방지용 Fallback: 인식이 끝내 불가능할 경우 25% 확장된 영역이 아닌, 원본 타이트한 가이드 박스 모서리를 반환
+        // 🚨 개선 5: Fallback 발생 시 무조건 거대 가림막이 되지 않도록 타이트한 원본 영역으로 엄격 고정
         val fallbackBox = arrayOf(
             PointF(fallbackRect.left.toFloat(), fallbackRect.top.toFloat()),
             PointF(fallbackRect.right.toFloat(), fallbackRect.top.toFloat()),
@@ -389,7 +390,6 @@ class MainActivity : AppCompatActivity() {
             edges = org.opencv.core.Mat()
             org.opencv.imgproc.Imgproc.Canny(gray, edges, 30.0, 100.0)
 
-            // Morphology Close 연산으로 끊어진 테두리 강력 접합
             val kernel = org.opencv.imgproc.Imgproc.getStructuringElement(
                 org.opencv.imgproc.Imgproc.MORPH_RECT, 
                 org.opencv.core.Size(5.0, 5.0)
