@@ -62,7 +62,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // 🚨 방어벽 1: OpenCV 초기화 실패 시 강제 종료(Crash) 방지
         if (!org.opencv.android.OpenCVLoader.initDebug()) {
             Log.e("JiSeKa", "OpenCV 초기화 실패")
             Toast.makeText(this, "🚨 OpenCV 로드 실패 (PC 에뮬레이터 환경인지 확인하세요)", Toast.LENGTH_LONG).show()
@@ -76,7 +75,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // 🚨 좌표계 완전 통일을 위한 ScaleType 고정
         viewFinder?.scaleType = PreviewView.ScaleType.FILL_CENTER
         cameraExecutor = Executors.newSingleThreadExecutor()
 
@@ -104,7 +102,6 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             
-            // 🚀 Vercel에 배포 완료된 진짜 웹사이트로 연결
             loadUrl("https://ziseka-app.vercel.app")
         }
 
@@ -112,7 +109,6 @@ class MainActivity : AppCompatActivity() {
         else ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 1001)
     }
 
-    // 🚨 Activity가 소멸된 상태에서 JS를 호출해 발생하는 크래시 방지
     private fun safeEvaluateJavascript(script: String) {
         if (isFinishing || isDestroyed) return
         runOnUiThread {
@@ -135,7 +131,6 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun analyzePlate(left: Float, top: Float, right: Float, bottom: Float) {
             cameraExecutor.execute { 
-                // 🚨 비트맵 해제 충돌을 막기 위한 안전 복사본 사용
                 lastCapturedBitmap?.let { bmp ->
                     val safeBitmap = bmp.copy(Bitmap.Config.ARGB_8888, false)
                     try {
@@ -218,7 +213,6 @@ class MainActivity : AppCompatActivity() {
             val preview = Preview.Builder().build().also { it.setSurfaceProvider(viewFinder?.surfaceProvider) }
             imageCapture = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY).build()
             
-            // 🚨 방어벽 3: 에뮬레이터에서 후면 카메라 바인딩 에러 방지
             try {
                 cameraProvider.unbindAll()
                 cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageCapture)
@@ -250,7 +244,8 @@ class MainActivity : AppCompatActivity() {
                         if (rotatedBmp != bitmap) bitmap.recycle()
                     }
 
-                    lastCapturedBitmap = downscaleBitmapIfNeeded(rotatedBmp, 1024)
+                    // 🚨 개선 E: 작은 번호판 픽셀 보존을 위해 다운스케일 한도를 1024px → 1600px로 상향
+                    lastCapturedBitmap = downscaleBitmapIfNeeded(rotatedBmp, 1600)
                     if (lastCapturedBitmap != rotatedBmp) rotatedBmp.recycle()
                     
                     val baos = ByteArrayOutputStream()
@@ -279,41 +274,47 @@ class MainActivity : AppCompatActivity() {
         val imgW = bitmap.width.toFloat()
         val imgH = bitmap.height.toFloat()
         
-        val guideRectImg = Rect(
-            kotlin.math.max(0, (guideRectF.left * imgW).toInt()),
-            kotlin.math.max(0, (guideRectF.top * imgH).toInt()),
-            kotlin.math.min(imgW.toInt(), (guideRectF.right * imgW).toInt()),
-            kotlin.math.min(imgH.toInt(), (guideRectF.bottom * imgH).toInt())
+        // 🚨 개선 A: 좌표계 Mismatch를 완벽히 흡수하기 위해 상하좌우 25% 넓게 확장된 ROI 계산
+        val baseLeft = (guideRectF.left * imgW).toInt()
+        val baseTop = (guideRectF.top * imgH).toInt()
+        val baseRight = (guideRectF.right * imgW).toInt()
+        val baseBottom = (guideRectF.bottom * imgH).toInt()
+
+        val paddingX = ((baseRight - baseLeft) * 0.25f).toInt()
+        val paddingY = ((baseBottom - baseTop) * 0.25f).toInt()
+
+        val expandedRectImg = Rect(
+            kotlin.math.max(0, baseLeft - paddingX),
+            kotlin.math.max(0, baseTop - paddingY),
+            kotlin.math.min(bitmap.width, baseRight + paddingX),
+            kotlin.math.min(bitmap.height, baseBottom + paddingY)
         )
 
-        if (guideRectImg.width() <= 0 || guideRectImg.height() <= 0) {
+        if (expandedRectImg.width() <= 0 || expandedRectImg.height() <= 0) {
             sendErrorToWeb("가이드 영역이 올바르지 않습니다.")
             return
         }
 
-        val corners = extractGeometryCorners(bitmap, guideRectImg)
+        val corners = extractGeometryCorners(bitmap, expandedRectImg)
         if (corners == null) {
             sendErrorToWeb("번호판을 찾을 수 없습니다.")
             return
         }
 
+        // 🚨 개선 D: OCR과 번호판 위치 검출을 완전 분리 (디커플링)
+        // 기하학적으로 신뢰할 수 있는 모서리를 찾았다면, OCR 인식 성공 여부와 관계없이 무조건 가림막을 씌웁니다.
         val rectifiedBmp = rectifyToFlatPlate(bitmap, corners)
         if (rectifiedBmp == null) {
-            sendErrorToWeb("이미지 보정에 실패했습니다.")
+            sendSuccessToWeb(corners, imgW, imgH) // 보정에 실패해도 꼭짓점 전송
             return
         }
 
         val inputImage = InputImage.fromBitmap(rectifiedBmp, 0)
         recognizer.process(inputImage).addOnCompleteListener { task ->
-            val text = task.result.text.replace(Regex("\\s+"), "")
-            val plateRegex = Regex("\\d{2,3}[가-힣]\\d{4}") 
+            // OCR 결과는 내부 로깅/보조 데이터로만 확인하며, 실패하더라도 에러를 내지 않고 성공 처리합니다.
+            val text = if (task.isSuccessful) task.result.text.replace(Regex("\\s+"), "") else ""
+            Log.d("JiSeKa", "Detected Auxiliary OCR Text: $text")
             
-            val ocrValid = task.isSuccessful && plateRegex.containsMatchIn(text)
-            if (!ocrValid) {
-                sendErrorToWeb("번호판 텍스트를 인식할 수 없습니다.")
-                rectifiedBmp.recycle()
-                return@addOnCompleteListener
-            }
             sendSuccessToWeb(corners, imgW, imgH)
             rectifiedBmp.recycle()
         }
@@ -348,50 +349,104 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun extractGeometryCorners(bitmap: Bitmap, guideRect: Rect): Array<PointF>? {
-        var mat: org.opencv.core.Mat? = null; var roiMat: org.opencv.core.Mat? = null;
-        var gray: org.opencv.core.Mat? = null; var edges: org.opencv.core.Mat? = null
+        var mat: org.opencv.core.Mat? = null
+        var roiMat: org.opencv.core.Mat? = null
+        var gray: org.opencv.core.Mat? = null
+        var edges: org.opencv.core.Mat? = null
         val contours = ArrayList<org.opencv.core.MatOfPoint>()
+
+        // 🚨 절대 멈춤 방지용 Fallback: 인식이 끝내 불가능할 경우 사용자가 놓은 박스 모서리를 그대로 반환
+        val fallbackBox = arrayOf(
+            PointF(guideRect.left.toFloat(), guideRect.top.toFloat()),
+            PointF(guideRect.right.toFloat(), guideRect.top.toFloat()),
+            PointF(guideRect.right.toFloat(), guideRect.bottom.toFloat()),
+            PointF(guideRect.left.toFloat(), guideRect.bottom.toFloat())
+        )
+
         try {
-            mat = org.opencv.core.Mat(); org.opencv.android.Utils.bitmapToMat(bitmap, mat)
+            mat = org.opencv.core.Mat()
+            org.opencv.android.Utils.bitmapToMat(bitmap, mat)
+
             val roiX = kotlin.math.max(0, guideRect.left)
             val roiY = kotlin.math.max(0, guideRect.top)
-            val roiW = kotlin.math.min(guideRect.width(), (mat.cols() - roiX))
-            val roiH = kotlin.math.min(guideRect.height(), (mat.rows() - roiY))
-            
-            if (roiW <= 0 || roiH <= 0) return null
+            val roiW = kotlin.math.min(mat.cols() - roiX, guideRect.width())
+            val roiH = kotlin.math.min(mat.rows() - roiY, guideRect.height())
+
+            if (roiW <= 0 || roiH <= 0) return fallbackBox
+
             roiMat = org.opencv.core.Mat(mat, org.opencv.core.Rect(roiX, roiY, roiW, roiH))
             val roiArea = roiW * roiH 
-            
-            gray = org.opencv.core.Mat(); org.opencv.imgproc.Imgproc.cvtColor(roiMat, gray, org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY)
-            edges = org.opencv.core.Mat(); org.opencv.imgproc.Imgproc.Canny(gray, edges, 50.0, 150.0)
-            org.opencv.imgproc.Imgproc.findContours(edges, contours, org.opencv.core.Mat(), org.opencv.imgproc.Imgproc.RETR_EXTERNAL, org.opencv.imgproc.Imgproc.CHAIN_APPROX_SIMPLE)
 
-            var bestScore = 0.0; var bestBox: Array<PointF>? = null
+            gray = org.opencv.core.Mat()
+            org.opencv.imgproc.Imgproc.cvtColor(roiMat, gray, org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY)
+
+            // 어두운 환경 방어 (히스토그램 평활화)
+            org.opencv.imgproc.Imgproc.equalizeHist(gray, gray)
+            org.opencv.imgproc.Imgproc.GaussianBlur(gray, gray, org.opencv.core.Size(3.0, 3.0), 0.0)
+
+            edges = org.opencv.core.Mat()
+            org.opencv.imgproc.Imgproc.Canny(gray, edges, 30.0, 100.0)
+
+            // 🚨 개선 C: Morphology Close 연산 추가 (글자나 반사광으로 끊어진 테두리를 강력하게 접합)
+            val kernel = org.opencv.imgproc.Imgproc.getStructuringElement(
+                org.opencv.imgproc.Imgproc.MORPH_RECT, 
+                org.opencv.core.Size(5.0, 5.0)
+            )
+            org.opencv.imgproc.Imgproc.morphologyEx(
+                edges, edges, 
+                org.opencv.imgproc.Imgproc.MORPH_CLOSE, 
+                kernel
+            )
+            kernel.release()
+
+            // 🚨 개선 B: RETR_EXTERNAL 대신 RETR_LIST를 사용하여 차체 내부의 번호판 윤곽선까지 모두 수집
+            org.opencv.imgproc.Imgproc.findContours(
+                edges, contours, org.opencv.core.Mat(), 
+                org.opencv.imgproc.Imgproc.RETR_LIST, 
+                org.opencv.imgproc.Imgproc.CHAIN_APPROX_SIMPLE
+            )
+
+            var bestScore = 0.0
+            var bestBox: Array<PointF>? = null
+
+            val guideCenterX = (guideRect.left + guideRect.right) / 2.0f
+            val guideCenterY = (guideRect.top + guideRect.bottom) / 2.0f
+
             for (contour in contours) {
                 val contour2f = org.opencv.core.MatOfPoint2f(*contour.toArray())
                 val minRect = org.opencv.imgproc.Imgproc.minAreaRect(contour2f)
                 contour2f.release()
 
-                val rw = minRect.size.width; val rh = minRect.size.height
+                val rw = minRect.size.width
+                val rh = minRect.size.height
                 val rectArea = rw * rh
-                if (rectArea < roiArea * 0.05) continue 
-                
-                val actualArea = org.opencv.imgproc.Imgproc.contourArea(contour)
-                val rectangularity = if (rectArea > 0) actualArea / rectArea else 0.0
+
+                // 너무 작은 노이즈 사각형만 필터링 (ROI 전체 면적의 10% 이상)
+                if (rectArea < roiArea * 0.10) continue 
+
                 val aspect = kotlin.math.max(rw, rh) / kotlin.math.min(rw, rh).coerceAtLeast(1.0)
-                
-                if (aspect in 2.0..6.0 && rectangularity > 0.6) {
-                    val overlapRatio = (rectArea / roiArea.toDouble()).coerceIn(0.0, 1.0)
-                    val score = (overlapRatio * 1.5) + (1.0 / aspect) + rectangularity
+
+                // 한국 번호판 비율(1.8 ~ 6.0) 내에 속하는 후보군 집중 평가
+                if (aspect in 1.8..6.0) {
+                    val centerX = minRect.center.x + roiX
+                    val centerY = minRect.center.y + roiY
+                    
+                    // 가이드 박스 중앙과 가까울수록 가중치 부여
+                    val dist = kotlin.math.hypot((centerX - guideCenterX).toDouble(), (centerY - guideCenterY).toDouble())
+                    val score = rectArea - (dist * 5.0)
+
                     if (score > bestScore) {
                         bestScore = score
-                        val pts = org.opencv.core.Mat(); org.opencv.imgproc.Imgproc.boxPoints(minRect, pts)
-                        bestBox = Array(4) { i -> PointF(pts.get(i,0)[0].toFloat() + roiX, pts.get(i,1)[0].toFloat() + roiY) }
+                        val pts = org.opencv.core.Mat()
+                        org.opencv.imgproc.Imgproc.boxPoints(minRect, pts)
+                        bestBox = Array(4) { i -> 
+                            PointF(pts.get(i, 0)[0].toFloat() + roiX, pts.get(i, 1)[0].toFloat() + roiY) 
+                        }
                         pts.release()
                     }
                 }
             }
-            
+
             bestBox?.let { pts ->
                 val sorted = Array(4) { PointF(0f, 0f) }
                 sorted[0] = pts.minByOrNull { it.x + it.y } ?: pts[0] 
@@ -400,9 +455,17 @@ class MainActivity : AppCompatActivity() {
                 sorted[3] = pts.minByOrNull { it.x - it.y } ?: pts[0] 
                 return sorted
             }
-            return null
+
+            return fallbackBox
+
+        } catch (e: Exception) {
+            Log.e("JiSeKa", "Corner extraction error", e)
+            return fallbackBox
         } finally {
-            mat?.release(); roiMat?.release(); gray?.release(); edges?.release()
+            mat?.release()
+            roiMat?.release()
+            gray?.release()
+            edges?.release()
             for (c in contours) c.release()
         }
     }
@@ -443,14 +506,17 @@ class MainActivity : AppCompatActivity() {
             val result = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
             org.opencv.android.Utils.matToBitmap(dest, result)
 
-            srcPts.release(); dstPts.release(); transform.release()
+            srcPts.release()
+            dstPts.release()
+            transform.release()
             return result
 
         } catch (e: Exception) {
             Log.e("JiSeKa", "warp 실패", e)
             return null
         } finally {
-            bgMat?.release(); dest?.release()
+            bgMat?.release()
+            dest?.release()
         }
     }
 
@@ -459,13 +525,20 @@ class MainActivity : AppCompatActivity() {
         val options = BitmapFactory.Options().apply { inSampleSize = 2; inPreferredConfig = Bitmap.Config.RGB_565 }
         if (format == ImageFormat.JPEG) {
             val buffer = planes[0].buffer
-            val bytes = ByteArray(buffer.remaining()); buffer.get(bytes)
+            val bytes = ByteArray(buffer.remaining())
+            buffer.get(bytes)
             return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options) ?: throw IllegalStateException("JPEG Bitmap decode failed")
         } 
-        val yBuffer = planes[0].buffer; val uBuffer = planes[1].buffer; val vBuffer = planes[2].buffer
-        val ySize = yBuffer.remaining(); val uSize = uBuffer.remaining(); val vSize = vBuffer.remaining()
+        val yBuffer = planes[0].buffer
+        val uBuffer = planes[1].buffer
+        val vBuffer = planes[2].buffer
+        val ySize = yBuffer.remaining()
+        val uSize = uBuffer.remaining()
+        val vSize = vBuffer.remaining()
         val nv21 = ByteArray(ySize + uSize + vSize)
-        yBuffer.get(nv21, 0, ySize); vBuffer.get(nv21, ySize, vSize); uBuffer.get(nv21, ySize + vSize, uSize)
+        yBuffer.get(nv21, 0, ySize)
+        vBuffer.get(nv21, ySize, vSize)
+        uBuffer.get(nv21, ySize + vSize, uSize)
         val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
         val out = ByteArrayOutputStream()
         yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 100, out)
