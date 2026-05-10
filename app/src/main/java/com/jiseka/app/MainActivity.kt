@@ -244,7 +244,7 @@ class MainActivity : AppCompatActivity() {
                         if (rotatedBmp != bitmap) bitmap.recycle()
                     }
 
-                    // 🚨 개선 E: 작은 번호판 픽셀 보존을 위해 다운스케일 한도를 1024px → 1600px로 상향
+                    // 🚨 화질 및 작은 번호판 픽셀 보존을 위해 1600px 다운스케일 유지
                     lastCapturedBitmap = downscaleBitmapIfNeeded(rotatedBmp, 1600)
                     if (lastCapturedBitmap != rotatedBmp) rotatedBmp.recycle()
                     
@@ -274,12 +274,15 @@ class MainActivity : AppCompatActivity() {
         val imgW = bitmap.width.toFloat()
         val imgH = bitmap.height.toFloat()
         
-        // 🚨 개선 A: 좌표계 Mismatch를 완벽히 흡수하기 위해 상하좌우 25% 넓게 확장된 ROI 계산
+        // 🚨 우선순위 2위 해결책: 확장 전의 순수 원본 타이트한 좌표(baseRectImg)를 별도 추출
         val baseLeft = (guideRectF.left * imgW).toInt()
         val baseTop = (guideRectF.top * imgH).toInt()
         val baseRight = (guideRectF.right * imgW).toInt()
         val baseBottom = (guideRectF.bottom * imgH).toInt()
 
+        val baseRectImg = Rect(baseLeft, baseTop, baseRight, baseBottom)
+
+        // 탐색 그물망 확장을 위한 25% 패딩 연산
         val paddingX = ((baseRight - baseLeft) * 0.25f).toInt()
         val paddingY = ((baseBottom - baseTop) * 0.25f).toInt()
 
@@ -295,23 +298,22 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        val corners = extractGeometryCorners(bitmap, expandedRectImg)
+        // 🚨 원본 baseRectImg를 함께 전달하여 Fallback 발생 시 타이트한 원본 영역으로 완벽 방어
+        val corners = extractGeometryCorners(bitmap, expandedRectImg, baseRectImg)
         if (corners == null) {
             sendErrorToWeb("번호판을 찾을 수 없습니다.")
             return
         }
 
-        // 🚨 개선 D: OCR과 번호판 위치 검출을 완전 분리 (디커플링)
-        // 기하학적으로 신뢰할 수 있는 모서리를 찾았다면, OCR 인식 성공 여부와 관계없이 무조건 가림막을 씌웁니다.
+        // OCR 종속성 완전 분리 (디커플링)
         val rectifiedBmp = rectifyToFlatPlate(bitmap, corners)
         if (rectifiedBmp == null) {
-            sendSuccessToWeb(corners, imgW, imgH) // 보정에 실패해도 꼭짓점 전송
+            sendSuccessToWeb(corners, imgW, imgH)
             return
         }
 
         val inputImage = InputImage.fromBitmap(rectifiedBmp, 0)
         recognizer.process(inputImage).addOnCompleteListener { task ->
-            // OCR 결과는 내부 로깅/보조 데이터로만 확인하며, 실패하더라도 에러를 내지 않고 성공 처리합니다.
             val text = if (task.isSuccessful) task.result.text.replace(Regex("\\s+"), "") else ""
             Log.d("JiSeKa", "Detected Auxiliary OCR Text: $text")
             
@@ -348,29 +350,30 @@ class MainActivity : AppCompatActivity() {
         return Bitmap.createScaledBitmap(bitmap, (bitmap.width * scale).toInt(), (bitmap.height * scale).toInt(), true)
     }
 
-    private fun extractGeometryCorners(bitmap: Bitmap, guideRect: Rect): Array<PointF>? {
+    // 🚨 파라미터에 fallbackRect 추가하여 거대화 왜곡 원천 차단
+    private fun extractGeometryCorners(bitmap: Bitmap, searchRect: Rect, fallbackRect: Rect): Array<PointF>? {
         var mat: org.opencv.core.Mat? = null
         var roiMat: org.opencv.core.Mat? = null
         var gray: org.opencv.core.Mat? = null
         var edges: org.opencv.core.Mat? = null
         val contours = ArrayList<org.opencv.core.MatOfPoint>()
 
-        // 🚨 절대 멈춤 방지용 Fallback: 인식이 끝내 불가능할 경우 사용자가 놓은 박스 모서리를 그대로 반환
+        // 🚨 절대 멈춤 방지용 Fallback: 인식이 끝내 불가능할 경우 25% 확장된 영역이 아닌, 원본 타이트한 가이드 박스 모서리를 반환
         val fallbackBox = arrayOf(
-            PointF(guideRect.left.toFloat(), guideRect.top.toFloat()),
-            PointF(guideRect.right.toFloat(), guideRect.top.toFloat()),
-            PointF(guideRect.right.toFloat(), guideRect.bottom.toFloat()),
-            PointF(guideRect.left.toFloat(), guideRect.bottom.toFloat())
+            PointF(fallbackRect.left.toFloat(), fallbackRect.top.toFloat()),
+            PointF(fallbackRect.right.toFloat(), fallbackRect.top.toFloat()),
+            PointF(fallbackRect.right.toFloat(), fallbackRect.bottom.toFloat()),
+            PointF(fallbackRect.left.toFloat(), fallbackRect.bottom.toFloat())
         )
 
         try {
             mat = org.opencv.core.Mat()
             org.opencv.android.Utils.bitmapToMat(bitmap, mat)
 
-            val roiX = kotlin.math.max(0, guideRect.left)
-            val roiY = kotlin.math.max(0, guideRect.top)
-            val roiW = kotlin.math.min(mat.cols() - roiX, guideRect.width())
-            val roiH = kotlin.math.min(mat.rows() - roiY, guideRect.height())
+            val roiX = kotlin.math.max(0, searchRect.left)
+            val roiY = kotlin.math.max(0, searchRect.top)
+            val roiW = kotlin.math.min(mat.cols() - roiX, searchRect.width())
+            val roiH = kotlin.math.min(mat.rows() - roiY, searchRect.height())
 
             if (roiW <= 0 || roiH <= 0) return fallbackBox
 
@@ -380,14 +383,13 @@ class MainActivity : AppCompatActivity() {
             gray = org.opencv.core.Mat()
             org.opencv.imgproc.Imgproc.cvtColor(roiMat, gray, org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY)
 
-            // 어두운 환경 방어 (히스토그램 평활화)
             org.opencv.imgproc.Imgproc.equalizeHist(gray, gray)
             org.opencv.imgproc.Imgproc.GaussianBlur(gray, gray, org.opencv.core.Size(3.0, 3.0), 0.0)
 
             edges = org.opencv.core.Mat()
             org.opencv.imgproc.Imgproc.Canny(gray, edges, 30.0, 100.0)
 
-            // 🚨 개선 C: Morphology Close 연산 추가 (글자나 반사광으로 끊어진 테두리를 강력하게 접합)
+            // Morphology Close 연산으로 끊어진 테두리 강력 접합
             val kernel = org.opencv.imgproc.Imgproc.getStructuringElement(
                 org.opencv.imgproc.Imgproc.MORPH_RECT, 
                 org.opencv.core.Size(5.0, 5.0)
@@ -399,7 +401,6 @@ class MainActivity : AppCompatActivity() {
             )
             kernel.release()
 
-            // 🚨 개선 B: RETR_EXTERNAL 대신 RETR_LIST를 사용하여 차체 내부의 번호판 윤곽선까지 모두 수집
             org.opencv.imgproc.Imgproc.findContours(
                 edges, contours, org.opencv.core.Mat(), 
                 org.opencv.imgproc.Imgproc.RETR_LIST, 
@@ -409,8 +410,8 @@ class MainActivity : AppCompatActivity() {
             var bestScore = 0.0
             var bestBox: Array<PointF>? = null
 
-            val guideCenterX = (guideRect.left + guideRect.right) / 2.0f
-            val guideCenterY = (guideRect.top + guideRect.bottom) / 2.0f
+            val guideCenterX = (searchRect.left + searchRect.right) / 2.0f
+            val guideCenterY = (searchRect.top + searchRect.bottom) / 2.0f
 
             for (contour in contours) {
                 val contour2f = org.opencv.core.MatOfPoint2f(*contour.toArray())
@@ -421,17 +422,14 @@ class MainActivity : AppCompatActivity() {
                 val rh = minRect.size.height
                 val rectArea = rw * rh
 
-                // 너무 작은 노이즈 사각형만 필터링 (ROI 전체 면적의 10% 이상)
                 if (rectArea < roiArea * 0.10) continue 
 
                 val aspect = kotlin.math.max(rw, rh) / kotlin.math.min(rw, rh).coerceAtLeast(1.0)
 
-                // 한국 번호판 비율(1.8 ~ 6.0) 내에 속하는 후보군 집중 평가
                 if (aspect in 1.8..6.0) {
                     val centerX = minRect.center.x + roiX
                     val centerY = minRect.center.y + roiY
                     
-                    // 가이드 박스 중앙과 가까울수록 가중치 부여
                     val dist = kotlin.math.hypot((centerX - guideCenterX).toDouble(), (centerY - guideCenterY).toDouble())
                     val score = rectArea - (dist * 5.0)
 
