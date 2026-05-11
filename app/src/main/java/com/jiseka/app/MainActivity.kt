@@ -319,7 +319,6 @@ class MainActivity : AppCompatActivity() {
                         if (rotatedBmp != bitmap) bitmap.recycle()
                     }
 
-                    // 원거리 작은 번호판의 픽셀 보호를 위해 고해상도(2400px) 유지
                     lastCapturedBitmap = downscaleBitmapIfNeeded(rotatedBmp, 2400)
                     if (lastCapturedBitmap != rotatedBmp) rotatedBmp.recycle()
                     
@@ -354,7 +353,6 @@ class MainActivity : AppCompatActivity() {
         val baseBottom = (guideRectF.bottom * imgH).toInt()
 
         val baseRectImg = Rect(baseLeft, baseTop, baseRight, baseBottom)
-
         val paddingX = (baseRectImg.width() * 0.08f).toInt()
         val paddingY = (baseRectImg.height() * 0.08f).toInt()
 
@@ -370,6 +368,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        // 🚨 파이프라인 전면 개편: 문자 기반 탐색(Text Localization) + 선분 교차 복원(Line Intersection)
         val corners = extractGeometryCorners(bitmap, expandedRectImg)
         if (corners == null) {
             sendErrorToWeb("번호판 검출 실패: 가이드 박스를 더 정확히 맞춰주세요.")
@@ -414,146 +413,164 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // 🚨 대혁신: 고각도 번호판 전용 기하 복원(Geometry Reconstruction) 파이프라인
+    // 🚀 Stage 1 ~ Stage 3: 문자 텍스처 탐색 및 선분 교차(Intersection) 정밀 복원 엔진
     // ─────────────────────────────────────────────────────────────────
     private fun extractGeometryCorners(bitmap: Bitmap, searchRect: Rect): Array<PointF>? {
         var mat: org.opencv.core.Mat? = null
         var roiMat: org.opencv.core.Mat? = null
         var gray: org.opencv.core.Mat? = null
+        var sobel: org.opencv.core.Mat? = null
+        var morph: org.opencv.core.Mat? = null
         var edges: org.opencv.core.Mat? = null
-        val contours = ArrayList<org.opencv.core.MatOfPoint>()
 
         try {
             mat = org.opencv.core.Mat()
             org.opencv.android.Utils.bitmapToMat(bitmap, mat)
 
             val roiX = kotlin.math.max(0, searchRect.left)
-            val roiY = kotlin.math.max(0, searchRect.top)
+            val roiY = kotlin.math.top
             val roiW = kotlin.math.min(mat.cols() - roiX, searchRect.width())
             val roiH = kotlin.math.min(mat.rows() - roiY, searchRect.height())
 
             if (roiW <= 0 || roiH <= 0) return null
 
             roiMat = org.opencv.core.Mat(mat, org.opencv.core.Rect(roiX, roiY, roiW, roiH))
-            val roiArea = roiW * roiH 
-
             gray = org.opencv.core.Mat()
             org.opencv.imgproc.Imgproc.cvtColor(roiMat, gray, org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY)
 
-            // 원거리 선예도 보강
-            org.opencv.imgproc.Imgproc.equalizeHist(gray, gray)
+            // 1. CLAHE 대비 극대화
+            val clahe = org.opencv.imgproc.Imgproc.createCLAHE(2.0, org.opencv.core.Size(8.0, 8.0))
+            clahe.apply(gray, gray)
+            clahe.release()
+
             org.opencv.imgproc.Imgproc.GaussianBlur(gray, gray, org.opencv.core.Size(3.0, 3.0), 0.0)
 
-            edges = org.opencv.core.Mat()
-            org.opencv.imgproc.Imgproc.Canny(gray, edges, 20.0, 80.0)
+            // ─────────────────────────────────────────────────────────────
+            // 🎯 Stage 1: 문자 구조 기반 탐색 (Text Texture Localization)
+            // ─────────────────────────────────────────────────────────────
+            // 번호판의 본질인 "세로 에지(Vertical Stroke) 반복 패턴"을 추출합니다.
+            sobel = org.opencv.core.Mat()
+            org.opencv.imgproc.Imgproc.Sobel(gray, sobel, org.opencv.core.CvType.CV_8U, 1, 0, 3, 1.0, 0.0, org.opencv.core.Core.BORDER_DEFAULT)
+            org.opencv.imgproc.Imgproc.threshold(sobel, sobel, 0.0, 255.0, org.opencv.imgproc.Imgproc.THRESH_BINARY or org.opencv.imgproc.Imgproc.THRESH_OTSU)
 
-            val kernel = org.opencv.imgproc.Imgproc.getStructuringElement(
-                org.opencv.imgproc.Imgproc.MORPH_RECT, 
-                org.opencv.core.Size(5.0, 5.0)
-            )
-            org.opencv.imgproc.Imgproc.morphologyEx(
-                edges, edges, 
-                org.opencv.imgproc.Imgproc.MORPH_CLOSE, 
-                kernel
-            )
+            // 수평 커널(25x5)을 적용하여 개별 문자들의 세로 획을 하나의 긴 "번호판 띠"로 융합합니다.
+            morph = org.opencv.core.Mat()
+            val kernel = org.opencv.imgproc.Imgproc.getStructuringElement(org.opencv.imgproc.Imgproc.MORPH_RECT, org.opencv.core.Size(25.0, 5.0))
+            org.opencv.imgproc.Imgproc.morphologyEx(sobel, morph, org.opencv.imgproc.Imgproc.MORPH_CLOSE, kernel)
             kernel.release()
 
-            org.opencv.imgproc.Imgproc.findContours(
-                edges, contours, org.opencv.core.Mat(), 
-                org.opencv.imgproc.Imgproc.RETR_LIST, 
-                org.opencv.imgproc.Imgproc.CHAIN_APPROX_SIMPLE
-            )
+            // 문자 클러스터 탐색을 통해 가장 번호판 영역다운 띠(Hypothesis Bbox)를 생성
+            val textContours = ArrayList<org.opencv.core.MatOfPoint>()
+            org.opencv.imgproc.Imgproc.findContours(morph, textContours, org.opencv.core.Mat(), org.opencv.imgproc.Imgproc.RETR_EXTERNAL, org.opencv.imgproc.Imgproc.CHAIN_APPROX_SIMPLE)
 
-            var bestScore = -9999.0
-            var bestQuadPts: Array<PointF>? = null
+            var plateRegionRect: org.opencv.core.Rect? = null
+            var maxTextScore = -9999.0
+            val totalRoiArea = roiW * roiH
 
-            val guideCenterX = (searchRect.left + searchRect.right) / 2.0f
-            val guideCenterY = (searchRect.top + searchRect.bottom) / 2.0f
+            for (c in textContours) {
+                val r = org.opencv.imgproc.Imgproc.boundingRect(c)
+                val area = r.width * r.height
+                if (area < totalRoiArea * 0.05 || area > totalRoiArea * 0.60) continue
 
-            for (contour in contours) {
-                // 🚨 개선 1: minAreaRect를 버리고, approxPolyDP 다각형 근사를 통해 진짜 볼록 사각형을 추출
-                val contour2f = org.opencv.core.MatOfPoint2f(*contour.toArray())
-                val approx = org.opencv.core.MatOfPoint2f()
-                
-                val arcLen = org.opencv.imgproc.Imgproc.arcLength(contour2f, true)
-                // 정밀도를 높여 꼭짓점이 4개인 임의의 사다리꼴을 빈틈없이 복원
-                org.opencv.imgproc.Imgproc.approxPolyDP(contour2f, approx, arcLen * 0.02, true)
-                contour2f.release()
-
-                // 투시 건전성 검사 (Sanity Check): 꼭짓점이 4개이고 볼록 다각형(Convex)인 경우만 승인
-                if (approx.rows() == 4 && org.opencv.imgproc.Imgproc.isContourConvex(org.opencv.core.MatOfPoint(*approx.toArray()))) {
-                    val ptsMat = approx.toArray()
-                    val quadPts = Array(4) { i -> PointF(ptsMat[i].x.toFloat() + roiX, ptsMat[i].y.toFloat() + roiY) }
-                    
-                    // 정렬을 위해 임시 바운딩 박스 추출
-                    val xs = quadPts.map { it.x }
-                    val ys = quadPts.map { it.y }
-                    val rw = (xs.maxOrNull() ?: 0f) - (xs.minOrNull() ?: 0f)
-                    val rh = (ys.maxOrNull() ?: 0f) - (ys.minOrNull() ?: 0f)
-                    val rectArea = rw * rh
-
-                    // 면적 15% ~ 45% 유지로 거대 범퍼/그릴 완벽 차단
-                    if (rectArea >= roiArea * 0.10 && rectArea <= roiArea * 0.45) {
-                        val aspect = kotlin.math.max(rw, rh) / kotlin.math.min(rw, rh).coerceAtLeast(1.0f)
-
-                        if (aspect in 1.8f..6.0f) {
-                            val centerX = xs.average().toFloat()
-                            val centerY = ys.average().toFloat()
-                            val dist = kotlin.math.hypot((centerX - guideCenterX).toDouble(), (centerY - guideCenterY).toDouble())
-
-                            // 정규화 스코어링
-                            val normalizedArea = rectArea / roiArea.toDouble()
-                            val aspectScore = 1.0 - kotlin.math.abs(aspect - 3.0f) / 3.0
-                            val distanceScore = 1.0 / (1.0 + dist)
-
-                            val score = (aspectScore * 0.5) + (distanceScore * 0.3) + (normalizedArea * 0.2)
-
-                            if (score > bestScore) {
-                                bestScore = score
-                                bestQuadPts = quadPts
-                            }
-                        }
+                val aspect = r.width.toFloat() / r.height.toFloat().coerceAtLeast(1.0f)
+                if (aspect in 1.5f..6.0f) {
+                    val score = area * aspect // 가로로 길게 뭉친 띠를 최우선으로 선정
+                    if (score > maxTextScore) {
+                        maxTextScore = score.toDouble()
+                        plateRegionRect = r
                     }
                 }
-                approx.release()
             }
+            for (c in textContours) c.release()
 
-            // 🚨 개선 2: 강건한 모서리 정렬 (Top/Bottom 분리 후 Left/Right 정렬)
-            bestQuadPts?.let { pts ->
-                // Y좌표 기준으로 정렬하여 상위 2개(Top)와 하위 2개(Bottom) 분리
-                val sortedByY = pts.sortedBy { it.y }
-                val topTwo = sortedByY.take(2).sortedBy { it.x }    // Top에서 X기준 좌우 분리
-                val bottomTwo = sortedByY.takeLast(2).sortedBy { it.x } // Bottom에서 X기준 좌우 분리
+            // 문자가 탐색되지 않았다면 기존 Strict ROI 전체를 대상으로 대체 탐색
+            val safePlateRect = plateRegionRect ?: org.opencv.core.Rect(0, 0, roiW, roiH)
 
-                // TL, TR, BR, BL 순서 완벽 매핑 (아무리 기울어도 역전 불가능)
-                val orderedPts = org.opencv.core.MatOfPoint2f(
-                    org.opencv.core.Point(topTwo[0].x.toDouble() - roiX, topTwo[0].y.toDouble() - roiY),       // TL
-                    org.opencv.core.Point(topTwo[1].x.toDouble() - roiX, topTwo[1].y.toDouble() - roiY),       // TR
-                    org.opencv.core.Point(bottomTwo[1].x.toDouble() - roiX, bottomTwo[1].y.toDouble() - roiY), // BR
-                    org.opencv.core.Point(bottomTwo[0].x.toDouble() - roiX, bottomTwo[0].y.toDouble() - roiY)  // BL
-                )
+            // ─────────────────────────────────────────────────────────────
+            // 🎯 Stage 2 & 3: 서브 ROI 집중 탐색 및 선분 교차 복원 (Line-based Reconstruction)
+            // ─────────────────────────────────────────────────────────────
+            // 문자 띠 영역 주변에만 집중하여 범퍼나 그릴 간섭을 0%로 제거합니다.
+            val subRoiX = safePlateRect.x
+            val subRoiY = safePlateRect.y
+            val subRoiW = safePlateRect.width
+            val subRoiH = safePlateRect.height
 
-                // 🚨 개선 3: cornerSubPix는 순서가 확정된 최종 꼭짓점의 아화소 미세 당김 보정으로만 한정
-                val criteria = org.opencv.core.TermCriteria(
-                    org.opencv.core.TermCriteria.EPS + org.opencv.core.TermCriteria.MAX_ITER, 
-                    30, 0.1
-                )
-                org.opencv.imgproc.Imgproc.cornerSubPix(
-                    gray, orderedPts, 
-                    org.opencv.core.Size(5.0, 5.0), 
-                    org.opencv.core.Size(-1.0, -1.0), 
-                    criteria
-                )
+            val subGray = org.opencv.core.Mat(gray, org.opencv.core.Rect(subRoiX, subRoiY, subRoiW, subRoiH))
+            edges = org.opencv.core.Mat()
+            org.opencv.imgproc.Imgproc.Canny(subGray, edges, 10.0, 50.0)
 
-                val refinedArray = orderedPts.toArray()
-                val finalResult = Array(4) { i -> 
-                    PointF(refinedArray[i].x.toFloat() + roiX, refinedArray[i].y.toFloat() + roiY) 
+            // HoughLinesP를 사용하여 번호판 상/하단의 강력한 크롬 및 그림자 에지 선분을 추출
+            val lines = org.opencv.core.Mat()
+            org.opencv.imgproc.Imgproc.HoughLinesP(edges, lines, 1.0, kotlin.math.PI / 180.0, 20, subRoiW * 0.3, 10.0)
+
+            val horizontalLines = ArrayList<LineSeg>()
+            val verticalLines = ArrayList<LineSeg>()
+
+            for (i in 0 until lines.rows()) {
+                val vec = lines.get(i, 0)
+                val lx1 = vec[0].toFloat()
+                val ly1 = vec[1].toFloat()
+                val lx2 = vec[2].toFloat()
+                val ly2 = vec[3].toFloat()
+                
+                val angle = kotlin.math.abs(kotlin.math.atan2((ly2 - ly1).toDouble(), (lx2 - lx1).toDouble()) * 180.0 / kotlin.math.PI)
+                val seg = LineSeg(PointF(lx1, ly1), PointF(lx2, ly2))
+
+                if (angle < 35.0 || angle > 145.0) {
+                    horizontalLines.add(seg)
+                } else if (angle in 55.0..125.0) {
+                    verticalLines.add(seg)
                 }
-                orderedPts.release()
-                return finalResult
+            }
+            lines.release()
+            subGray.release()
+
+            // 선분이 부족하면 기존 다각형 근사 알고리즘으로 안전하게 우회(Fallback)
+            if (horizontalLines.size < 2 || verticalLines.size < 2) {
+                return fallbackPolyReconstruction(edges, roiX + subRoiX, roiY + subRoiY, subRoiW, subRoiH, gray)
             }
 
-            return null 
+            // 가장 위쪽과 아래쪽에 위치한 수평선(Top/Bottom Edges) 추출
+            horizontalLines.sortBy { (it.p1.y + it.p2.y) / 2.0f }
+            val topEdge = horizontalLines.first()
+            val bottomEdge = horizontalLines.last()
+
+            // 가장 왼쪽과 오른쪽에 위치한 수직선(Left/Right Edges) 추출
+            verticalLines.sortBy { (it.p1.x + it.p2.x) / 2.0f }
+            val leftEdge = verticalLines.first()
+            val rightEdge = verticalLines.last()
+
+            // 4개의 선분을 연장하여 수학적 교차점(Intersection) 계산
+            val tl = intersection(topEdge, leftEdge) ?: return null
+            val tr = intersection(topEdge, rightEdge) ?: return null
+            val br = intersection(bottomEdge, rightEdge) ?: return null
+            val bl = intersection(bottomEdge, leftEdge) ?: return null
+
+            // 절대 좌표 매핑 (ROI 및 subROI 오프셋 합산)
+            val baseOffset = PointF((roiX + subRoiX).toFloat(), (roiY + subRoiY).toFloat())
+            val rawPts = arrayOf(
+                PointF(tl.x + baseOffset.x, tl.y + baseOffset.y),
+                PointF(tr.x + baseOffset.x, tr.y + baseOffset.y),
+                PointF(br.x + baseOffset.x, br.y + baseOffset.y),
+                PointF(bl.x + baseOffset.x, bl.y + baseOffset.y)
+            )
+
+            // 최종 모서리 Subpix 정밀 보정
+            val orderedPts = org.opencv.core.MatOfPoint2f(
+                org.opencv.core.Point(rawPts[0].x.toDouble(), rawPts[0].y.toDouble()),
+                org.opencv.core.Point(rawPts[1].x.toDouble(), rawPts[1].y.toDouble()),
+                org.opencv.core.Point(rawPts[2].x.toDouble(), rawPts[2].y.toDouble()),
+                org.opencv.core.Point(rawPts[3].x.toDouble(), rawPts[3].y.toDouble())
+            )
+
+            val criteria = org.opencv.core.TermCriteria(org.opencv.core.TermCriteria.EPS + org.opencv.core.TermCriteria.MAX_ITER, 30, 0.1)
+            org.opencv.imgproc.Imgproc.cornerSubPix(gray, orderedPts, org.opencv.core.Size(5.0, 5.0), org.opencv.core.Size(-1.0, -1.0), criteria)
+
+            val refinedArray = orderedPts.toArray()
+            val finalResult = Array(4) { i -> PointF(refinedArray[i].x.toFloat(), refinedArray[i].y.toFloat()) }
+            orderedPts.release()
+
+            return finalResult
 
         } catch (e: Exception) {
             return null
@@ -561,9 +578,90 @@ class MainActivity : AppCompatActivity() {
             mat?.release()
             roiMat?.release()
             gray?.release()
+            sobel?.release()
+            morph?.release()
             edges?.release()
-            for (c in contours) c.release()
         }
+    }
+
+    // 선분 구조체 및 수학적 교차점 연산 헬퍼
+    data class LineSeg(val p1: PointF, val p2: PointF)
+
+    private fun intersection(l1: LineSeg, l2: LineSeg): PointF? {
+        val x1 = l1.p1.x; val y1 = l1.p1.y
+        val x2 = l1.p2.x; val y2 = l1.p2.y
+        val x3 = l2.p1.x; val y3 = l2.p1.y
+        val x4 = l2.p2.x; val y4 = l2.p2.y
+
+        val denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+        if (kotlin.math.abs(denom) < 1e-6f) return null // 평행선 방어
+
+        val t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+        val px = x1 + t * (x2 - x1)
+        val py = y1 + t * (y2 - y1)
+        return PointF(px, py)
+    }
+
+    // 선분 부족 시 가동되는 기존 안전 다각형 복원 로직
+    private fun fallbackPolyReconstruction(edges: org.opencv.core.Mat, absX: Int, absY: Int, sw: Int, sh: Int, gray: org.opencv.core.Mat): Array<PointF>? {
+        val contours = ArrayList<org.opencv.core.MatOfPoint>()
+        org.opencv.imgproc.Imgproc.findContours(edges, contours, org.opencv.core.Mat(), org.opencv.imgproc.Imgproc.RETR_LIST, org.opencv.imgproc.Imgproc.CHAIN_APPROX_SIMPLE)
+
+        var bestScore = -9999.0
+        var bestQuad: Array<PointF>? = null
+        val totalArea = sw * sh
+
+        for (c in contours) {
+            val contour2f = org.opencv.core.MatOfPoint2f(*c.toArray())
+            val approx = org.opencv.core.MatOfPoint2f()
+            val arcLen = org.opencv.imgproc.Imgproc.arcLength(contour2f, true)
+            org.opencv.imgproc.Imgproc.approxPolyDP(contour2f, approx, arcLen * 0.02, true)
+            contour2f.release()
+
+            if (approx.rows() == 4 && org.opencv.imgproc.Imgproc.isContourConvex(org.opencv.core.MatOfPoint(*approx.toArray()))) {
+                val ptsMat = approx.toArray()
+                val quadPts = Array(4) { i -> PointF(ptsMat[i].x.toFloat() + absX, ptsMat[i].y.toFloat() + absY) }
+                
+                val xs = quadPts.map { it.x }; val ys = quadPts.map { it.y }
+                val rw = (xs.maxOrNull() ?: 0f) - (xs.minOrNull() ?: 0f)
+                val rh = (ys.maxOrNull() ?: 0f) - (ys.minOrNull() ?: 0f)
+                val area = rw * rh
+
+                if (area >= totalArea * 0.10 && area <= totalArea * 0.90) {
+                    val aspect = kotlin.math.max(rw, rh) / kotlin.math.min(rw, rh).coerceAtLeast(1.0f)
+                    if (aspect in 1.2f..6.0f) {
+                        val score = area.toDouble()
+                        if (score > bestScore) {
+                            bestScore = score
+                            bestQuad = quadPts
+                        }
+                    }
+                }
+            }
+            approx.release()
+        }
+        for (c in contours) c.release()
+
+        bestQuad?.let { pts ->
+            val sortedByY = pts.sortedBy { it.y }
+            val topTwo = sortedByY.take(2).sortedBy { it.x }
+            val bottomTwo = sortedByY.takeLast(2).sortedBy { it.x }
+
+            val orderedPts = org.opencv.core.MatOfPoint2f(
+                org.opencv.core.Point(topTwo[0].x.toDouble(), topTwo[0].y.toDouble()),
+                org.opencv.core.Point(topTwo[1].x.toDouble(), topTwo[1].y.toDouble()),
+                org.opencv.core.Point(bottomTwo[1].x.toDouble(), bottomTwo[1].y.toDouble()),
+                org.opencv.core.Point(bottomTwo[0].x.toDouble(), bottomTwo[0].y.toDouble())
+            )
+            val criteria = org.opencv.core.TermCriteria(org.opencv.core.TermCriteria.EPS + org.opencv.core.TermCriteria.MAX_ITER, 30, 0.1)
+            org.opencv.imgproc.Imgproc.cornerSubPix(gray, orderedPts, org.opencv.core.Size(5.0, 5.0), org.opencv.core.Size(-1.0, -1.0), criteria)
+            
+            val refinedArray = orderedPts.toArray()
+            val finalResult = Array(4) { i -> PointF(refinedArray[i].x.toFloat(), refinedArray[i].y.toFloat()) }
+            orderedPts.release()
+            return finalResult
+        }
+        return null
     }
 
     private fun rectifyToFlatPlate(bitmap: Bitmap, corners: Array<PointF>): Bitmap? {
