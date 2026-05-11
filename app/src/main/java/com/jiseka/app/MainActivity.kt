@@ -48,7 +48,6 @@ class MainActivity : AppCompatActivity() {
     private val isCapturing = AtomicBoolean(false)
     private val recognizer by lazy { TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build()) }
 
-    // 원본 화질 보존을 위한 비트맵 캐시
     private var lastCapturedBitmap: Bitmap? = null 
     private var isWebReady = false 
 
@@ -122,6 +121,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // 🚨 해결책 1: 누락되었던 JS 에러 전송 헬퍼 함수 복구
+    private fun sendErrorToWeb(msg: String) {
+        val js = "javascript:window.onNativeError(${JSONObject.quote(msg)})"
+        safeEvaluateJavascript(js)
+    }
+
     inner class WebAppInterface {
         @JavascriptInterface
         fun takePhotoOnly() {
@@ -160,8 +165,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // 🚨 대혁신: 웹 브라우저 캡처 의존성을 버리고, 수신된 모서리 좌표를 바탕으로 
-        // 안드로이드 네이티브 OpenCV에서 텍스처를 완벽한 사다리꼴로 직접 구워내어 갤러리에 저장합니다.
         @JavascriptInterface
         fun saveImageWithNativeOverlay(cornersStr: String) {
             cameraExecutor.execute {
@@ -173,9 +176,15 @@ class MainActivity : AppCompatActivity() {
                     bgBmp = lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true)
                         ?: throw IllegalStateException("메모리에 원본 비트맵이 없습니다.")
                     
-                    // 1. 앱 리소스(drawable)에서 번호판 텍스처 로드
-                    maskBmp = BitmapFactory.decodeResource(resources, R.drawable.cbf082_grande)
-                        ?: throw IllegalStateException("마스크 텍스처 리소스를 찾을 수 없습니다.")
+                    // 🚨 해결책 2: 식별자 에러 방지를 위해 getIdentifier를 통한 안전한 동적 리소스 로딩 적용
+                    // res/drawable 폴더에 cbf082_grande.jpg 또는 .png 파일이 소문자로 존재해야 합니다.
+                    val resId = resources.getIdentifier("cbf082_grande", "drawable", packageName)
+                    if (resId == 0) {
+                        throw IllegalStateException("res/drawable/ 폴더에서 cbf082_grande 이미지를 찾을 수 없습니다. 파일명을 소문자로 확인하세요.")
+                    }
+                    
+                    maskBmp = BitmapFactory.decodeResource(resources, resId)
+                        ?: throw IllegalStateException("마스크 텍스처를 비트맵으로 디코딩할 수 없습니다.")
 
                     val cornersArray = JSONArray(cornersStr)
                     if (cornersArray.length() != 4) throw IllegalArgumentException("모서리 좌표 개수가 올바르지 않습니다.")
@@ -186,11 +195,10 @@ class MainActivity : AppCompatActivity() {
                     val dstPoints = ArrayList<org.opencv.core.Point>()
                     for (i in 0 until 4) {
                         val ptObj = cornersArray.getJSONObject(i)
-                        // 웹에서 넘어온 정규화 비율(0~1)을 원본 고화질 비트맵 픽셀 좌표로 복원
                         dstPoints.add(org.opencv.core.Point(ptObj.getDouble("x") * imgW, ptObj.getDouble("y") * imgH))
                     }
 
-                    // 2. OpenCV 호모그래피 투영 연산 (가장 완벽하고 정확한 Perspective 렌더링)
+                    // OpenCV 호모그래피 투영 연산
                     val bgMat = org.opencv.core.Mat()
                     val maskMat = org.opencv.core.Mat()
                     org.opencv.android.Utils.bitmapToMat(bgBmp, bgMat)
@@ -207,22 +215,21 @@ class MainActivity : AppCompatActivity() {
                     val perspectiveTransform = org.opencv.imgproc.Imgproc.getPerspectiveTransform(srcMatPts, dstMatPts)
                     val warpedMask = org.opencv.core.Mat()
                     
-                    // 원본 비트맵 크기 위에 마스크를 완벽한 투시 사다리꼴로 변형
                     org.opencv.imgproc.Imgproc.warpPerspective(
                         maskMat, warpedMask, perspectiveTransform, 
                         bgMat.size(), org.opencv.imgproc.Imgproc.INTER_LINEAR
                     )
 
-                    // 3. 투명도(Alpha) 채널을 고려하여 배경 위에 정밀 합성
                     resultBmp = Bitmap.createBitmap(bgBmp.width, bgBmp.height, Bitmap.Config.ARGB_8888)
                     val warpedBmp = Bitmap.createBitmap(bgBmp.width, bgBmp.height, Bitmap.Config.ARGB_8888)
                     org.opencv.android.Utils.matToBitmap(warpedMask, warpedBmp)
 
                     val canvas = android.graphics.Canvas(resultBmp)
-                    canvas.drawImage(bgBmp, 0f, 0f, null)
-                    canvas.drawImage(warpedBmp, 0f, 0f, null)
+                    
+                    // 🚨 해결책 3: 안드로이드 그래픽스 표준 API인 drawBitmap으로 완벽 교체
+                    canvas.drawBitmap(bgBmp, 0f, 0f, null)
+                    canvas.drawBitmap(warpedBmp, 0f, 0f, null)
 
-                    // 4. 합성된 최종 비트맵을 갤러리에 안전하게 파일로 저장
                     val filename = "JiSeKa_${System.currentTimeMillis()}.jpg"
                     var outputStream: java.io.OutputStream? = null
                     var legacyFile: java.io.File? = null
@@ -245,7 +252,7 @@ class MainActivity : AppCompatActivity() {
                     }
 
                     outputStream?.use { stream ->
-                        resultBmp.compress(Bitmap.CompressFormat.JPEG, 95, stream)
+                        resultBmp!!.compress(Bitmap.CompressFormat.JPEG, 95, stream)
                         stream.flush()
                     }
 
@@ -255,7 +262,6 @@ class MainActivity : AppCompatActivity() {
 
                     showToast("사진이 갤러리에 완벽히 저장되었습니다.")
 
-                    // 메모리 해제
                     srcMatPts.release()
                     dstMatPts.release()
                     perspectiveTransform.release()
@@ -332,7 +338,7 @@ class MainActivity : AppCompatActivity() {
                     safeEvaluateJavascript(safeJS)
                 } catch (e: Exception) {
                     Log.e("JiSeKa", "Capture error", e)
-                    safeEvaluateJavascript("javascript:window.onNativeError('사진 처리 오류')")
+                    sendErrorToWeb("사진 처리 오류")
                 } finally {
                     imageProxy.close()
                     isCapturing.set(false)
@@ -341,7 +347,7 @@ class MainActivity : AppCompatActivity() {
 
             override fun onError(exception: ImageCaptureException) {
                 isCapturing.set(false)
-                safeEvaluateJavascript("javascript:window.onNativeError('캡처 실패')")
+                sendErrorToWeb("캡처 실패")
             }
         })
     }
@@ -368,13 +374,13 @@ class MainActivity : AppCompatActivity() {
         )
 
         if (expandedRectImg.width() <= 0 || expandedRectImg.height() <= 0) {
-            safeEvaluateJavascript("javascript:window.onNativeError('가이드 영역 오류')")
+            sendErrorToWeb("가이드 영역 오류")
             return
         }
 
         val corners = extractGeometryCorners(bitmap, expandedRectImg, baseRectImg)
         if (corners == null) {
-            safeEvaluateJavascript("javascript:window.onNativeError('번호판 탐색 실패')")
+            sendErrorToWeb("번호판 탐색 실패")
             return
         }
 
@@ -399,7 +405,6 @@ class MainActivity : AppCompatActivity() {
             put("corners", JSONArray().apply {
                 corners.forEach { 
                     put(JSONObject().apply { 
-                        // 정규화된 비율 좌표 전송 (가장 안전한 매핑 방식)
                         put("x", it.x / imgW) 
                         put("y", it.y / imgH) 
                     }) 
