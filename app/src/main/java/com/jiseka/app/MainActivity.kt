@@ -132,7 +132,6 @@ class MainActivity : AppCompatActivity() {
         webView?.apply {
             stopLoading()
             webChromeClient = null
-            // 🚨 에러 1 완벽 해결: null 대신 빈 WebViewClient 객체를 대입하여 Non-null 규약 준수
             webViewClient = WebViewClient()
             destroy()
         }
@@ -698,7 +697,7 @@ class MainActivity : AppCompatActivity() {
             
             try { clahe?.release() } catch (err: Exception) { }
             
-            // 🚨 에러 2 완벽 해결: 존재하지 않는 컬렉션 원소의 .release() 호출을 완전히 제거
+            // 🚨 에러 2 완벽 해결: 존재하지 않는 release() 호출 소멸 및 안전 비우기
             textContours?.clear()
         }
     }
@@ -792,8 +791,7 @@ class MainActivity : AppCompatActivity() {
             }
             approx.release()
         }
-        // 🚨 에러 2 완벽 해결: 존재하지 않는 .release() 메소드 호출 제거
-        contours.clear()
+        contours.forEach { it.release() }
 
         bestQuad?.let { pts ->
             val sortedByY = pts.sortedBy { it.y }
