@@ -530,6 +530,9 @@ class MainActivity : AppCompatActivity() {
         return Bitmap.createScaledBitmap(bitmap, (bitmap.width * scale).toInt(), (bitmap.height * scale).toInt(), true)
     }
 
+    // ─────────────────────────────────────────────────────────────────
+    // 🚀 Stage 1 ~ Stage 3: 컴파일 무결성 확보 및 시점 맞춤형 기하 복원 엔진
+    // ─────────────────────────────────────────────────────────────────
     private fun extractGeometryCorners(bitmap: Bitmap, searchRect: Rect): Array<PointF>? {
         var mat: org.opencv.core.Mat? = null
         var roiMat: org.opencv.core.Mat? = null
@@ -697,7 +700,7 @@ class MainActivity : AppCompatActivity() {
             
             try { clahe?.release() } catch (err: Exception) { }
             
-            // 🚨 최종 무결성 확보: 메인 탐색 루프의 에러 원인이었던 .release() 순회 완전 소멸
+            // 🚨 최종 무결성 확보: 에러를 유발하던 .release() 순회를 완벽히 제거하고 비우기만 강제
             textContours?.clear()
         }
     }
