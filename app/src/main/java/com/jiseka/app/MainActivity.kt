@@ -530,9 +530,6 @@ class MainActivity : AppCompatActivity() {
         return Bitmap.createScaledBitmap(bitmap, (bitmap.width * scale).toInt(), (bitmap.height * scale).toInt(), true)
     }
 
-    // ─────────────────────────────────────────────────────────────────
-    // 🚀 Stage 1 ~ Stage 3: 컴파일 무결성 확보 및 시점 맞춤형 기하 복원 엔진
-    // ─────────────────────────────────────────────────────────────────
     private fun extractGeometryCorners(bitmap: Bitmap, searchRect: Rect): Array<PointF>? {
         var mat: org.opencv.core.Mat? = null
         var roiMat: org.opencv.core.Mat? = null
@@ -698,9 +695,7 @@ class MainActivity : AppCompatActivity() {
             subGray?.release()
             lines?.release()
             
-            try { clahe?.release() } catch (err: Exception) { }
-            
-            // 🚨 최종 무결성 확보: 에러를 유발하던 .release() 순회를 완벽히 제거하고 비우기만 강제
+            // 🚨 최종 무결성 확보: 컴파일 에러를 유발하던 clahe?.release()를 완전히 제거하고 참조만 안전하게 초기화
             textContours?.clear()
         }
     }
@@ -755,6 +750,7 @@ class MainActivity : AppCompatActivity() {
         return PointF(px, py)
     }
 
+    // 🚨 임시 객체(MatOfPoint) 안전 해제 적용
     private fun fallbackPolyReconstruction(edges: org.opencv.core.Mat, absX: Int, absY: Int, sw: Int, sh: Int, gray: org.opencv.core.Mat): Array<PointF>? {
         val contours = ArrayList<org.opencv.core.MatOfPoint>()
         val hierarchy = org.opencv.core.Mat()
@@ -772,7 +768,9 @@ class MainActivity : AppCompatActivity() {
             org.opencv.imgproc.Imgproc.approxPolyDP(contour2f, approx, arcLen * 0.02, true)
             contour2f.release()
 
-            if (approx.rows() == 4 && org.opencv.imgproc.Imgproc.isContourConvex(org.opencv.core.MatOfPoint(*approx.toArray()))) {
+            // 🚨 수정 2: 네이티브 메모리 누수 방지를 위해 임시 객체를 명시적으로 릴리즈
+            val approxMat = org.opencv.core.MatOfPoint(*approx.toArray())
+            if (approx.rows() == 4 && org.opencv.imgproc.Imgproc.isContourConvex(approxMat)) {
                 val ptsMat = approx.toArray()
                 val quadPts = Array(4) { i -> PointF(ptsMat[i].x.toFloat() + absX, ptsMat[i].y.toFloat() + absY) }
                 
@@ -792,6 +790,7 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             }
+            approxMat.release()
             approx.release()
         }
         contours.clear()
