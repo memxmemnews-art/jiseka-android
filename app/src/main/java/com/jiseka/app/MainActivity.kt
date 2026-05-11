@@ -428,8 +428,10 @@ class MainActivity : AppCompatActivity() {
             org.opencv.android.Utils.bitmapToMat(bitmap, mat)
 
             val roiX = kotlin.math.max(0, searchRect.left)
-            val roiY = kotlin.math.top
+            // 🚨 수정 1: Unresolved reference 'top' 에러를 완벽 복구
+            val roiY = kotlin.math.max(0, searchRect.top)
             val roiW = kotlin.math.min(mat.cols() - roiX, searchRect.width())
+            // 🚨 수정 2: roiY 에러 연쇄 작용으로 발생했던 min 함수 Ambiguity 에러 자동 해결
             val roiH = kotlin.math.min(mat.rows() - roiY, searchRect.height())
 
             if (roiW <= 0 || roiH <= 0) return null
@@ -441,7 +443,7 @@ class MainActivity : AppCompatActivity() {
             // 1. CLAHE 대비 극대화
             val clahe = org.opencv.imgproc.Imgproc.createCLAHE(2.0, org.opencv.core.Size(8.0, 8.0))
             clahe.apply(gray, gray)
-            clahe.release()
+            // 🚨 수정 3: 존재하지 않는 메소드인 clahe.release() 라인 완전 삭제
 
             org.opencv.imgproc.Imgproc.GaussianBlur(gray, gray, org.opencv.core.Size(3.0, 3.0), 0.0)
 
