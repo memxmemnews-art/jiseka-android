@@ -121,7 +121,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 🚨 해결책 1: 누락되었던 JS 에러 전송 헬퍼 함수 복구
     private fun sendErrorToWeb(msg: String) {
         val js = "javascript:window.onNativeError(${JSONObject.quote(msg)})"
         safeEvaluateJavascript(js)
@@ -176,15 +175,13 @@ class MainActivity : AppCompatActivity() {
                     bgBmp = lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true)
                         ?: throw IllegalStateException("메모리에 원본 비트맵이 없습니다.")
                     
-                    // 🚨 해결책 2: 식별자 에러 방지를 위해 getIdentifier를 통한 안전한 동적 리소스 로딩 적용
-                    // res/drawable 폴더에 cbf082_grande.jpg 또는 .png 파일이 소문자로 존재해야 합니다.
                     val resId = resources.getIdentifier("cbf082_grande", "drawable", packageName)
                     if (resId == 0) {
-                        throw IllegalStateException("res/drawable/ 폴더에서 cbf082_grande 이미지를 찾을 수 없습니다. 파일명을 소문자로 확인하세요.")
+                        throw IllegalStateException("res/drawable/ 폴더에서 cbf082_grande 이미지를 찾을 수 없습니다.")
                     }
                     
                     maskBmp = BitmapFactory.decodeResource(resources, resId)
-                        ?: throw IllegalStateException("마스크 텍스처를 비트맵으로 디코딩할 수 없습니다.")
+                        ?: throw IllegalStateException("마스크 텍스처 디코딩 실패")
 
                     val cornersArray = JSONArray(cornersStr)
                     if (cornersArray.length() != 4) throw IllegalArgumentException("모서리 좌표 개수가 올바르지 않습니다.")
@@ -198,7 +195,6 @@ class MainActivity : AppCompatActivity() {
                         dstPoints.add(org.opencv.core.Point(ptObj.getDouble("x") * imgW, ptObj.getDouble("y") * imgH))
                     }
 
-                    // OpenCV 호모그래피 투영 연산
                     val bgMat = org.opencv.core.Mat()
                     val maskMat = org.opencv.core.Mat()
                     org.opencv.android.Utils.bitmapToMat(bgBmp, bgMat)
@@ -225,8 +221,6 @@ class MainActivity : AppCompatActivity() {
                     org.opencv.android.Utils.matToBitmap(warpedMask, warpedBmp)
 
                     val canvas = android.graphics.Canvas(resultBmp)
-                    
-                    // 🚨 해결책 3: 안드로이드 그래픽스 표준 API인 drawBitmap으로 완벽 교체
                     canvas.drawBitmap(bgBmp, 0f, 0f, null)
                     canvas.drawBitmap(warpedBmp, 0f, 0f, null)
 
@@ -363,8 +357,9 @@ class MainActivity : AppCompatActivity() {
 
         val baseRectImg = Rect(baseLeft, baseTop, baseRight, baseBottom)
 
-        val paddingX = ((baseRight - baseLeft) * 0.25f).toInt()
-        val paddingY = ((baseBottom - baseTop) * 0.25f).toInt()
+        // 🚨 솔루션 1: 조작 오차를 보정하기 위해 패딩을 8%로 대폭 축소하여 타이트하게 유지
+        val paddingX = (baseRectImg.width() * 0.08f).toInt()
+        val paddingY = (baseRectImg.height() * 0.08f).toInt()
 
         val expandedRectImg = Rect(
             kotlin.math.max(0, baseLeft - paddingX),
@@ -378,9 +373,11 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        val corners = extractGeometryCorners(bitmap, expandedRectImg, baseRectImg)
+        val corners = extractGeometryCorners(bitmap, expandedRectImg)
+        
+        // 🚨 솔루션 4: Fallback 자동 사용을 전면 금지하고, 실패 시 웹에 정확한 에러를 전송하여 UX 보호
         if (corners == null) {
-            sendErrorToWeb("번호판 탐색 실패")
+            sendErrorToWeb("번호판 검출 실패: 가이드 박스를 더 정확히 맞춰주세요.")
             return
         }
 
@@ -421,19 +418,12 @@ class MainActivity : AppCompatActivity() {
         return Bitmap.createScaledBitmap(bitmap, (bitmap.width * scale).toInt(), (bitmap.height * scale).toInt(), true)
     }
 
-    private fun extractGeometryCorners(bitmap: Bitmap, searchRect: Rect, fallbackRect: Rect): Array<PointF>? {
+    private fun extractGeometryCorners(bitmap: Bitmap, searchRect: Rect): Array<PointF>? {
         var mat: org.opencv.core.Mat? = null
         var roiMat: org.opencv.core.Mat? = null
         var gray: org.opencv.core.Mat? = null
         var edges: org.opencv.core.Mat? = null
         val contours = ArrayList<org.opencv.core.MatOfPoint>()
-
-        val fallbackBox = arrayOf(
-            PointF(fallbackRect.left.toFloat(), fallbackRect.top.toFloat()),
-            PointF(fallbackRect.right.toFloat(), fallbackRect.top.toFloat()),
-            PointF(fallbackRect.right.toFloat(), fallbackRect.bottom.toFloat()),
-            PointF(fallbackRect.left.toFloat(), fallbackRect.bottom.toFloat())
-        )
 
         try {
             mat = org.opencv.core.Mat()
@@ -444,7 +434,7 @@ class MainActivity : AppCompatActivity() {
             val roiW = kotlin.math.min(mat.cols() - roiX, searchRect.width())
             val roiH = kotlin.math.min(mat.rows() - roiY, searchRect.height())
 
-            if (roiW <= 0 || roiH <= 0) return fallbackBox
+            if (roiW <= 0 || roiH <= 0) return null
 
             roiMat = org.opencv.core.Mat(mat, org.opencv.core.Rect(roiX, roiY, roiW, roiH))
             val roiArea = roiW * roiH 
@@ -475,7 +465,7 @@ class MainActivity : AppCompatActivity() {
                 org.opencv.imgproc.Imgproc.CHAIN_APPROX_SIMPLE
             )
 
-            var bestScore = 0.0
+            var bestScore = -9999.0
             var bestBox: Array<PointF>? = null
 
             val guideCenterX = (searchRect.left + searchRect.right) / 2.0f
@@ -490,16 +480,25 @@ class MainActivity : AppCompatActivity() {
                 val rh = minRect.size.height
                 val rectArea = rw * rh
 
-                if (rectArea < roiArea * 0.10) continue 
+                // 🚨 솔루션 3: 면적이 ROI의 45%를 초과하는 거대 범퍼 윤곽선을 단호하게 필터링
+                if (rectArea < roiArea * 0.15 || rectArea > roiArea * 0.45) continue 
 
                 val aspect = kotlin.math.max(rw, rh) / kotlin.math.min(rw, rh).coerceAtLeast(1.0)
 
+                // 한국 번호판 규격 비율(2.0 ~ 5.0) 내외만 정밀 허용
                 if (aspect in 1.8..6.0) {
                     val centerX = minRect.center.x + roiX
                     val centerY = minRect.center.y + roiY
                     
                     val dist = kotlin.math.hypot((centerX - guideCenterX).toDouble(), (centerY - guideCenterY).toDouble())
-                    val score = rectArea - (dist * 5.0)
+                    
+                    // 🚨 솔루션 2: ChatGPT의 완벽한 정규화 Scoring 공식 전면 도입
+                    // 사각형 크기보다 번호판다운 비율(Aspect Ratio)과 중심 거리를 최우선으로 평가합니다.
+                    val normalizedArea = rectArea / roiArea.toDouble()
+                    val aspectScore = 1.0 - kotlin.math.abs(aspect - 3.0) / 3.0
+                    val distanceScore = 1.0 / (1.0 + dist)
+
+                    val score = (aspectScore * 0.5) + (distanceScore * 0.3) + (normalizedArea * 0.2)
 
                     if (score > bestScore) {
                         bestScore = score
@@ -522,10 +521,10 @@ class MainActivity : AppCompatActivity() {
                 return sorted
             }
 
-            return fallbackBox
+            return null // 🚨 실패 시 null을 반환하여 웹 토스트 알림 연동
 
         } catch (e: Exception) {
-            return fallbackBox
+            return null
         } finally {
             mat?.release()
             roiMat?.release()
