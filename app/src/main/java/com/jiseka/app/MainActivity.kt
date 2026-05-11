@@ -48,6 +48,7 @@ class MainActivity : AppCompatActivity() {
     private val isCapturing = AtomicBoolean(false)
     private val recognizer by lazy { TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build()) }
 
+    // 원본 화질 보존을 위한 비트맵 캐시
     private var lastCapturedBitmap: Bitmap? = null 
     private var isWebReady = false 
 
@@ -75,7 +76,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // 🚨 핵심 개선 1: 웹의 object-fit: contain과 완벽하게 1:1 좌표계를 일치시키기 위해 FIT_CENTER 채택
         viewFinder?.scaleType = PreviewView.ScaleType.FIT_CENTER
         cameraExecutor = Executors.newSingleThreadExecutor()
 
@@ -135,7 +135,6 @@ class MainActivity : AppCompatActivity() {
                 lastCapturedBitmap?.let { bmp ->
                     val safeBitmap = bmp.copy(Bitmap.Config.ARGB_8888, false)
                     try {
-                        // 🚨 개선 3: 0.0 ~ 1.0 사이로 완벽하게 안전 클램핑(Clamp)하여 네이티브로 전달
                         val cLeft = kotlin.math.max(0f, kotlin.math.min(1f, left))
                         val cTop = kotlin.math.max(0f, kotlin.math.min(1f, top))
                         val cRight = kotlin.math.max(0f, kotlin.math.min(1f, right))
@@ -161,15 +160,69 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // 🚨 대혁신: 웹 브라우저 캡처 의존성을 버리고, 수신된 모서리 좌표를 바탕으로 
+        // 안드로이드 네이티브 OpenCV에서 텍스처를 완벽한 사다리꼴로 직접 구워내어 갤러리에 저장합니다.
         @JavascriptInterface
-        fun saveImageToGallery(base64Data: String) {
-            Thread {
-                var bitmap: Bitmap? = null
+        fun saveImageWithNativeOverlay(cornersStr: String) {
+            cameraExecutor.execute {
+                var bgBmp: Bitmap? = null
+                var maskBmp: Bitmap? = null
+                var resultBmp: Bitmap? = null
+                
                 try {
-                    val base64Image = base64Data.substringAfter(",")
-                    val imageBytes = Base64.decode(base64Image, Base64.DEFAULT)
-                    bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size) ?: throw IllegalStateException("Bitmap decode failed")
+                    bgBmp = lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true)
+                        ?: throw IllegalStateException("메모리에 원본 비트맵이 없습니다.")
+                    
+                    // 1. 앱 리소스(drawable)에서 번호판 텍스처 로드
+                    maskBmp = BitmapFactory.decodeResource(resources, R.drawable.cbf082_grande)
+                        ?: throw IllegalStateException("마스크 텍스처 리소스를 찾을 수 없습니다.")
 
+                    val cornersArray = JSONArray(cornersStr)
+                    if (cornersArray.length() != 4) throw IllegalArgumentException("모서리 좌표 개수가 올바르지 않습니다.")
+
+                    val imgW = bgBmp.width.toFloat()
+                    val imgH = bgBmp.height.toFloat()
+
+                    val dstPoints = ArrayList<org.opencv.core.Point>()
+                    for (i in 0 until 4) {
+                        val ptObj = cornersArray.getJSONObject(i)
+                        // 웹에서 넘어온 정규화 비율(0~1)을 원본 고화질 비트맵 픽셀 좌표로 복원
+                        dstPoints.add(org.opencv.core.Point(ptObj.getDouble("x") * imgW, ptObj.getDouble("y") * imgH))
+                    }
+
+                    // 2. OpenCV 호모그래피 투영 연산 (가장 완벽하고 정확한 Perspective 렌더링)
+                    val bgMat = org.opencv.core.Mat()
+                    val maskMat = org.opencv.core.Mat()
+                    org.opencv.android.Utils.bitmapToMat(bgBmp, bgMat)
+                    org.opencv.android.Utils.bitmapToMat(maskBmp, maskMat)
+
+                    val srcMatPts = org.opencv.core.MatOfPoint2f(
+                        org.opencv.core.Point(0.0, 0.0),
+                        org.opencv.core.Point(maskMat.cols().toDouble(), 0.0),
+                        org.opencv.core.Point(maskMat.cols().toDouble(), maskMat.rows().toDouble()),
+                        org.opencv.core.Point(0.0, maskMat.rows().toDouble())
+                    )
+                    val dstMatPts = org.opencv.core.MatOfPoint2f(*dstPoints.toTypedArray())
+
+                    val perspectiveTransform = org.opencv.imgproc.Imgproc.getPerspectiveTransform(srcMatPts, dstMatPts)
+                    val warpedMask = org.opencv.core.Mat()
+                    
+                    // 원본 비트맵 크기 위에 마스크를 완벽한 투시 사다리꼴로 변형
+                    org.opencv.imgproc.Imgproc.warpPerspective(
+                        maskMat, warpedMask, perspectiveTransform, 
+                        bgMat.size(), org.opencv.imgproc.Imgproc.INTER_LINEAR
+                    )
+
+                    // 3. 투명도(Alpha) 채널을 고려하여 배경 위에 정밀 합성
+                    resultBmp = Bitmap.createBitmap(bgBmp.width, bgBmp.height, Bitmap.Config.ARGB_8888)
+                    val warpedBmp = Bitmap.createBitmap(bgBmp.width, bgBmp.height, Bitmap.Config.ARGB_8888)
+                    org.opencv.android.Utils.matToBitmap(warpedMask, warpedBmp)
+
+                    val canvas = android.graphics.Canvas(resultBmp)
+                    canvas.drawImage(bgBmp, 0f, 0f, null)
+                    canvas.drawImage(warpedBmp, 0f, 0f, null)
+
+                    // 4. 합성된 최종 비트맵을 갤러리에 안전하게 파일로 저장
                     val filename = "JiSeKa_${System.currentTimeMillis()}.jpg"
                     var outputStream: java.io.OutputStream? = null
                     var legacyFile: java.io.File? = null
@@ -192,20 +245,37 @@ class MainActivity : AppCompatActivity() {
                     }
 
                     outputStream?.use { stream ->
-                        bitmap.compress(Bitmap.CompressFormat.JPEG, 92, stream)
+                        resultBmp.compress(Bitmap.CompressFormat.JPEG, 95, stream)
                         stream.flush()
                     }
 
                     legacyFile?.let { file ->
                         android.media.MediaScannerConnection.scanFile(this@MainActivity, arrayOf(file.absolutePath), arrayOf("image/jpeg"), null)
                     }
-                    showToast("사진이 갤러리에 저장되었습니다.")
+
+                    showToast("사진이 갤러리에 완벽히 저장되었습니다.")
+
+                    // 메모리 해제
+                    srcMatPts.release()
+                    dstMatPts.release()
+                    perspectiveTransform.release()
+                    warpedMask.release()
+                    bgMat.release()
+                    maskMat.release()
+                    warpedBmp.recycle()
+
                 } catch (e: Exception) {
-                    showToast("사진 저장 실패")
+                    Log.e("JiSeKa", "네이티브 합성 캡처 실패", e)
+                    showToast("합성 저장 실패: " + e.message)
                 } finally {
-                    bitmap?.let { if (!it.isRecycled) it.recycle() }
+                    bgBmp?.recycle()
+                    maskBmp?.recycle()
+                    resultBmp?.recycle()
+                    runOnUiThread {
+                        safeEvaluateJavascript("javascript:window.onNativeSaveComplete()")
+                    }
                 }
-            }.start()
+            }
         }
     }
 
@@ -225,7 +295,7 @@ class MainActivity : AppCompatActivity() {
                 cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageCapture)
             } catch (exc: Exception) {
                 Log.e("JiSeKa", "Camera binding failed", exc)
-                Toast.makeText(this, "🚨 [경고] 카메라를 시작할 수 없습니다. (에뮬레이터 설정 확인)", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "🚨 [경고] 카메라를 시작할 수 없습니다.", Toast.LENGTH_LONG).show()
             }
         }, ContextCompat.getMainExecutor(this))
     }
@@ -262,7 +332,7 @@ class MainActivity : AppCompatActivity() {
                     safeEvaluateJavascript(safeJS)
                 } catch (e: Exception) {
                     Log.e("JiSeKa", "Capture error", e)
-                    sendErrorToWeb("사진 처리 중 내부 오류 발생")
+                    safeEvaluateJavascript("javascript:window.onNativeError('사진 처리 오류')")
                 } finally {
                     imageProxy.close()
                     isCapturing.set(false)
@@ -271,7 +341,7 @@ class MainActivity : AppCompatActivity() {
 
             override fun onError(exception: ImageCaptureException) {
                 isCapturing.set(false)
-                sendErrorToWeb("카메라 캡처 실패: ${exception.message}")
+                safeEvaluateJavascript("javascript:window.onNativeError('캡처 실패')")
             }
         })
     }
@@ -298,13 +368,13 @@ class MainActivity : AppCompatActivity() {
         )
 
         if (expandedRectImg.width() <= 0 || expandedRectImg.height() <= 0) {
-            sendErrorToWeb("가이드 영역이 올바르지 않습니다.")
+            safeEvaluateJavascript("javascript:window.onNativeError('가이드 영역 오류')")
             return
         }
 
         val corners = extractGeometryCorners(bitmap, expandedRectImg, baseRectImg)
         if (corners == null) {
-            sendErrorToWeb("번호판을 찾을 수 없습니다.")
+            safeEvaluateJavascript("javascript:window.onNativeError('번호판 탐색 실패')")
             return
         }
 
@@ -317,16 +387,10 @@ class MainActivity : AppCompatActivity() {
         val inputImage = InputImage.fromBitmap(rectifiedBmp, 0)
         recognizer.process(inputImage).addOnCompleteListener { task ->
             val text = if (task.isSuccessful) task.result.text.replace(Regex("\\s+"), "") else ""
-            Log.d("JiSeKa", "Detected Auxiliary OCR Text: $text")
-            
+            Log.d("JiSeKa", "OCR Text: $text")
             sendSuccessToWeb(corners, imgW, imgH)
             rectifiedBmp.recycle()
         }
-    }
-
-    private fun sendErrorToWeb(msg: String) {
-        val js = "javascript:window.onNativeError(${JSONObject.quote(msg)})"
-        safeEvaluateJavascript(js)
     }
 
     private fun sendSuccessToWeb(corners: Array<PointF>, imgW: Float, imgH: Float) {
@@ -335,14 +399,14 @@ class MainActivity : AppCompatActivity() {
             put("corners", JSONArray().apply {
                 corners.forEach { 
                     put(JSONObject().apply { 
+                        // 정규화된 비율 좌표 전송 (가장 안전한 매핑 방식)
                         put("x", it.x / imgW) 
                         put("y", it.y / imgH) 
                     }) 
                 }
             })
         }
-        val js = "javascript:window.onNativeSuccess(${JSONObject.quote(payload.toString())})"
-        safeEvaluateJavascript(js)
+        safeEvaluateJavascript("javascript:window.onNativeSuccess(${JSONObject.quote(payload.toString())})")
     }
 
     private fun downscaleBitmapIfNeeded(bitmap: Bitmap, maxDimension: Int): Bitmap {
@@ -359,7 +423,6 @@ class MainActivity : AppCompatActivity() {
         var edges: org.opencv.core.Mat? = null
         val contours = ArrayList<org.opencv.core.MatOfPoint>()
 
-        // 🚨 개선 5: Fallback 발생 시 무조건 거대 가림막이 되지 않도록 타이트한 원본 영역으로 엄격 고정
         val fallbackBox = arrayOf(
             PointF(fallbackRect.left.toFloat(), fallbackRect.top.toFloat()),
             PointF(fallbackRect.right.toFloat(), fallbackRect.top.toFloat()),
@@ -457,7 +520,6 @@ class MainActivity : AppCompatActivity() {
             return fallbackBox
 
         } catch (e: Exception) {
-            Log.e("JiSeKa", "Corner extraction error", e)
             return fallbackBox
         } finally {
             mat?.release()
@@ -510,7 +572,6 @@ class MainActivity : AppCompatActivity() {
             return result
 
         } catch (e: Exception) {
-            Log.e("JiSeKa", "warp 실패", e)
             return null
         } finally {
             bgMat?.release()
