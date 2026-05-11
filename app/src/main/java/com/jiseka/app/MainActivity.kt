@@ -697,7 +697,7 @@ class MainActivity : AppCompatActivity() {
             
             try { clahe?.release() } catch (err: Exception) { }
             
-            // 🚨 에러 2 완벽 해결: 존재하지 않는 release() 호출 소멸 및 안전 비우기
+            // 🚨 최종 무결성 확보: 메인 탐색 루프의 에러 원인이었던 .release() 순회 완전 소멸
             textContours?.clear()
         }
     }
@@ -791,7 +791,7 @@ class MainActivity : AppCompatActivity() {
             }
             approx.release()
         }
-        contours.forEach { it.release() }
+        contours.clear()
 
         bestQuad?.let { pts ->
             val sortedByY = pts.sortedBy { it.y }
