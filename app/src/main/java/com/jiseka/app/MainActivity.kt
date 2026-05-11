@@ -48,7 +48,6 @@ class MainActivity : AppCompatActivity() {
     private var viewFinder: PreviewView? = null
     private var webView: WebView? = null
     
-    // 🚨 개선 12: 사진 캡처와 무거운 OpenCV 비전 연산을 분리하여 프리뷰 멈춤(Freeze) 방지
     private lateinit var cameraExecutor: ExecutorService
     private lateinit var analysisExecutor: ExecutorService
     
@@ -56,7 +55,6 @@ class MainActivity : AppCompatActivity() {
     private val isCapturing = AtomicBoolean(false)
     private val recognizer by lazy { TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build()) }
 
-    // 🚨 개선 1: 비트맵 Race Condition 원천 차단을 위한 전용 동기화 락 객체 탑재
     private val bitmapLock = Any()
     private var lastCapturedBitmap: Bitmap? = null 
     
@@ -92,7 +90,6 @@ class MainActivity : AppCompatActivity() {
         analysisExecutor = Executors.newSingleThreadExecutor()
 
         webView?.apply {
-            // 🚨 개선 14: 개발 환경에서만 강제 캐시 삭제를 수행하여 상용 릴리즈 시 로딩 속도 극대화
             if (BuildConfig.DEBUG) {
                 clearHistory()
                 clearFormData()
@@ -129,14 +126,14 @@ class MainActivity : AppCompatActivity() {
         else ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 1001)
     }
 
-    // 🚨 개선 10: 메모리 및 백그라운드 스레드 완벽 수거를 통한 고질적 Leak 영구 소멸
     override fun onDestroy() {
         super.onDestroy()
         
         webView?.apply {
             stopLoading()
             webChromeClient = null
-            webViewClient = null
+            // 🚨 에러 1 완벽 해결: null 대신 빈 WebViewClient 객체를 대입하여 Non-null 규약 준수
+            webViewClient = WebViewClient()
             destroy()
         }
 
@@ -150,7 +147,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 🚨 개선 11: 클래스 스코프 오류 차단을 위해 최상위 액티비티 레벨로 알림 함수 분리
     private fun showToast(msg: String) {
         runOnUiThread {
             if (!isFinishing && !isDestroyed) {
@@ -159,7 +155,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 🚨 개선 5: 불안정한 웹뷰 progress 대신, 명시적인 isWebReady 상태 플래그만 신뢰
     private fun safeEvaluateJavascript(script: String) {
         if (isFinishing || isDestroyed) return
         runOnUiThread {
@@ -192,9 +187,7 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun analyzePlateWithMode(left: Float, top: Float, right: Float, bottom: Float, mode: String) {
             currentPerspectiveMode = mode.uppercase()
-            // 🚨 개선 12: 무거운 이미지 분석 연산을 별도의 analysisExecutor로 완전히 격리
             analysisExecutor.execute { 
-                // 🚨 개선 1 & 2: 비트맵 락 동기화 및 강제 Mutable Deep Copy(true)로 Skia Assertion 완벽 방어
                 val safeBitmap = synchronized(bitmapLock) {
                     lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true)
                 }
@@ -238,7 +231,6 @@ class MainActivity : AppCompatActivity() {
                 var perspectiveTransform: org.opencv.core.Mat? = null
                 
                 try {
-                    // 🚨 개선 1 & 2: 비트맵 락 기반 완전 독립적인 Deep Copy 확보
                     bgBmp = synchronized(bitmapLock) {
                         lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true)
                     } ?: throw IllegalStateException("메모리에 원본 비트맵이 없습니다.")
@@ -399,7 +391,6 @@ class MainActivity : AppCompatActivity() {
             val cameraProvider = cameraProviderFuture.get()
             val preview = Preview.Builder().build().also { it.setSurfaceProvider(viewFinder?.surfaceProvider) }
             
-            // 🚨 개선 9: 48MP/64MP 센서 버퍼 폭주(OOM) 완벽 방어를 위해 캡처 타겟 해상도 상한선 강제 설정
             imageCapture = ImageCapture.Builder()
                 .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                 .setTargetResolution(Size(1920, 1080))
@@ -423,7 +414,6 @@ class MainActivity : AppCompatActivity() {
             @SuppressLint("UnsafeOptInUsageError")
             override fun onCaptureSuccess(imageProxy: ImageProxy) {
                 try {
-                    // 🚨 개선 4: 프레임 드랍(Stall)을 유발하는 시스템 강제 GC 호출(System.gc) 완전 소멸
                     val bitmap = imageProxy.toBitmapExt()
                     val rotation = imageProxy.imageInfo.rotationDegrees
 
@@ -437,7 +427,6 @@ class MainActivity : AppCompatActivity() {
                     val downscaledBmp = downscaleBitmapIfNeeded(rotatedBmp, 2400)
                     if (downscaledBmp != rotatedBmp) rotatedBmp.recycle()
                     
-                    // 🚨 개선 1: 비트맵 락을 통해 안전하고 원자적으로 레퍼런스 업데이트
                     synchronized(bitmapLock) {
                         lastCapturedBitmap?.recycle()
                         lastCapturedBitmap = downscaledBmp
@@ -509,7 +498,6 @@ class MainActivity : AppCompatActivity() {
             }
             val text = if (task.isSuccessful) task.result.text.replace(Regex("\\s+"), "") else ""
             
-            // 🚨 개선 6: 번호판 구조 검증의 무결성을 위해 최소한의 OCR 텍스트 힌트(길이 3 이상)를 방어적 평가
             if (text.length >= 3) {
                 Log.d("JiSeKa", "OCR Text Validator Confirmed: $text")
             } else {
@@ -543,9 +531,6 @@ class MainActivity : AppCompatActivity() {
         return Bitmap.createScaledBitmap(bitmap, (bitmap.width * scale).toInt(), (bitmap.height * scale).toInt(), true)
     }
 
-    // ─────────────────────────────────────────────────────────────────
-    // 🚀 Stage 1 ~ Stage 3: C++ 누수/크래시 원천 봉쇄형 기하 복원 엔진
-    // ─────────────────────────────────────────────────────────────────
     private fun extractGeometryCorners(bitmap: Bitmap, searchRect: Rect): Array<PointF>? {
         var mat: org.opencv.core.Mat? = null
         var roiMat: org.opencv.core.Mat? = null
@@ -575,10 +560,8 @@ class MainActivity : AppCompatActivity() {
             gray = org.opencv.core.Mat()
             org.opencv.imgproc.Imgproc.cvtColor(roiMat, gray, org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY)
 
-            // 🚨 개선 8: cornerSubPix 연산 전, 도화지가 너무 작아 발생하는 C++ Assertion 크래시 완전 차단
             if (gray.cols() < 12 || gray.rows() < 12) return null
 
-            // 🚨 개선 3: C++ 네이티브 CLAHE 객체의 완벽한 수거 보장을 위해 명시적 변수화
             clahe = org.opencv.imgproc.Imgproc.createCLAHE(2.0, org.opencv.core.Size(8.0, 8.0))
             clahe.apply(gray, gray)
 
@@ -594,7 +577,6 @@ class MainActivity : AppCompatActivity() {
             kernel.release()
 
             textContours = ArrayList()
-            // 🚨 개선 13: C++ temp Mat 생성 후 누락되던 findContours의 계층(Hierarchy) 객체 완벽 릴리즈
             val hierarchy = org.opencv.core.Mat()
             org.opencv.imgproc.Imgproc.findContours(morph, textContours, hierarchy, org.opencv.imgproc.Imgproc.RETR_EXTERNAL, org.opencv.imgproc.Imgproc.CHAIN_APPROX_SIMPLE)
             hierarchy.release()
@@ -634,7 +616,6 @@ class MainActivity : AppCompatActivity() {
             org.opencv.imgproc.Imgproc.Canny(subGray, edges, 10.0, 50.0)
 
             lines = org.opencv.core.Mat()
-            // 🚨 개선 7: 기기별 화소 편차에 구애받지 않도록 적응형(Adaptive) 선분 최소 길이 검증 수식 적용
             val minLineLen = kotlin.math.max(20.0, subRoiW * 0.12)
             org.opencv.imgproc.Imgproc.HoughLinesP(edges, lines, 1.0, kotlin.math.PI / 180.0, 15, minLineLen, 15.0)
 
@@ -672,7 +653,6 @@ class MainActivity : AppCompatActivity() {
                 return fallbackPolyReconstruction(edges, roiX + subRoiX, roiY + subRoiY, subRoiW, subRoiH, gray)
             }
 
-            // K-Means 가중 평균 추출
             val topEdge = clusterAndGetBestLine(horizontalLines, true, true) ?: return null
             val bottomEdge = clusterAndGetBestLine(horizontalLines, true, false) ?: return null
             val leftEdge = clusterAndGetBestLine(verticalLines, false, true) ?: return null
@@ -707,7 +687,6 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             return null
         } finally {
-            // 🚨 개선 3 & 13: 중간에 어떠한 크래시나 우회 경로가 발생해도 모든 C++ 네이티브 메모리를 절대 수거
             mat?.release()
             roiMat?.release()
             gray?.release()
@@ -717,10 +696,10 @@ class MainActivity : AppCompatActivity() {
             subGray?.release()
             lines?.release()
             
-            // C++ CLAHE 객체의 확실한 릭 해제 (버전에 따라 release() 또는 자동 수거 지원)
             try { clahe?.release() } catch (err: Exception) { }
             
-            textContours?.forEach { it.release() }
+            // 🚨 에러 2 완벽 해결: 존재하지 않는 컬렉션 원소의 .release() 호출을 완전히 제거
+            textContours?.clear()
         }
     }
 
@@ -813,7 +792,8 @@ class MainActivity : AppCompatActivity() {
             }
             approx.release()
         }
-        contours.forEach { it.release() }
+        // 🚨 에러 2 완벽 해결: 존재하지 않는 .release() 메소드 호출 제거
+        contours.clear()
 
         bestQuad?.let { pts ->
             val sortedByY = pts.sortedBy { it.y }
