@@ -85,7 +85,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // 🚨 개선: WebView + CameraX + OpenCV 혼합 환경의 GPU Surface 경합 방지를 위해 COMPATIBLE 모드 강제
         viewFinder?.apply {
             scaleType = PreviewView.ScaleType.FIT_CENTER
             implementationMode = PreviewView.ImplementationMode.COMPATIBLE
@@ -413,7 +412,6 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    // 🚨 핵심 해결책: 최초 권한 허용 직후 레이아웃(PreviewView)이 완전히 그려지길 기다렸다가 안전하게 카메라 바인딩
     override fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<out String>,
@@ -721,7 +719,10 @@ class MainActivity : AppCompatActivity() {
             subGray?.release()
             lines?.release()
             
-            try { clahe?.release() } catch (err: Exception) { }
+            // 🚨 최종 호환성 해결: 문제의 .release()를 collectGarbage()로 안전하게 교체
+            try {
+                clahe?.collectGarbage()
+            } catch (_: Exception) { }
             
             textContours?.clear()
         }
