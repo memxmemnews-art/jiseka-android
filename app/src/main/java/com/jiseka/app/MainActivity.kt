@@ -85,7 +85,12 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        viewFinder?.scaleType = PreviewView.ScaleType.FIT_CENTER
+        // 🚨 개선: WebView + CameraX + OpenCV 혼합 환경의 GPU Surface 경합 방지를 위해 COMPATIBLE 모드 강제
+        viewFinder?.apply {
+            scaleType = PreviewView.ScaleType.FIT_CENTER
+            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+        }
+
         cameraExecutor = Executors.newSingleThreadExecutor()
         analysisExecutor = Executors.newSingleThreadExecutor()
 
@@ -122,8 +127,11 @@ class MainActivity : AppCompatActivity() {
             loadUrl("https://ziseka-app.vercel.app")
         }
 
-        if (allPermissionsGranted()) startCamera() 
-        else ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 1001)
+        if (allPermissionsGranted()) {
+            startCamera() 
+        } else {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 1001)
+        }
     }
 
     override fun onDestroy() {
@@ -403,6 +411,24 @@ class MainActivity : AppCompatActivity() {
                 showToast("🚨 카메라 시작 실패")
             }
         }, ContextCompat.getMainExecutor(this))
+    }
+
+    // 🚨 핵심 해결책: 최초 권한 허용 직후 레이아웃(PreviewView)이 완전히 그려지길 기다렸다가 안전하게 카메라 바인딩
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 1001) {
+            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                viewFinder?.post {
+                    startCamera()
+                }
+            } else {
+                showToast("카메라 권한이 필요합니다.")
+            }
+        }
     }
 
     private fun capturePhoto() {
@@ -695,7 +721,8 @@ class MainActivity : AppCompatActivity() {
             subGray?.release()
             lines?.release()
             
-            // 🚨 최종 무결성 확보: 컴파일 에러를 유발하던 clahe?.release()를 완전히 제거하고 참조만 안전하게 초기화
+            try { clahe?.release() } catch (err: Exception) { }
+            
             textContours?.clear()
         }
     }
@@ -750,7 +777,6 @@ class MainActivity : AppCompatActivity() {
         return PointF(px, py)
     }
 
-    // 🚨 임시 객체(MatOfPoint) 안전 해제 적용
     private fun fallbackPolyReconstruction(edges: org.opencv.core.Mat, absX: Int, absY: Int, sw: Int, sh: Int, gray: org.opencv.core.Mat): Array<PointF>? {
         val contours = ArrayList<org.opencv.core.MatOfPoint>()
         val hierarchy = org.opencv.core.Mat()
@@ -768,7 +794,6 @@ class MainActivity : AppCompatActivity() {
             org.opencv.imgproc.Imgproc.approxPolyDP(contour2f, approx, arcLen * 0.02, true)
             contour2f.release()
 
-            // 🚨 수정 2: 네이티브 메모리 누수 방지를 위해 임시 객체를 명시적으로 릴리즈
             val approxMat = org.opencv.core.MatOfPoint(*approx.toArray())
             if (approx.rows() == 4 && org.opencv.imgproc.Imgproc.isContourConvex(approxMat)) {
                 val ptsMat = approx.toArray()
