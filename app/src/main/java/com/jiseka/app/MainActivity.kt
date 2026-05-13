@@ -30,6 +30,8 @@ import org.opencv.android.Utils
 import org.opencv.core.*
 import org.opencv.imgproc.Imgproc
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
 import java.io.OutputStream
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -47,10 +49,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cameraExecutor: ExecutorService
     private lateinit var analysisExecutor: ExecutorService
 
+    // 스레드 경합 방지를 위한 메인 소스 비트맵 유지 변수
     private var lastCapturedBitmap: Bitmap? = null
     private val bitmapLock = Any()
 
-    // ML Kit 한국어 텍스트 인식 클라이언트 지연 초기화
+    // 로컬 파일 캐싱을 위한 파일 객체 관리
+    private var cachedPreviewFile: File? = null
+
     private val recognizer by lazy { 
         TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build()) 
     }
@@ -66,6 +71,9 @@ class MainActivity : AppCompatActivity() {
         viewFinder = findViewById(R.id.viewFinder)
         nativeBackgroundView = findViewById(R.id.nativeBackgroundView)
         webView = findViewById(R.id.webView)
+
+        // 캐시 디렉토리 초기화
+        cachedPreviewFile = File(externalCacheDir ?: cacheDir, "preview_cache.jpg")
 
         viewFinder?.apply {
             scaleType = PreviewView.ScaleType.FIT_CENTER
@@ -94,6 +102,9 @@ class MainActivity : AppCompatActivity() {
                 domStorageEnabled = true
                 allowFileAccess = true
                 allowContentAccess = true
+                // 로컬 파일 접근 허용 강제 (file:// 프리뷰 로드용)
+                allowFileAccessFromFileURLs = true
+                allowUniversalAccessFromFileURLs = true
             }
             webViewClient = object : WebViewClient() {
                 override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?) = false
@@ -120,77 +131,130 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        /**
+         * 🚨 [TOP 1 & 2 해결] JS 수신부: 정규화 좌표를 실제 비트맵 좌표로 역매핑하고 파일 URI를 반환합니다.
+         */
         @JavascriptInterface
         fun analyzePlateWithMode(cornersJsonStr: String, mode: String) {
             analysisExecutor.execute {
-                // 스레드 안전한 로컬 분석용 비트맵 복사본 생성
-                val sourceBitmap = synchronized(bitmapLock) { 
-                    lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) 
-                } ?: return@execute
-
+                var processingBitmap: Bitmap? = null
                 try {
-                    val inputCorners = JSONObject(cornersJsonStr).getJSONArray("corners")
-                    val bmpW = sourceBitmap.width.toFloat()
-                    val bmpH = sourceBitmap.height.toFloat()
-                    val initialPoints = mutableListOf<PointF>()
-                    for (i in 0 until 4) {
-                        val p = inputCorners.getJSONObject(i)
-                        initialPoints.add(PointF(p.getDouble("x").toFloat() * bmpW, p.getDouble("y").toFloat() * bmpH))
+                    // 1. 스레드 세이프 원본 복사본 생성
+                    val rawBitmap = synchronized(bitmapLock) { 
+                        lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) 
+                    } ?: return@execute
+
+                    // 🚨 [TOP 3 해결] OOM 방지를 위해 최대 1920x1080 이하로 스케일링 제한 강제
+                    processingBitmap = scaleBitmapDownToLimit(rawBitmap, 1920, 1080)
+                    if (processingBitmap !== rawBitmap) {
+                        rawBitmap.recycle() // 원본 크기 임시 비트맵 조기 해제
                     }
 
-                    // 허프 변환 직선 피팅 엔진 기반 정밀 엣지 좌표 추출
-                    val refinedPoints = extractPlateCornersViaLineFitting(sourceBitmap, initialPoints)
+                    val bmpW = processingBitmap.width.toFloat()
+                    val bmpH = processingBitmap.height.toFloat()
+                    
+                    // 🚨 [TOP 1 해결] 뷰파인더 해상도 확보 (스레드 동기화를 위해 변수 사전 복사)
+                    val viewW = viewFinder?.width?.toFloat() ?: 1f
+                    val viewH = viewFinder?.height?.toFloat() ?: 1f
 
-                    // OCR 검증 및 결과 전송 (수명주기 회수 포함)
-                    verifyCandidateAndRespond(sourceBitmap, refinedPoints, initialPoints, bmpW, bmpH)
+                    val inputCorners = JSONObject(cornersJsonStr).getJSONArray("corners")
+                    val mappedPoints = mutableListOf<PointF>()
+
+                    // 🚨 [TOP 1 핵심 로직] Letterbox/Pillarbox 영역을 수식으로 도출하여 원본 픽셀로 다이렉트 역변환
+                    val scale = min(viewW / bmpW, viewH / bmpH)
+                    val displayedW = bmpW * scale
+                    val displayedH = bmpH * scale
+                    val offsetX = (viewW - displayedW) / 2f
+                    val offsetY = (viewH - displayedH) / 2f
+
+                    for (i in 0 until 4) {
+                        val p = inputCorners.getJSONObject(i)
+                        val normX = p.getDouble("x").toFloat()
+                        val normY = p.getDouble("y").toFloat()
+
+                        // 웹뷰 절대 픽셀 좌표 도출
+                        val screenPixelX = normX * viewW
+                        val screenPixelY = normY * viewH
+
+                        // 오버레이 영역 바운더리 제거 후 실제 비트맵 내부 픽셀로 환산
+                        val targetBmpX = ((screenPixelX - offsetX) / scale).coerceIn(0f, bmpW - 1f)
+                        val targetBmpY = ((screenPixelY - offsetY) / scale).coerceIn(0f, bmpH - 1f)
+                        mappedPoints.add(PointF(targetBmpX, targetBmpY))
+                    }
+
+                    // 허프 변환 직선 피팅을 통한 미세 모서리 정제 가동
+                    val refinedPoints = extractPlateCornersViaLineFitting(processingBitmap, mappedPoints)
+
+                    // OCR 검증 및 로컬 캐시 파일 프리뷰 생성 파이프라인 가동
+                    verifyAndGenerateFilePreview(processingBitmap, refinedPoints, mappedPoints, bmpW, bmpH)
 
                 } catch (e: Exception) {
-                    Log.e("JiSeKa Engine", "분석 파이프라인 에러", e)
-                    runOnUiThread { webView?.evaluateJavascript("window.onNativeSuccess('{\"corners\":null}')", null) }
-                    sourceBitmap.recycle()
+                    Log.e("JiSeKa Engine", "분석 파이프라인 크래시 방어", e)
+                    runOnUiThread { webView?.evaluateJavascript("window.onNativeSuccess('{\"corners\":null, \"preview\":null}')", null) }
+                } finally {
+                    // 🚨 [TOP 3 해결] 연산 전용 비트맵 안전 해제 (UI용 lastCapturedBitmap은 유지됨)
+                    processingBitmap?.recycle()
                 }
             }
         }
 
         @JavascriptInterface
         fun saveImageWithNativeOverlay(cornersJsonStr: String) {
-            val sourceBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) } ?: return
             analysisExecutor.execute {
+                var baseBitmap: Bitmap? = null
                 var overlayResult: Bitmap? = null
                 try {
+                    baseBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) } ?: return@execute
                     val jsonObj = JSONObject(cornersJsonStr)
+
                     if (jsonObj.isNull("corners")) {
-                        Log.d("JiSeKa Engine", "ℹ️ 가림막 기각 대상: 원본 비트맵 직접 저장")
-                        saveBitmapToGallery(sourceBitmap)
+                        saveBitmapToGallery(baseBitmap)
                         runOnUiThread { webView?.evaluateJavascript("window.onNativeSaveComplete()", null) }
                         return@execute
                     }
 
+                    // 저장 시점의 좌표 환산 (현재 캐싱된 좌표는 이미 원본 픽셀 단위로 환산되어 있음)
                     val corners = jsonObj.getJSONArray("corners")
-                    val bmpW = sourceBitmap.width.toFloat()
-                    val bmpH = sourceBitmap.height.toFloat()
                     val pts = mutableListOf<PointF>()
                     for (i in 0 until 4) {
                         val p = corners.getJSONObject(i)
-                        pts.add(PointF(p.getDouble("x").toFloat() * bmpW, p.getDouble("y").toFloat() * bmpH))
+                        // 최종 저장 시 원본 비트맵 해상도 비율로 복원
+                        val absX = p.getDouble("x").toFloat() * baseBitmap.width
+                        val absY = p.getDouble("y").toFloat() * baseBitmap.height
+                        pts.add(PointF(absX, absY))
                     }
 
-                    overlayResult = processPerspectiveOverlay(sourceBitmap, pts)
+                    overlayResult = processPerspectiveOverlay(baseBitmap, pts)
                     saveBitmapToGallery(overlayResult!!)
                     runOnUiThread { webView?.evaluateJavascript("window.onNativeSaveComplete()", null) }
                 } finally { 
-                    sourceBitmap.recycle()
-                    // 🚨 완벽 조치: 안전한 주소 참조 비교(!==)를 통한 메모리 누수 방어
-                    overlayResult?.let { if (it !== sourceBitmap) it.recycle() }
+                    baseBitmap?.recycle()
+                    overlayResult?.let { if (it !== baseBitmap) it.recycle() }
                 }
             }
         }
     }
 
     /**
-     * 🚨 완벽 조치: 비동기 흐름 종착지에서 안전하게 비트맵을 회수하는 OCR 검증 파이프라인
+     * 🚨 [TOP 3 해결] OOM 방지를 위한 해상도 제한 다운샘플링 수식
      */
-    private fun verifyCandidateAndRespond(
+    private fun scaleBitmapDownToLimit(bitmap: Bitmap, maxW: Int, maxH: Int): Bitmap {
+        val oW = bitmap.width
+        val oH = bitmap.height
+        if (oW <= maxW && oH <= maxH) return bitmap
+
+        val scale = min(maxW.toFloat() / oW, maxH.toFloat() / oH)
+        val scaledW = (oW * scale).toInt()
+        val scaledH = (oH * scale).toInt()
+
+        return Bitmap.createScaledBitmap(bitmap, scaledW, scaledH, true)
+    }
+
+    /**
+     * 🚨 [TOP 2 해결] 파일 URI 기반의 초고속 프리뷰 파이프라인
+     * Base64 변환을 완벽히 제거하고 로컬 디스크 파일로 저장하여 통신 부하를 소멸시킵니다.
+     */
+    private fun verifyAndGenerateFilePreview(
         sourceBitmap: Bitmap, 
         targetPoints: List<PointF>, 
         fallbackPoints: List<PointF>, 
@@ -201,181 +265,198 @@ class MainActivity : AppCompatActivity() {
         if (flatBmp != null) {
             val inputImage = InputImage.fromBitmap(flatBmp, 0)
             recognizer.process(inputImage).addOnCompleteListener { task ->
-                if (task.isSuccessful) {
-                    val rawText = task.result.text.replace(Regex("\\s+"), "")
-                    if (isValidLicensePlatePattern(rawText)) {
-                        Log.d("JiSeKa Engine", "✅ 정밀 피팅 좌표 OCR 검증 통과 ($rawText)")
-                        sendPointsToJs(targetPoints, bmpW, bmpH)
-                    } else {
-                        Log.w("JiSeKa Engine", "⚠️ 피팅 영역 텍스트 미달. 사용자 가이드 좌표로 폴백")
-                        sendPointsToJs(fallbackPoints, bmpW, bmpH)
-                    }
+                val finalPoints = if (task.isSuccessful && isValidLicensePlatePattern(task.result.text)) {
+                    Log.d("JiSeKa Engine", "✅ 정밀 좌표 피팅 완료")
+                    targetPoints
                 } else {
-                    sendPointsToJs(fallbackPoints, bmpW, bmpH)
+                    Log.w("JiSeKa Engine", "⚠️ 텍스트 유효성 미달. 드롭 영역으로 폴백")
+                    fallbackPoints
                 }
+                
+                // 가림막이 밀착 렌더링된 프리뷰용 비트맵 생성
+                val previewBitmap = processPerspectiveOverlay(sourceBitmap, finalPoints)
+                
+                // 🚨 로컬 캐시 파일로 즉시 덮어쓰기 저장
+                val fileUriStr = saveBitmapToCacheFile(previewBitmap)
+                
+                sendCachedPreviewToJs(finalPoints, fileUriStr, bmpW, bmpH)
+                
+                previewBitmap.recycle()
                 flatBmp.recycle()
-                sourceBitmap.recycle() // 비동기 콜백 완료 시점에 안전 회수
             }
         } else {
-            sendPointsToJs(fallbackPoints, bmpW, bmpH)
-            sourceBitmap.recycle()
+            val fileUriStr = saveBitmapToCacheFile(sourceBitmap)
+            sendCachedPreviewToJs(fallbackPoints, fileUriStr, bmpW, bmpH)
+        }
+    }
+
+    /**
+     * 🚨 [TOP 2 해결] 비트맵을 로컬 캐시 파일로 렌더링하고 파일 경로 스트링 반환
+     */
+    private fun saveBitmapToCacheFile(bitmap: Bitmap): String? {
+        return try {
+            cachedPreviewFile?.let { file ->
+                // 이전 파일 잔상 제거
+                if (file.exists()) file.delete()
+                
+                FileOutputStream(file).use { out ->
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
+                    out.flush()
+                }
+                // 브라우저 캐시 무효화를 위한 타임스탬프 파라미터 삽입
+                "file://${file.absolutePath}?t=${System.currentTimeMillis()}"
+            }
+        } catch (e: Exception) {
+            Log.e("JiSeKa Engine", "캐시 파일 저장 실패", e)
+            null
+        }
+    }
+
+    // 🚨 JS로 파일 URI 경로와 정규화 비율 데이터를 전송
+    private fun sendCachedPreviewToJs(points: List<PointF>, fileUriStr: String?, bmpW: Float, bmpH: Float) {
+        val outputArray = JSONArray()
+        for (pt in points) {
+            // JS 내부 저장을 위해 0.0~1.0 사이의 절대 정규화 비율로 변환하여 전달
+            outputArray.put(JSONObject().put("x", (pt.x / bmpW).toDouble()).put("y", (pt.y / bmpH).toDouble()))
+        }
+        
+        val resultJson = JSONObject().apply {
+            put("corners", outputArray)
+            put("preview", fileUriStr ?: JSONObject.NULL)
+        }.toString()
+        
+        runOnUiThread { 
+            webView?.evaluateJavascript("window.onNativeSuccess('$resultJson')", null) 
         }
     }
 
     private fun isValidLicensePlatePattern(text: String): Boolean {
-        if (text.length < 3) return false
+        val cleanText = text.replace(Regex("\\s+"), "")
+        if (cleanText.length < 3) return false
         val strictPattern = Regex("\\d{2,3}[가-힣]\\d{4}")
-        if (strictPattern.containsMatchIn(text)) return true
-        val digitCount = text.count { it.isDigit() }
-        val hasKorean = text.any { it in '가'..'힣' }
+        if (strictPattern.containsMatchIn(cleanText)) return true
+        val digitCount = cleanText.count { it.isDigit() }
+        val hasKorean = cleanText.any { it in '가'..'힣' }
         return digitCount >= 3 && hasKorean
     }
 
-    private fun sendPointsToJs(points: List<PointF>?, bmpW: Float, bmpH: Float) {
-        val resultJson = if (points == null) {
-            "{\"corners\":null}"
-        } else {
-            val outputArray = JSONArray()
-            for (pt in points) {
-                outputArray.put(JSONObject().put("x", (pt.x / bmpW).toDouble()).put("y", (pt.y / bmpH).toDouble()))
-            }
-            JSONObject().put("corners", outputArray).toString()
-        }
-        runOnUiThread { webView?.evaluateJavascript("window.onNativeSuccess('$resultJson')", null) }
-    }
-
     /**
-     * 🚨 완벽 조치: 허프 변환 직선 피팅 + 제네릭 오류 해결 + 최신 API 널 안정성 + 서브픽셀 보호
+     * 🚨 [TOP 3 해결] JNI 힙 메모리 안전 관리를 강제한 OpenCV 피팅 알고리즘
      */
     private fun extractPlateCornersViaLineFitting(bitmap: Bitmap, pts: List<PointF>): List<PointF> {
         val mat = org.opencv.core.Mat()
-        Utils.bitmapToMat(bitmap, mat)
         val gray = org.opencv.core.Mat()
-        Imgproc.cvtColor(mat, gray, Imgproc.COLOR_RGBA2GRAY)
-        
-        val xs = pts.map { it.x }; val ys = pts.map { it.y }
-        
-        // 🚨 조치: minOrNull() / maxOrNull() 적용으로 최신 코틀린 API 호환성 및 널 안정성 확보
-        val minX = max(0, xs.minOrNull()?.toInt() ?: 0)
-        val minY = max(0, ys.minOrNull()?.toInt() ?: 0)
-        val maxX = min(mat.cols() - 1, xs.maxOrNull()?.toInt() ?: (mat.cols() - 1))
-        val maxY = min(mat.rows() - 1, ys.maxOrNull()?.toInt() ?: (mat.rows() - 1))
-        
-        val roi = org.opencv.core.Rect(minX, minY, maxX - minX, maxY - minY)
-        if (roi.width <= 20 || roi.height <= 20) {
-            mat.release(); gray.release()
-            return pts
-        }
-        
-        val roiMat = org.opencv.core.Mat(gray, roi)
-        Imgproc.GaussianBlur(roiMat, roiMat, org.opencv.core.Size(5.0, 5.0), 0.0)
-        
-        val morphKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, org.opencv.core.Size(3.0, 3.0))
-        Imgproc.morphologyEx(roiMat, roiMat, Imgproc.MORPH_CLOSE, morphKernel)
-        morphKernel.release()
-        
-        Imgproc.Canny(roiMat, roiMat, 50.0, 150.0)
-
+        val roiMat = org.opencv.core.Mat()
         val lines = org.opencv.core.Mat()
-        Imgproc.HoughLinesP(roiMat, lines, 1.0, Math.PI / 180, 30, roi.width * 0.3, 10.0)
+        var subPixMat: MatOfPoint2f? = null
 
-        // 🚨 조치: 제네릭 타입 파라미터 문법 완전 해결 (Line() 오타 -> Line 수정)
-        val topLines = mutableListOf<Line>()
-        val bottomLines = mutableListOf<Line>()
-        val leftLines = mutableListOf<Line>()
-        val rightLines = mutableListOf<Line>()
-
-        val roiCenterY = roi.height / 2.0
-        val roiCenterX = roi.width / 2.0
-
-        for (i in 0 until lines.rows()) {
-            val vec = lines.get(i, 0) ?: continue
-            val x1 = vec[0]; val y1 = vec[1]; val x2 = vec[2]; val y2 = vec[3]
+        try {
+            Utils.bitmapToMat(bitmap, mat)
+            Imgproc.cvtColor(mat, gray, Imgproc.COLOR_RGBA2GRAY)
             
-            val dx = x2 - x1; val dy = y2 - y1
-            val angle = abs(Math.atan2(dy, dx) * 180.0 / Math.PI)
-            val midX = (x1 + x2) / 2.0; val midY = (y1 + y2) / 2.0
-            val length = sqrt(dx * dx + dy * dy)
+            val xs = pts.map { it.x }; val ys = pts.map { it.y }
+            
+            val minX = max(0, xs.minOrNull()?.toInt() ?: 0)
+            val minY = max(0, ys.minOrNull()?.toInt() ?: 0)
+            val maxX = min(mat.cols() - 1, xs.maxOrNull()?.toInt() ?: (mat.cols() - 1))
+            val maxY = min(mat.rows() - 1, ys.maxOrNull()?.toInt() ?: (mat.rows() - 1))
+            
+            val roi = org.opencv.core.Rect(minX, minY, maxX - minX, maxY - minY)
+            if (roi.width <= 20 || roi.height <= 20) return pts
+            
+            gray.submat(roi).copyTo(roiMat) // 안전한 하위 메모리 할당
+            Imgproc.GaussianBlur(roiMat, roiMat, org.opencv.core.Size(5.0, 5.0), 0.0)
+            
+            val morphKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, org.opencv.core.Size(3.0, 3.0))
+            Imgproc.morphologyEx(roiMat, roiMat, Imgproc.MORPH_CLOSE, morphKernel)
+            morphKernel.release()
+            
+            Imgproc.Canny(roiMat, roiMat, 50.0, 150.0)
+            Imgproc.HoughLinesP(roiMat, lines, 1.0, Math.PI / 180, 30, roi.width * 0.3, 10.0)
 
-            val lineObj = Line(x1, y1, x2, y2, length)
+            val topLines = mutableListOf<Line>()
+            val bottomLines = mutableListOf<Line>()
+            val leftLines = mutableListOf<Line>()
+            val rightLines = mutableListOf<Line>()
 
-            if (angle <= 35.0 || angle >= 145.0) {
-                if (midY < roiCenterY) topLines.add(lineObj) else bottomLines.add(lineObj)
-            } else if (angle in 55.0..125.0) {
-                if (midX < roiCenterX) leftLines.add(lineObj) else rightLines.add(lineObj)
-            }
-        }
-        lines.release()
+            val roiCenterY = roi.height / 2.0
+            val roiCenterX = roi.width / 2.0
 
-        val topEdge = topLines.maxByOrNull { it.length }
-        val bottomEdge = bottomLines.maxByOrNull { it.length }
-        val leftEdge = leftLines.maxByOrNull { it.length }
-        val rightEdge = rightLines.maxByOrNull { it.length }
+            for (i in 0 until lines.rows()) {
+                val vec = lines.get(i, 0) ?: continue
+                val x1 = vec[0]; val y1 = vec[1]; val x2 = vec[2]; val y2 = vec[3]
+                
+                val dx = x2 - x1; val dy = y2 - y1
+                val angle = abs(Math.atan2(dy, dx) * 180.0 / Math.PI)
+                val midX = (x1 + x2) / 2.0; val midY = (y1 + y2) / 2.0
+                val length = sqrt(dx * dx + dy * dy)
 
-        var fittedPoints = pts
-        if (topEdge != null && bottomEdge != null && leftEdge != null && rightEdge != null) {
-            val tl = getIntersection(topEdge, leftEdge)
-            val tr = getIntersection(topEdge, rightEdge)
-            val br = getIntersection(bottomEdge, rightEdge)
-            val bl = getIntersection(bottomEdge, leftEdge)
+                val lineObj = Line(x1, y1, x2, y2, length)
 
-            if (tl != null && tr != null && br != null && bl != null) {
-                val rawCorners = listOf(
-                    PointF(tl.x.toFloat() + roi.x, tl.y.toFloat() + roi.y),
-                    PointF(tr.x.toFloat() + roi.x, tr.y.toFloat() + roi.y),
-                    PointF(br.x.toFloat() + roi.x, br.y.toFloat() + roi.y),
-                    PointF(bl.x.toFloat() + roi.x, bl.y.toFloat() + roi.y)
-                )
-
-                // 업계 표준 방식의 완벽한 정렬 적용 (x±y Ordering)
-                val sortedCorners = sortCornersStandard(rawCorners)
-
-                // 🚨 조치: 이미지 외곽 근접 시 OpenCV Assertion Crash를 막기 위한 범위 필터링
-                val safePoints = sortedCorners.filter {
-                    it.x >= 4f && it.y >= 4f && 
-                    it.x < (gray.cols() - 4f) && 
-                    it.y < (gray.rows() - 4f)
+                if (angle <= 35.0 || angle >= 145.0) {
+                    if (midY < roiCenterY) topLines.add(lineObj) else bottomLines.add(lineObj)
+                } else if (angle in 55.0..125.0) {
+                    if (midX < roiCenterX) leftLines.add(lineObj) else rightLines.add(lineObj)
                 }
-
-                if (safePoints.size == 4) {
-                    val subPixMat = MatOfPoint2f()
-                    subPixMat.fromArray(
-                        org.opencv.core.Point(sortedCorners[0].x.toDouble(), sortedCorners[0].y.toDouble()),
-                        org.opencv.core.Point(sortedCorners[1].x.toDouble(), sortedCorners[1].y.toDouble()),
-                        org.opencv.core.Point(sortedCorners[2].x.toDouble(), sortedCorners[2].y.toDouble()),
-                        org.opencv.core.Point(sortedCorners[3].x.toDouble(), sortedCorners[3].y.toDouble())
-                    )
-
-                    val criteria = TermCriteria(TermCriteria.EPS + TermCriteria.MAX_ITER, 40, 0.05)
-                    Imgproc.cornerSubPix(
-                        gray, 
-                        subPixMat, 
-                        org.opencv.core.Size(4.0, 4.0), 
-                        org.opencv.core.Size(-1.0, -1.0), 
-                        criteria
-                    )
-
-                    val subPixArray = subPixMat.toArray()
-                    fittedPoints = listOf(
-                        PointF(subPixArray[0].x.toFloat(), subPixArray[0].y.toFloat()),
-                        PointF(subPixArray[1].x.toFloat(), subPixArray[1].y.toFloat()),
-                        PointF(subPixArray[2].x.toFloat(), subPixArray[2].y.toFloat()),
-                        PointF(subPixArray[3].x.toFloat(), subPixArray[3].y.toFloat())
-                    )
-                    subPixMat.release()
-                } else {
-                    Log.w("JiSeKa Engine", "⚠️ 외곽 근접 좌표 감지. 안전을 위해 Subpixel 정제 생략")
-                    fittedPoints = sortedCorners
-                }
-            } else {
-                Log.w("JiSeKa Engine", "⚠️ 직선 교차점 연산 실패. 원본 가이드 좌표 유지")
             }
-        } else {
-            Log.w("JiSeKa Engine", "⚠️ 4면 대표 직선 검출 부족. 원본 가이드 좌표 유지")
-        }
 
-        mat.release(); gray.release()
-        return fittedPoints
+            val topEdge = topLines.maxByOrNull { it.length }
+            val bottomEdge = bottomLines.maxByOrNull { it.length }
+            val leftEdge = leftLines.maxByOrNull { it.length }
+            val rightEdge = rightLines.maxByOrNull { it.length }
+
+            var fittedPoints = pts
+            if (topEdge != null && bottomEdge != null && leftEdge != null && rightEdge != null) {
+                val tl = getIntersection(topEdge, leftEdge)
+                val tr = getIntersection(topEdge, rightEdge)
+                val br = getIntersection(bottomEdge, rightEdge)
+                val bl = getIntersection(bottomEdge, leftEdge)
+
+                if (tl != null && tr != null && br != null && bl != null) {
+                    val rawCorners = listOf(
+                        PointF(tl.x.toFloat() + roi.x, tl.y.toFloat() + roi.y),
+                        PointF(tr.x.toFloat() + roi.x, tr.y.toFloat() + roi.y),
+                        PointF(br.x.toFloat() + roi.x, br.y.toFloat() + roi.y),
+                        PointF(bl.x.toFloat() + roi.x, bl.y.toFloat() + roi.y)
+                    )
+
+                    val sortedCorners = sortCornersStandard(rawCorners)
+                    val safePoints = sortedCorners.filter {
+                        it.x >= 4f && it.y >= 4f && 
+                        it.x < (gray.cols() - 4f) && 
+                        it.y < (gray.rows() - 4f)
+                    }
+
+                    if (safePoints.size == 4) {
+                        subPixMat = MatOfPoint2f()
+                        subPixMat.fromArray(
+                            org.opencv.core.Point(sortedCorners[0].x.toDouble(), sortedCorners[0].y.toDouble()),
+                            org.opencv.core.Point(sortedCorners[1].x.toDouble(), sortedCorners[1].y.toDouble()),
+                            org.opencv.core.Point(sortedCorners[2].x.toDouble(), sortedCorners[2].y.toDouble()),
+                            org.opencv.core.Point(sortedCorners[3].x.toDouble(), sortedCorners[3].y.toDouble())
+                        )
+
+                        val criteria = TermCriteria(TermCriteria.EPS + TermCriteria.MAX_ITER, 40, 0.05)
+                        Imgproc.cornerSubPix(gray, subPixMat, org.opencv.core.Size(4.0, 4.0), org.opencv.core.Size(-1.0, -1.0), criteria)
+
+                        val subPixArray = subPixMat.toArray()
+                        fittedPoints = listOf(
+                            PointF(subPixArray[0].x.toFloat(), subPixArray[0].y.toFloat()),
+                            PointF(subPixArray[1].x.toFloat(), subPixArray[1].y.toFloat()),
+                            PointF(subPixArray[2].x.toFloat(), subPixArray[2].y.toFloat()),
+                            PointF(subPixArray[3].x.toFloat(), subPixArray[3].y.toFloat())
+                        )
+                    } else {
+                        fittedPoints = sortedCorners
+                    }
+                }
+            }
+            return fittedPoints
+        } finally {
+            // 🚨 [TOP 3 해결] 예외 발생 여부와 무관하게 네이티브 힙 메모리 즉각 반환 강제
+            mat.release(); gray.release(); roiMat.release(); lines.release()
+            subPixMat?.release()
+        }
     }
 
     data class Line(val x1: Double, val y1: Double, val x2: Double, val y2: Double, val length: Double)
@@ -407,8 +488,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun rectifyToFlatPlate(sourceBitmap: Bitmap, pts: List<PointF>): Bitmap? {
+        val srcMat = org.opencv.core.Mat()
+        val destMat = org.opencv.core.Mat()
+        var flatBitmap: Bitmap? = null
         try {
-            val srcMat = org.opencv.core.Mat()
             Utils.bitmapToMat(sourceBitmap, srcMat)
             val targetW = 400; val targetH = 100
             val srcPts = MatOfPoint2f(
@@ -424,49 +507,64 @@ class MainActivity : AppCompatActivity() {
                 org.opencv.core.Point(0.0, targetH.toDouble())
             )
             val transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
-            val destMat = org.opencv.core.Mat()
             Imgproc.warpPerspective(srcMat, destMat, transform, org.opencv.core.Size(targetW.toDouble(), targetH.toDouble()))
-            val flatBitmap = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
+            
+            flatBitmap = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(destMat, flatBitmap)
-            srcMat.release(); destMat.release(); srcPts.release(); dstPts.release(); transform.release()
+            
+            srcPts.release(); dstPts.release(); transform.release()
             return flatBitmap
-        } catch (e: Exception) { return null }
+        } catch (e: Exception) { 
+            flatBitmap?.recycle()
+            return null 
+        } finally {
+            srcMat.release(); destMat.release()
+        }
     }
 
+    /**
+     * 🚨 [TOP 3 해결] 렌더링용 임시 텍스처 메모리 즉각 해제 보장
+     */
     private fun processPerspectiveOverlay(source: Bitmap, targetCorners: List<PointF>): Bitmap {
         val result = source.copy(Bitmap.Config.ARGB_8888, true)
         val targetMat = org.opencv.core.Mat()
-        Utils.bitmapToMat(result, targetMat)
-        val resId = resources.getIdentifier("plate_mask", "drawable", packageName)
-        val maskBmp = if (resId != 0) BitmapFactory.decodeResource(resources, resId) 
-                      else Bitmap.createBitmap(600, 150, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.LTGRAY) }
         val maskMat = org.opencv.core.Mat()
-        Utils.bitmapToMat(maskBmp, maskMat)
-        maskBmp.recycle() // 픽셀 Mat 업로드 직후 조기 메모리 해제 보장
-
-        val srcPts = MatOfPoint2f(
-            org.opencv.core.Point(0.0, 0.0), 
-            org.opencv.core.Point(maskMat.cols().toDouble(), 0.0),
-            org.opencv.core.Point(maskMat.cols().toDouble(), maskMat.rows().toDouble()), 
-            org.opencv.core.Point(0.0, maskMat.rows().toDouble())
-        )
-        val sortedTargets = sortCornersStandard(targetCorners)
-        val dstPts = MatOfPoint2f(
-            org.opencv.core.Point(sortedTargets[0].x.toDouble(), sortedTargets[0].y.toDouble()),
-            org.opencv.core.Point(sortedTargets[1].x.toDouble(), sortedTargets[1].y.toDouble()),
-            org.opencv.core.Point(sortedTargets[2].x.toDouble(), sortedTargets[2].y.toDouble()),
-            org.opencv.core.Point(sortedTargets[3].x.toDouble(), sortedTargets[3].y.toDouble())
-        )
-        val transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
         val warpedMask = org.opencv.core.Mat()
-        Imgproc.warpPerspective(maskMat, warpedMask, transform, targetMat.size(), Imgproc.INTER_LINEAR)
-        val overlayBmp = Bitmap.createBitmap(result.width, result.height, Bitmap.Config.ARGB_8888)
-        Utils.matToBitmap(warpedMask, overlayBmp)
-        Canvas(result).drawBitmap(overlayBmp, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG))
+        var overlayBmp: Bitmap? = null
 
-        targetMat.release(); maskMat.release(); srcPts.release(); dstPts.release(); transform.release(); warpedMask.release()
-        overlayBmp.recycle()
-        return result
+        try {
+            Utils.bitmapToMat(result, targetMat)
+            val resId = resources.getIdentifier("plate_mask", "drawable", packageName)
+            val maskBmp = if (resId != 0) BitmapFactory.decodeResource(resources, resId) 
+                          else Bitmap.createBitmap(600, 150, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.LTGRAY) }
+            
+            Utils.bitmapToMat(maskBmp, maskMat)
+            maskBmp.recycle() // 소스 마스크 텍스처 조기 회수
+
+            val srcPts = MatOfPoint2f(
+                org.opencv.core.Point(0.0, 0.0), org.opencv.core.Point(maskMat.cols().toDouble(), 0.0),
+                org.opencv.core.Point(maskMat.cols().toDouble(), maskMat.rows().toDouble()), org.opencv.core.Point(0.0, maskMat.rows().toDouble())
+            )
+            val sortedTargets = sortCornersStandard(targetCorners)
+            val dstPts = MatOfPoint2f(
+                org.opencv.core.Point(sortedTargets[0].x.toDouble(), sortedTargets[0].y.toDouble()),
+                org.opencv.core.Point(sortedTargets[1].x.toDouble(), sortedTargets[1].y.toDouble()),
+                org.opencv.core.Point(sortedTargets[2].x.toDouble(), sortedTargets[2].y.toDouble()),
+                org.opencv.core.Point(sortedTargets[3].x.toDouble(), sortedTargets[3].y.toDouble())
+            )
+            val transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
+            Imgproc.warpPerspective(maskMat, warpedMask, transform, targetMat.size(), Imgproc.INTER_LINEAR)
+            
+            overlayBmp = Bitmap.createBitmap(result.width, result.height, Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(warpedMask, overlayBmp)
+            Canvas(result).drawBitmap(overlayBmp, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG))
+
+            srcPts.release(); dstPts.release(); transform.release()
+            return result
+        } finally {
+            targetMat.release(); maskMat.release(); warpedMask.release()
+            overlayBmp?.recycle()
+        }
     }
 
     private fun startCamera() {
@@ -488,14 +586,17 @@ class MainActivity : AppCompatActivity() {
         if (requestCode == REQUEST_CODE_PERMISSIONS && allPermissionsGranted()) viewFinder?.post { startCamera() }
     }
 
-    // 🚨 하이브리드 2.0 조치: Base64 인코딩을 완전히 제거하고 네이티브 뷰 안착 후 심플 트리거 전송
     private fun takePhoto() {
         val capture = imageCapture ?: return
         capture.takePicture(cameraExecutor, object : ImageCapture.OnImageCapturedCallback() {
             override fun onCaptureSuccess(image: ImageProxy) {
                 val bitmap = image.toBitmapExt()
                 image.close()
-                synchronized(bitmapLock) { lastCapturedBitmap?.recycle(); lastCapturedBitmap = bitmap }
+                // 메인 소스 비트맵 할당 (절대 백그라운드 연산 중 .recycle()을 호출하지 않음)
+                synchronized(bitmapLock) { 
+                    lastCapturedBitmap?.recycle()
+                    lastCapturedBitmap = bitmap 
+                }
                 
                 runOnUiThread { 
                     viewFinder?.visibility = View.INVISIBLE
@@ -508,7 +609,6 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
-    // 🚨 패키지 충돌 해소: android.graphics.Rect 명시적 적용
     private fun ImageProxy.toBitmapExt(): Bitmap {
         val yBuffer = planes[0].buffer; val uBuffer = planes[1].buffer; val vBuffer = planes[2].buffer
         val ySize = yBuffer.remaining(); val uSize = uBuffer.remaining(); val vSize = vBuffer.remaining()
@@ -535,11 +635,18 @@ class MainActivity : AppCompatActivity() {
 
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all { ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED }
 
+    /**
+     * 🚨 [TOP 2 & 3 해결] 앱 종료 시 캐시 파일 삭제 및 모든 잔여 비트맵 메모리 완벽 환산
+     */
     override fun onDestroy() { 
         super.onDestroy()
         cameraExecutor.shutdown()
         analysisExecutor.shutdown()
         recognizer.close()
+        
+        // 로컬 프리뷰 파일 정리
+        try { cachedPreviewFile?.let { if (it.exists()) it.delete() } } catch (e: Exception) {}
+
         synchronized(bitmapLock) {
             lastCapturedBitmap?.recycle()
             lastCapturedBitmap = null
