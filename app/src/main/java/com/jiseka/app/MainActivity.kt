@@ -48,6 +48,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cameraExecutor: ExecutorService
     private lateinit var analysisExecutor: ExecutorService
 
+    // 🚨 [개선] 스레드 경합 및 중복 촬영 방지를 위한 가시성 보장 플래그
+    @Volatile
+    private var isProcessing = false
+
     // 스레드 경합 방지를 위한 메인 소스 비트맵 유지 변수
     private var lastCapturedBitmap: Bitmap? = null
     private val bitmapLock = Any()
@@ -121,6 +125,8 @@ class MainActivity : AppCompatActivity() {
         fun setCameraVisibility(isVisible: Boolean) {
             runOnUiThread { 
                 if (isVisible) {
+                    // 🚨 [개선] 카메라가 다시 켜질 때(다시 찍기 등) 촬영 가능 상태로 안전하게 복구
+                    isProcessing = false
                     viewFinder?.visibility = View.VISIBLE
                     nativeBackgroundView?.visibility = View.GONE
                 } else {
@@ -246,7 +252,6 @@ class MainActivity : AppCompatActivity() {
         if (flatBmp != null) {
             val inputImage = InputImage.fromBitmap(flatBmp, 0)
             recognizer.process(inputImage).addOnCompleteListener { task ->
-                // 완화된 조건 적용: OCR 결과 안에서 숫자 3개 이상만 감지되면 통과
                 val finalPoints = if (task.isSuccessful && isValidLicensePlatePattern(task.result.text)) {
                     Log.d("JiSeKa Engine", "✅ OCR 숫자 3개 이상 감지 통과: 정밀 미리보기 렌더링")
                     targetPoints
@@ -485,9 +490,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * 🚨 [핵심 개선] 원근 변환된 오버레이 마스크에 Feathering 및 Weighted Alpha Blending 적용
-     */
     private fun processPerspectiveOverlay(source: Bitmap, targetCorners: List<PointF>): Bitmap {
         val result = source.copy(Bitmap.Config.ARGB_8888, true)
         val targetMat = org.opencv.core.Mat()
@@ -499,14 +501,12 @@ class MainActivity : AppCompatActivity() {
         try {
             Utils.bitmapToMat(result, targetMat)
             
-            // 1. 가림막 리소스 로드
             val resId = resources.getIdentifier("plate_mask", "drawable", packageName)
             val maskBmp = if (resId != 0) BitmapFactory.decodeResource(resources, resId) 
                           else Bitmap.createBitmap(600, 150, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.LTGRAY) }
             Utils.bitmapToMat(maskBmp, maskMat)
             maskBmp.recycle()
 
-            // 2. 투시 변환 (Perspective Warp)
             val srcPts = MatOfPoint2f(
                 org.opencv.core.Point(0.0, 0.0), org.opencv.core.Point(maskMat.cols().toDouble(), 0.0),
                 org.opencv.core.Point(maskMat.cols().toDouble(), maskMat.rows().toDouble()), org.opencv.core.Point(0.0, maskMat.rows().toDouble())
@@ -521,12 +521,10 @@ class MainActivity : AppCompatActivity() {
             val transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
             Imgproc.warpPerspective(maskMat, warpedMask, transform, targetMat.size(), Imgproc.INTER_LINEAR)
 
-            // 3. Edge Feathering (경계면 부드럽게 깎아주기)
             Imgproc.cvtColor(warpedMask, alphaMask, Imgproc.COLOR_RGBA2GRAY)
             Imgproc.threshold(alphaMask, alphaMask, 1.0, 255.0, Imgproc.THRESH_BINARY)
             Imgproc.GaussianBlur(alphaMask, alphaMask, org.opencv.core.Size(7.0, 7.0), 0.0)
 
-            // 4. Alpha Blending (주변 픽셀과의 조화 및 그레인 매칭 유도)
             val warpedMatFloat = org.opencv.core.Mat()
             val targetMatFloat = org.opencv.core.Mat()
             val alphaMaskFloat = org.opencv.core.Mat()
@@ -554,7 +552,6 @@ class MainActivity : AppCompatActivity() {
                 targetChannels.forEach { it.release() }
             }
 
-            // 원본 비트맵의 최종 렌더링 무결성을 위해 배경 타겟 이미지의 알파 채널을 유지
             val targetChannelsForAlpha = mutableListOf<org.opencv.core.Mat>()
             Core.split(targetMatFloat, targetChannelsForAlpha)
             if (channels.size > 3 && targetChannelsForAlpha.size > 3) {
@@ -598,7 +595,18 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun takePhoto() {
-        val capture = imageCapture ?: return
+        // 🚨 [개선] 경합 방어 로직 진입점: 처리 중일 때 중복 촬영 차단
+        if (isProcessing) {
+            Log.w("JiSeKa Engine", "중복 촬영 요청 무시 (Race condition 방어)")
+            return
+        }
+        isProcessing = true
+
+        val capture = imageCapture ?: run {
+            isProcessing = false
+            return
+        }
+        
         capture.takePicture(cameraExecutor, object : ImageCapture.OnImageCapturedCallback() {
             override fun onCaptureSuccess(image: ImageProxy) {
                 val bitmap = image.toBitmapExt()
@@ -615,7 +623,11 @@ class MainActivity : AppCompatActivity() {
                     webView?.evaluateJavascript("window.onNativePhotoCaptured()", null)
                 }
             }
-            override fun onError(e: ImageCaptureException) { Log.e("JiSeKa", "Capture failed", e) }
+            override fun onError(e: ImageCaptureException) { 
+                Log.e("JiSeKa", "Capture failed", e)
+                // 🚨 [개선] 캡처 실패 시 다시 시도할 수 있도록 상태 락 해제
+                isProcessing = false
+            }
         })
     }
 
