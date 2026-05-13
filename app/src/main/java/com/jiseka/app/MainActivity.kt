@@ -33,9 +33,10 @@ import java.io.ByteArrayOutputStream
 import java.io.OutputStream
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import kotlin.math.atan2
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sqrt
 
 class MainActivity : AppCompatActivity() {
 
@@ -126,21 +127,14 @@ class MainActivity : AppCompatActivity() {
                         initialPoints.add(PointF(p.getDouble("x").toFloat() * bmpW, p.getDouble("y").toFloat() * bmpH))
                     }
 
-                    // 최적화된 다중 사각형 후보군 추출 (최대 5개 제한)
-                    val candidates = extractPlateCandidatesOptimized(sourceBitmap, initialPoints)
+                    // 🚨 고도화: 허프 변환 직선 피팅 엔진 기반 정밀 좌표 추출
+                    val refinedPoints = extractPlateCornersViaLineFitting(sourceBitmap, initialPoints)
 
-                    if (candidates.isEmpty()) {
-                        Log.w("JiSeKa Engine", "⚠️ 사각형 후보 없음: 원본 보존 통신 가동")
-                        sendPointsToJs(null, bmpW, bmpH)
-                        sourceBitmap.recycle() // 🚨 안전 회수 지점
-                        return@execute
-                    }
-
-                    // 재귀 검증 체인 시작 (수명주기 이관)
-                    verifyCandidatesSequentiallySafe(sourceBitmap, candidates, 0, bmpW, bmpH)
+                    // OCR 유효성 검증을 위한 1회차 평탄화 후보 생성
+                    verifyCandidateAndRespond(sourceBitmap, refinedPoints, initialPoints, bmpW, bmpH)
 
                 } catch (e: Exception) {
-                    Log.e("JiSeKa Engine", "분석 엔진 처리 에러", e)
+                    Log.e("JiSeKa Engine", "분석 에러", e)
                     runOnUiThread { webView?.evaluateJavascript("window.onNativeSuccess('{\"corners\":null}')", null) }
                     sourceBitmap.recycle()
                 }
@@ -155,7 +149,6 @@ class MainActivity : AppCompatActivity() {
                 try {
                     val jsonObj = JSONObject(cornersJsonStr)
                     if (jsonObj.isNull("corners")) {
-                        Log.d("JiSeKa Engine", "ℹ️ 가림막 기각 대상: 원본 비트맵 직접 저장")
                         saveBitmapToGallery(sourceBitmap)
                         runOnUiThread { webView?.evaluateJavascript("window.onNativeSaveComplete()", null) }
                         return@execute
@@ -171,57 +164,45 @@ class MainActivity : AppCompatActivity() {
                     }
 
                     overlayResult = processPerspectiveOverlay(sourceBitmap, pts)
-                    saveBitmapToGallery(overlayResult)
+                    saveBitmapToGallery(overlayResult!!)
                     runOnUiThread { webView?.evaluateJavascript("window.onNativeSaveComplete()", null) }
                 } finally { 
                     sourceBitmap.recycle()
-                    // 🚨 개선: 저장 시 메모리 증가 방지를 위해 합성 완료된 결과 비트맵도 명시적 해제
                     overlayResult?.let { if (it != sourceBitmap) it.recycle() }
                 }
             }
         }
     }
 
-    private fun verifyCandidatesSequentiallySafe(
+    private fun verifyCandidateAndRespond(
         sourceBitmap: Bitmap, 
-        candidates: List<List<PointF>>, 
-        index: Int, 
+        targetPoints: List<PointF>, 
+        fallbackPoints: List<PointF>, 
         bmpW: Float, 
         bmpH: Float
     ) {
-        if (index >= candidates.size) {
-            Log.w("JiSeKa Engine", "⚠️ 모든 후보 사각형 검증 실패: 번호판 텍스트 미달로 기각")
-            sendPointsToJs(null, bmpW, bmpH)
-            sourceBitmap.recycle() // 🚨 종착지 안전 회수
-            return
-        }
-
-        val currentCandidate = candidates[index]
-        val flatBmp = rectifyToFlatPlate(sourceBitmap, currentCandidate)
-
+        val flatBmp = rectifyToFlatPlate(sourceBitmap, targetPoints)
         if (flatBmp != null) {
             val inputImage = InputImage.fromBitmap(flatBmp, 0)
             recognizer.process(inputImage).addOnCompleteListener { task ->
-                var isConfirmed = false
                 if (task.isSuccessful) {
                     val rawText = task.result.text.replace(Regex("\\s+"), "")
                     if (isValidLicensePlatePattern(rawText)) {
-                        Log.d("JiSeKa Engine", "✅ [후보 ${index + 1}/${candidates.size}] 정밀 검증 통과 ($rawText): 흡착 좌표 확정")
-                        isConfirmed = true
-                        sendPointsToJs(currentCandidate, bmpW, bmpH)
-                        sourceBitmap.recycle() // 🚨 성공 종착지 안전 회수
+                        Log.d("JiSeKa Engine", "✅ 정밀 피팅 좌표 OCR 검증 통과 ($rawText)")
+                        sendPointsToJs(targetPoints, bmpW, bmpH)
+                    } else {
+                        Log.w("JiSeKa Engine", "⚠️ 피팅 영역 텍스트 미달. 사용자 가이드 좌표 폴백")
+                        sendPointsToJs(fallbackPoints, bmpW, bmpH)
                     }
+                } else {
+                    sendPointsToJs(fallbackPoints, bmpW, bmpH)
                 }
-
                 flatBmp.recycle()
-
-                if (!isConfirmed) {
-                    Log.d("JiSeKa Engine", "❌ [후보 ${index + 1}/${candidates.size}] 기각. 다음 순위 스캔...")
-                    verifyCandidatesSequentiallySafe(sourceBitmap, candidates, index + 1, bmpW, bmpH)
-                }
+                sourceBitmap.recycle()
             }
         } else {
-            verifyCandidatesSequentiallySafe(sourceBitmap, candidates, index + 1, bmpW, bmpH)
+            sendPointsToJs(fallbackPoints, bmpW, bmpH)
+            sourceBitmap.recycle()
         }
     }
 
@@ -229,7 +210,6 @@ class MainActivity : AppCompatActivity() {
         if (text.length < 3) return false
         val strictPattern = Regex("\\d{2,3}[가-힣]\\d{4}")
         if (strictPattern.containsMatchIn(text)) return true
-
         val digitCount = text.count { it.isDigit() }
         val hasKorean = text.any { it in '가'..'힣' }
         return digitCount >= 3 && hasKorean
@@ -248,95 +228,173 @@ class MainActivity : AppCompatActivity() {
         runOnUiThread { webView?.evaluateJavascript("window.onNativeSuccess('$resultJson')", null) }
     }
 
-    private fun extractPlateCandidatesOptimized(bitmap: Bitmap, pts: List<PointF>): List<List<PointF>> {
+    /**
+     * 🚨 최우선순위 개선 적용: 허프 변환(HoughLinesP) 기반의 독립적 외곽선 추출 및 기하학적 피팅 엔진
+     * 끊어지거나 노이즈가 낀 다각형 대신, 상/하/좌/우 4개의 강력한 대표 선분을 도출하여 완벽한 수학적 교차점을 찾아냅니다.
+     */
+    private fun extractPlateCornersViaLineFitting(bitmap: Bitmap, pts: List<PointF>): List<PointF> {
         val mat = org.opencv.core.Mat()
         Utils.bitmapToMat(bitmap, mat)
         val gray = org.opencv.core.Mat()
         Imgproc.cvtColor(mat, gray, Imgproc.COLOR_RGBA2GRAY)
         
         val xs = pts.map { it.x }; val ys = pts.map { it.y }
-        val minX = max(0, xs.min().toInt())
-        val minY = max(0, ys.min().toInt())
-        val maxX = min(mat.cols() - 1, xs.max().toInt())
-        val maxY = min(mat.rows() - 1, ys.max().toInt())
+        val minX = max(0, xs.min().toInt()); val minY = max(0, ys.min().toInt())
+        val maxX = min(mat.cols() - 1, xs.max().toInt()); val maxY = min(mat.rows() - 1, ys.max().toInt())
         
         val roi = org.opencv.core.Rect(minX, minY, maxX - minX, maxY - minY)
-        if (roi.width <= 10 || roi.height <= 10) {
+        if (roi.width <= 20 || roi.height <= 20) {
             mat.release(); gray.release()
-            return emptyList()
+            return pts
         }
         
         val roiMat = org.opencv.core.Mat(gray, roi)
         Imgproc.GaussianBlur(roiMat, roiMat, org.opencv.core.Size(5.0, 5.0), 0.0)
         
-        val morphKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, org.opencv.core.Size(5.0, 5.0))
+        // 모폴로지 연산으로 문자 엣지 간섭 최소화 및 프레임 강화
+        val morphKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, org.opencv.core.Size(3.0, 3.0))
         Imgproc.morphologyEx(roiMat, roiMat, Imgproc.MORPH_CLOSE, morphKernel)
         morphKernel.release()
-
+        
         Imgproc.Canny(roiMat, roiMat, 50.0, 150.0)
-        
-        val contours = mutableListOf<MatOfPoint>()
-        Imgproc.findContours(roiMat, contours, org.opencv.core.Mat(), Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE)
-        
-        val validCandidates = mutableListOf<Pair<Double, List<PointF>>>()
-        val totalRoiArea = roi.width * roi.height.toDouble()
 
-        for (contour in contours) {
-            val contour2f = MatOfPoint2f(*contour.toArray())
-            val approx = MatOfPoint2f()
-            Imgproc.approxPolyDP(contour2f, approx, Imgproc.arcLength(contour2f, true) * 0.02, true)
+        // 1단계: HoughLinesP 가동 (선분 조각 수집)
+        val lines = org.opencv.core.Mat()
+        Imgproc.HoughLinesP(roiMat, lines, 1.0, Math.PI / 180, 30, roi.width * 0.3, 10.0)
+
+        val topLines = mutableListOf<Line()>()
+        val bottomLines = mutableListOf<Line()>()
+        val leftLines = mutableListOf<Line()>()
+        val rightLines = mutableListOf<Line()>()
+
+        val roiCenterY = roi.height / 2.0
+        val roiCenterX = roi.width / 2.0
+
+        // 2단계: 추출된 선분들을 위치와 기울기 기반으로 상/하/좌/우 4개 엣지로 엄격히 분류
+        for (i in 0 until lines.rows()) {
+            val vec = lines.get(i, 0) ?: continue
+            val x1 = vec[0]; val y1 = vec[1]; val x2 = vec[2]; val y2 = vec[3]
             
-            if (approx.rows() == 4) {
-                val area = Imgproc.contourArea(approx)
-                if (area > totalRoiArea * 0.1) {
-                    val rawPoints = approx.toArray().map { PointF(it.x.toFloat() + roi.x, it.y.toFloat() + roi.y) }
-                    // 🚨 개선: 수학적으로 완벽한 방사형 꼭짓점 정렬 적용
-                    validCandidates.add(Pair(area, sortCornersCentroid(rawPoints)))
-                }
+            val dx = x2 - x1; val dy = y2 - y1
+            val angle = abs(Math.atan2(dy, dx) * 180.0 / Math.PI)
+            val midX = (x1 + x2) / 2.0; val midY = (y1 + y2) / 2.0
+            val length = sqrt(dx * dx + dy * dy)
+
+            val lineObj = Line(x1, y1, x2, y2, length)
+
+            // 수평선 계열 (각도가 0~35도 또는 145~180도)
+            if (angle <= 35.0 || angle >= 145.0) {
+                if (midY < roiCenterY) topLines.add(lineObj) else bottomLines.add(lineObj)
+            } 
+            // 수직선 계열 (각도가 55~125도)
+            else if (angle in 55.0..125.0) {
+                if (midX < roiCenterX) leftLines.add(lineObj) else rightLines.add(lineObj)
             }
-            contour2f.release()
-            approx.release()
-            contour.release()
+        }
+        lines.release()
+
+        // 3단계: 각 그룹에서 가장 길고 뚜렷한 대표 직선(Best Line) 선택
+        val topEdge = topLines.maxByOrNull { it.length }
+        val bottomEdge = bottomLines.maxByOrNull { it.length }
+        val leftEdge = leftLines.maxByOrNull { it.length }
+        val rightEdge = rightLines.maxByOrNull { it.length }
+
+        // 4개의 엣지가 모두 확보된 경우에만 교차점 피팅을 가동, 누락 시 안전하게 근사화/폴백
+        var fittedPoints = pts
+        if (topEdge != null && bottomEdge != null && leftEdge != null && rightEdge != null) {
+            val tl = getIntersection(topEdge, leftEdge)
+            val tr = getIntersection(topEdge, rightEdge)
+            val br = getIntersection(bottomEdge, rightEdge)
+            val bl = getIntersection(bottomEdge, leftEdge)
+
+            if (tl != null && tr != null && br != null && bl != null) {
+                // ROI 내부 상대 좌표를 전체 이미지 절대 좌표로 매핑
+                val rawCorners = listOf(
+                    PointF(tl.x.toFloat() + roi.x, tl.y.toFloat() + roi.y),
+                    PointF(tr.x.toFloat() + roi.x, tr.y.toFloat() + roi.y),
+                    PointF(br.x.toFloat() + roi.x, br.y.toFloat() + roi.y),
+                    PointF(bl.x.toFloat() + roi.x, bl.y.toFloat() + roi.y)
+                )
+
+                // 🚨 우선순위 4: 업계 표준 방식의 완벽한 정렬 적용 (x±y Ordering)
+                val sortedCorners = sortCornersStandard(rawCorners)
+
+                // 🚨 우선순위 3: 서브픽셀 정밀 흡착 (cornerSubPix Refinement)
+                // 수학적 교차점을 실제 엣지의 최적 그라디언트 중심으로 미세 소수점 보정 유도
+                val subPixMat = MatOfPoint2f()
+                subPixMat.fromArray(
+                    org.opencv.core.Point(sortedCorners[0].x.toDouble(), sortedCorners[0].y.toDouble()),
+                    org.opencv.core.Point(sortedCorners[1].x.toDouble(), sortedCorners[1].y.toDouble()),
+                    org.opencv.core.Point(sortedCorners[2].x.toDouble(), sortedCorners[2].y.toDouble()),
+                    org.opencv.core.Point(sortedCorners[3].x.toDouble(), sortedCorners[3].y.toDouble())
+                )
+
+                val criteria = TermCriteria(TermCriteria.EPS + TermCriteria.MAX_ITER, 40, 0.05)
+                Imgproc.cornerSubPix(
+                    gray, 
+                    subPixMat, 
+                    org.opencv.core.Size(4.0, 4.0), 
+                    org.opencv.core.Size(-1.0, -1.0), 
+                    criteria
+                )
+
+                val subPixArray = subPixMat.toArray()
+                fittedPoints = listOf(
+                    PointF(subPixArray[0].x.toFloat(), subPixArray[0].y.toFloat()),
+                    PointF(subPixArray[1].x.toFloat(), subPixArray[1].y.toFloat()),
+                    PointF(subPixArray[2].x.toFloat(), subPixArray[2].y.toFloat()),
+                    PointF(subPixArray[3].x.toFloat(), subPixArray[3].y.toFloat())
+                )
+                subPixMat.release()
+            }
         }
 
         mat.release(); gray.release()
-        return validCandidates.sortedByDescending { it.first }.map { it.second }.take(5)
+        return fittedPoints
+    }
+
+    // 내부 연산용 데이터 클래스
+    data class Line(val x1: Double, val y1: Double, val x2: Double, val y2: Double, val length: Double)
+
+    /**
+     * 🚨 우선순위 2: 두 직선의 방정식 교차점 도출 알고리즘 (Line Intersection)
+     * 크래머 공식(Cramer's Rule)을 사용하여 두 선분이 연장되었을 때 만나는 수학적 꼭짓점을 도출합니다.
+     */
+    private fun getIntersection(line1: Line, line2: Line): PointF? {
+        val a1 = line1.y2 - line1.y1
+        val b1 = line1.x1 - line1.x2
+        val c1 = a1 * line1.x1 + b1 * line1.y1
+
+        val a2 = line2.y2 - line2.y1
+        val b2 = line2.x1 - line2.x2
+        val c2 = a2 * line2.x1 + b2 * line2.y1
+
+        val det = a1 * b2 - a2 * b1
+        if (abs(det) < 1e-6) return null // 평행선 방어
+
+        val cx = (b2 * c1 - b1 * c2) / det
+        val cy = (a1 * c2 - a2 * c1) / det
+        return PointF(cx.toFloat(), cy.toFloat())
     }
 
     /**
-     * 🚨 개선: 아크탄젠트(atan2) 기반 방사형 꼭짓점 정렬 알고리즘
-     * 극단적인 각도 왜곡이나 180도 회전 환경에서도 꼭짓점 순서(TL, TR, BR, BL)를 시계 방향으로 완벽하게 보장합니다.
+     * 🚨 우선순위 4: 업계 표준 방식인 (x+y), (x-y) 연산 기반 꼭짓점 정렬
+     * 꼬임 현상을 완벽히 차단하고 시계방향(TL ➔ TR ➔ BR ➔ BL) 슬롯을 보장합니다.
      */
-    private fun sortCornersCentroid(pts: List<PointF>): List<PointF> {
+    private fun sortCornersStandard(pts: List<PointF>): List<PointF> {
         if (pts.size != 4) return pts
-        
-        // 1. 다각형의 무게중심(Centroid) 도출
-        val cx = pts.map { it.x }.average().toFloat()
-        val cy = pts.map { it.y }.average().toFloat()
-
-        // 2. 중심을 기준으로 한 아크탄젠트 각도(-π ~ π) 계산 후 시계방향 정렬
-        // Y축이 아래로 향하는 그래픽스 좌표계 특성을 반영하여 atan2 파라미터 매핑
-        val sorted = pts.sortedBy { atan2((it.y - cy).toDouble(), (it.x - cx).toDouble()) }
-
-        // 3. 배열 순서 조정: atan2 결과 특성상 Top-Left가 첫 번째가 되도록 인덱스 회전 보정
-        // 일반적으로 2사분면(Top-Left)부터 시작하도록 매핑
-        val tlIndex = sorted.indexOfFirst { it.x < cx && it.y < cy }.takeIf { it != -1 } ?: 0
-        
-        val result = mutableListOf<PointF>()
-        for (i in 0 until 4) {
-            result.add(sorted[(tlIndex + i) % 4])
-        }
-        return result
+        val tl = pts.minByOrNull { it.x + it.y } ?: pts[0]
+        val br = pts.maxByOrNull { it.x + it.y } ?: pts[1]
+        val tr = pts.maxByOrNull { it.x - it.y } ?: pts[2]
+        val bl = pts.minByOrNull { it.x - it.y } ?: pts[3]
+        return listOf(tl, tr, br, bl)
     }
 
     private fun rectifyToFlatPlate(sourceBitmap: Bitmap, pts: List<PointF>): Bitmap? {
         try {
             val srcMat = org.opencv.core.Mat()
             Utils.bitmapToMat(sourceBitmap, srcMat)
-
-            val targetW = 400
-            val targetH = 100
-
+            val targetW = 400; val targetH = 100
             val srcPts = MatOfPoint2f(
                 org.opencv.core.Point(pts[0].x.toDouble(), pts[0].y.toDouble()),
                 org.opencv.core.Point(pts[1].x.toDouble(), pts[1].y.toDouble()),
@@ -349,55 +407,39 @@ class MainActivity : AppCompatActivity() {
                 org.opencv.core.Point(targetW.toDouble(), targetH.toDouble()),
                 org.opencv.core.Point(0.0, targetH.toDouble())
             )
-
             val transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
             val destMat = org.opencv.core.Mat()
             Imgproc.warpPerspective(srcMat, destMat, transform, org.opencv.core.Size(targetW.toDouble(), targetH.toDouble()))
-
             val flatBitmap = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(destMat, flatBitmap)
-
             srcMat.release(); destMat.release(); srcPts.release(); dstPts.release(); transform.release()
             return flatBitmap
-        } catch (e: Exception) {
-            Log.e("JiSeKa Engine", "평탄화 뷰 생성 실패", e)
-            return null
-        }
+        } catch (e: Exception) { return null }
     }
 
     private fun processPerspectiveOverlay(source: Bitmap, targetCorners: List<PointF>): Bitmap {
         val result = source.copy(Bitmap.Config.ARGB_8888, true)
         val targetMat = org.opencv.core.Mat()
         Utils.bitmapToMat(result, targetMat)
-
         val resId = resources.getIdentifier("plate_mask", "drawable", packageName)
         val maskBmp = if (resId != 0) BitmapFactory.decodeResource(resources, resId) 
                       else Bitmap.createBitmap(600, 150, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.LTGRAY) }
-        
         val maskMat = org.opencv.core.Mat()
         Utils.bitmapToMat(maskBmp, maskMat)
-
         val srcPts = MatOfPoint2f(org.opencv.core.Point(0.0, 0.0), org.opencv.core.Point(maskMat.cols().toDouble(), 0.0),
                                   org.opencv.core.Point(maskMat.cols().toDouble(), maskMat.rows().toDouble()), org.opencv.core.Point(0.0, maskMat.rows().toDouble()))
-        
-        // 정렬 보장 매핑
-        val sortedTargets = sortCornersCentroid(targetCorners)
+        val sortedTargets = sortCornersStandard(targetCorners)
         val dstPts = MatOfPoint2f(org.opencv.core.Point(sortedTargets[0].x.toDouble(), sortedTargets[0].y.toDouble()),
                                   org.opencv.core.Point(sortedTargets[1].x.toDouble(), sortedTargets[1].y.toDouble()),
                                   org.opencv.core.Point(sortedTargets[2].x.toDouble(), sortedTargets[2].y.toDouble()),
                                   org.opencv.core.Point(sortedTargets[3].x.toDouble(), sortedTargets[3].y.toDouble()))
-
         val transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
         val warpedMask = org.opencv.core.Mat()
         Imgproc.warpPerspective(maskMat, warpedMask, transform, targetMat.size(), Imgproc.INTER_LINEAR)
-
         val overlayBmp = Bitmap.createBitmap(result.width, result.height, Bitmap.Config.ARGB_8888)
         Utils.matToBitmap(warpedMask, overlayBmp)
         Canvas(result).drawBitmap(overlayBmp, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG))
-        
-        targetMat.release(); maskMat.release(); srcPts.release(); dstPts.release()
-        transform.release(); warpedMask.release(); overlayBmp.recycle()
-        
+        targetMat.release(); maskMat.release(); srcPts.release(); dstPts.release(); transform.release(); warpedMask.release(); overlayBmp.recycle()
         return result
     }
 
@@ -434,7 +476,6 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
-    // 🚨 해결 방법 1: 패키지 명시를 통한 Rect 충돌 완전 제거
     private fun ImageProxy.toBitmapExt(): Bitmap {
         val yBuffer = planes[0].buffer; val uBuffer = planes[1].buffer; val vBuffer = planes[2].buffer
         val ySize = yBuffer.remaining(); val uSize = uBuffer.remaining(); val vSize = vBuffer.remaining()
@@ -442,10 +483,7 @@ class MainActivity : AppCompatActivity() {
         yBuffer.get(nv21, 0, ySize); vBuffer.get(nv21, ySize, vSize); uBuffer.get(nv21, ySize + vSize, uSize)
         val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
         val out = ByteArrayOutputStream()
-        
-        // 명시적 패키지 참조로 컴파일 에러 해결
         yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 100, out)
-        
         val bitmap = BitmapFactory.decodeByteArray(out.toByteArray(), 0, out.size())
         val matrix = Matrix().apply { postRotate(imageInfo.rotationDegrees.toFloat()) }
         return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
