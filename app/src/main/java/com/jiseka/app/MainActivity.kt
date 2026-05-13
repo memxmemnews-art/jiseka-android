@@ -102,7 +102,6 @@ class MainActivity : AppCompatActivity() {
                 domStorageEnabled = true
                 allowFileAccess = true
                 allowContentAccess = true
-                // 로컬 파일 접근 허용 강제 (file:// 프리뷰 로드용)
                 allowFileAccessFromFileURLs = true
                 allowUniversalAccessFromFileURLs = true
             }
@@ -131,36 +130,31 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        /**
-         * 🚨 [TOP 1 & 2 해결] JS 수신부: 정규화 좌표를 실제 비트맵 좌표로 역매핑하고 파일 URI를 반환합니다.
-         */
         @JavascriptInterface
         fun analyzePlateWithMode(cornersJsonStr: String, mode: String) {
             analysisExecutor.execute {
                 var processingBitmap: Bitmap? = null
                 try {
-                    // 1. 스레드 세이프 원본 복사본 생성
                     val rawBitmap = synchronized(bitmapLock) { 
                         lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) 
                     } ?: return@execute
 
-                    // 🚨 [TOP 3 해결] OOM 방지를 위해 최대 1920x1080 이하로 스케일링 제한 강제
+                    // OOM 방지 안전 해상도 스케일링 강제
                     processingBitmap = scaleBitmapDownToLimit(rawBitmap, 1920, 1080)
                     if (processingBitmap !== rawBitmap) {
-                        rawBitmap.recycle() // 원본 크기 임시 비트맵 조기 해제
+                        rawBitmap.recycle()
                     }
 
                     val bmpW = processingBitmap.width.toFloat()
                     val bmpH = processingBitmap.height.toFloat()
                     
-                    // 🚨 [TOP 1 해결] 뷰파인더 해상도 확보 (스레드 동기화를 위해 변수 사전 복사)
                     val viewW = viewFinder?.width?.toFloat() ?: 1f
                     val viewH = viewFinder?.height?.toFloat() ?: 1f
 
                     val inputCorners = JSONObject(cornersJsonStr).getJSONArray("corners")
                     val mappedPoints = mutableListOf<PointF>()
 
-                    // 🚨 [TOP 1 핵심 로직] Letterbox/Pillarbox 영역을 수식으로 도출하여 원본 픽셀로 다이렉트 역변환
+                    // Letterbox/Pillarbox 수식 기반 정밀 픽셀 좌표 역매핑
                     val scale = min(viewW / bmpW, viewH / bmpH)
                     val displayedW = bmpW * scale
                     val displayedH = bmpH * scale
@@ -172,27 +166,24 @@ class MainActivity : AppCompatActivity() {
                         val normX = p.getDouble("x").toFloat()
                         val normY = p.getDouble("y").toFloat()
 
-                        // 웹뷰 절대 픽셀 좌표 도출
                         val screenPixelX = normX * viewW
                         val screenPixelY = normY * viewH
 
-                        // 오버레이 영역 바운더리 제거 후 실제 비트맵 내부 픽셀로 환산
                         val targetBmpX = ((screenPixelX - offsetX) / scale).coerceIn(0f, bmpW - 1f)
                         val targetBmpY = ((screenPixelY - offsetY) / scale).coerceIn(0f, bmpH - 1f)
                         mappedPoints.add(PointF(targetBmpX, targetBmpY))
                     }
 
-                    // 허프 변환 직선 피팅을 통한 미세 모서리 정제 가동
+                    // 허프 직선 피팅 기반 모서리 정제 가동
                     val refinedPoints = extractPlateCornersViaLineFitting(processingBitmap, mappedPoints)
 
-                    // OCR 검증 및 로컬 캐시 파일 프리뷰 생성 파이프라인 가동
+                    // OCR 검증 및 프리뷰 파일 렌더링 파이프라인 가동
                     verifyAndGenerateFilePreview(processingBitmap, refinedPoints, mappedPoints, bmpW, bmpH)
 
                 } catch (e: Exception) {
                     Log.e("JiSeKa Engine", "분석 파이프라인 크래시 방어", e)
                     runOnUiThread { webView?.evaluateJavascript("window.onNativeSuccess('{\"corners\":null, \"preview\":null}')", null) }
                 } finally {
-                    // 🚨 [TOP 3 해결] 연산 전용 비트맵 안전 해제 (UI용 lastCapturedBitmap은 유지됨)
                     processingBitmap?.recycle()
                 }
             }
@@ -213,12 +204,10 @@ class MainActivity : AppCompatActivity() {
                         return@execute
                     }
 
-                    // 저장 시점의 좌표 환산 (현재 캐싱된 좌표는 이미 원본 픽셀 단위로 환산되어 있음)
                     val corners = jsonObj.getJSONArray("corners")
                     val pts = mutableListOf<PointF>()
                     for (i in 0 until 4) {
                         val p = corners.getJSONObject(i)
-                        // 최종 저장 시 원본 비트맵 해상도 비율로 복원
                         val absX = p.getDouble("x").toFloat() * baseBitmap.width
                         val absY = p.getDouble("y").toFloat() * baseBitmap.height
                         pts.add(PointF(absX, absY))
@@ -235,9 +224,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * 🚨 [TOP 3 해결] OOM 방지를 위한 해상도 제한 다운샘플링 수식
-     */
     private fun scaleBitmapDownToLimit(bitmap: Bitmap, maxW: Int, maxH: Int): Bitmap {
         val oW = bitmap.width
         val oH = bitmap.height
@@ -250,10 +236,6 @@ class MainActivity : AppCompatActivity() {
         return Bitmap.createScaledBitmap(bitmap, scaledW, scaledH, true)
     }
 
-    /**
-     * 🚨 [TOP 2 해결] 파일 URI 기반의 초고속 프리뷰 파이프라인
-     * Base64 변환을 완벽히 제거하고 로컬 디스크 파일로 저장하여 통신 부하를 소멸시킵니다.
-     */
     private fun verifyAndGenerateFilePreview(
         sourceBitmap: Bitmap, 
         targetPoints: List<PointF>, 
@@ -265,18 +247,16 @@ class MainActivity : AppCompatActivity() {
         if (flatBmp != null) {
             val inputImage = InputImage.fromBitmap(flatBmp, 0)
             recognizer.process(inputImage).addOnCompleteListener { task ->
+                // 🚨 완화된 조건 적용: OCR 결과 안에서 숫자 3개 이상만 감지되면 통과
                 val finalPoints = if (task.isSuccessful && isValidLicensePlatePattern(task.result.text)) {
-                    Log.d("JiSeKa Engine", "✅ 정밀 좌표 피팅 완료")
+                    Log.d("JiSeKa Engine", "✅ OCR 숫자 3개 이상 감지 통과: 정밀 미리보기 렌더링")
                     targetPoints
                 } else {
-                    Log.w("JiSeKa Engine", "⚠️ 텍스트 유효성 미달. 드롭 영역으로 폴백")
+                    Log.w("JiSeKa Engine", "⚠️ 숫자 3개 미만 감지. 드롭 영역으로 폴백")
                     fallbackPoints
                 }
                 
-                // 가림막이 밀착 렌더링된 프리뷰용 비트맵 생성
                 val previewBitmap = processPerspectiveOverlay(sourceBitmap, finalPoints)
-                
-                // 🚨 로컬 캐시 파일로 즉시 덮어쓰기 저장
                 val fileUriStr = saveBitmapToCacheFile(previewBitmap)
                 
                 sendCachedPreviewToJs(finalPoints, fileUriStr, bmpW, bmpH)
@@ -290,20 +270,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * 🚨 [TOP 2 해결] 비트맵을 로컬 캐시 파일로 렌더링하고 파일 경로 스트링 반환
-     */
     private fun saveBitmapToCacheFile(bitmap: Bitmap): String? {
         return try {
             cachedPreviewFile?.let { file ->
-                // 이전 파일 잔상 제거
                 if (file.exists()) file.delete()
                 
                 FileOutputStream(file).use { out ->
                     bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
                     out.flush()
                 }
-                // 브라우저 캐시 무효화를 위한 타임스탬프 파라미터 삽입
                 "file://${file.absolutePath}?t=${System.currentTimeMillis()}"
             }
         } catch (e: Exception) {
@@ -312,11 +287,9 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 🚨 JS로 파일 URI 경로와 정규화 비율 데이터를 전송
     private fun sendCachedPreviewToJs(points: List<PointF>, fileUriStr: String?, bmpW: Float, bmpH: Float) {
         val outputArray = JSONArray()
         for (pt in points) {
-            // JS 내부 저장을 위해 0.0~1.0 사이의 절대 정규화 비율로 변환하여 전달
             outputArray.put(JSONObject().put("x", (pt.x / bmpW).toDouble()).put("y", (pt.y / bmpH).toDouble()))
         }
         
@@ -330,19 +303,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 🚨 개선된 OCR 판정 조건: 문자열 내 공백 제거 후 순수 숫자 갯수가 3개 이상인지 검사
+     */
     private fun isValidLicensePlatePattern(text: String): Boolean {
         val cleanText = text.replace(Regex("\\s+"), "")
-        if (cleanText.length < 3) return false
-        val strictPattern = Regex("\\d{2,3}[가-힣]\\d{4}")
-        if (strictPattern.containsMatchIn(cleanText)) return true
         val digitCount = cleanText.count { it.isDigit() }
-        val hasKorean = cleanText.any { it in '가'..'힣' }
-        return digitCount >= 3 && hasKorean
+        return digitCount >= 3
     }
 
-    /**
-     * 🚨 [TOP 3 해결] JNI 힙 메모리 안전 관리를 강제한 OpenCV 피팅 알고리즘
-     */
     private fun extractPlateCornersViaLineFitting(bitmap: Bitmap, pts: List<PointF>): List<PointF> {
         val mat = org.opencv.core.Mat()
         val gray = org.opencv.core.Mat()
@@ -364,7 +333,7 @@ class MainActivity : AppCompatActivity() {
             val roi = org.opencv.core.Rect(minX, minY, maxX - minX, maxY - minY)
             if (roi.width <= 20 || roi.height <= 20) return pts
             
-            gray.submat(roi).copyTo(roiMat) // 안전한 하위 메모리 할당
+            gray.submat(roi).copyTo(roiMat)
             Imgproc.GaussianBlur(roiMat, roiMat, org.opencv.core.Size(5.0, 5.0), 0.0)
             
             val morphKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, org.opencv.core.Size(3.0, 3.0))
@@ -453,7 +422,6 @@ class MainActivity : AppCompatActivity() {
             }
             return fittedPoints
         } finally {
-            // 🚨 [TOP 3 해결] 예외 발생 여부와 무관하게 네이티브 힙 메모리 즉각 반환 강제
             mat.release(); gray.release(); roiMat.release(); lines.release()
             subPixMat?.release()
         }
@@ -522,9 +490,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * 🚨 [TOP 3 해결] 렌더링용 임시 텍스처 메모리 즉각 해제 보장
-     */
     private fun processPerspectiveOverlay(source: Bitmap, targetCorners: List<PointF>): Bitmap {
         val result = source.copy(Bitmap.Config.ARGB_8888, true)
         val targetMat = org.opencv.core.Mat()
@@ -539,7 +504,7 @@ class MainActivity : AppCompatActivity() {
                           else Bitmap.createBitmap(600, 150, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.LTGRAY) }
             
             Utils.bitmapToMat(maskBmp, maskMat)
-            maskBmp.recycle() // 소스 마스크 텍스처 조기 회수
+            maskBmp.recycle()
 
             val srcPts = MatOfPoint2f(
                 org.opencv.core.Point(0.0, 0.0), org.opencv.core.Point(maskMat.cols().toDouble(), 0.0),
@@ -592,7 +557,6 @@ class MainActivity : AppCompatActivity() {
             override fun onCaptureSuccess(image: ImageProxy) {
                 val bitmap = image.toBitmapExt()
                 image.close()
-                // 메인 소스 비트맵 할당 (절대 백그라운드 연산 중 .recycle()을 호출하지 않음)
                 synchronized(bitmapLock) { 
                     lastCapturedBitmap?.recycle()
                     lastCapturedBitmap = bitmap 
@@ -635,16 +599,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all { ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED }
 
-    /**
-     * 🚨 [TOP 2 & 3 해결] 앱 종료 시 캐시 파일 삭제 및 모든 잔여 비트맵 메모리 완벽 환산
-     */
     override fun onDestroy() { 
         super.onDestroy()
         cameraExecutor.shutdown()
         analysisExecutor.shutdown()
         recognizer.close()
         
-        // 로컬 프리뷰 파일 정리
         try { cachedPreviewFile?.let { if (it.exists()) it.delete() } } catch (e: Exception) {}
 
         synchronized(bitmapLock) {
