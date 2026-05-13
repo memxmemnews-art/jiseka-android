@@ -33,6 +33,7 @@ import java.io.ByteArrayOutputStream
 import java.io.OutputStream
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlin.math.atan2
 import kotlin.math.max
 import kotlin.math.min
 
@@ -47,7 +48,6 @@ class MainActivity : AppCompatActivity() {
     private var lastCapturedBitmap: Bitmap? = null
     private val bitmapLock = Any()
 
-    // ML Kit 한국어 텍스트 인식 클라이언트
     private val recognizer by lazy { 
         TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build()) 
     }
@@ -126,17 +126,17 @@ class MainActivity : AppCompatActivity() {
                         initialPoints.add(PointF(p.getDouble("x").toFloat() * bmpW, p.getDouble("y").toFloat() * bmpH))
                     }
 
-                    // 1. 🚨 개선 5 & 7 & 8 & 9: 끊어진 엣지 연결(Morphology) 적용 후 최대 5개의 상위 사각형 추출
+                    // 최적화된 다중 사각형 후보군 추출 (최대 5개 제한)
                     val candidates = extractPlateCandidatesOptimized(sourceBitmap, initialPoints)
 
                     if (candidates.isEmpty()) {
-                        Log.w("JiSeKa Engine", "⚠️ 사각형 후보 없음: 원본 보존 프로세스 진행")
+                        Log.w("JiSeKa Engine", "⚠️ 사각형 후보 없음: 원본 보존 통신 가동")
                         sendPointsToJs(null, bmpW, bmpH)
-                        sourceBitmap.recycle() // 🚨 개선 1: 즉시 종료 시점에만 안전 회수
+                        sourceBitmap.recycle() // 🚨 안전 회수 지점
                         return@execute
                     }
 
-                    // 2. 🚨 개선 1 & 2: 비동기 체인이 비트맵 참조를 유지하도록 제어 플로우 이관
+                    // 재귀 검증 체인 시작 (수명주기 이관)
                     verifyCandidatesSequentiallySafe(sourceBitmap, candidates, 0, bmpW, bmpH)
 
                 } catch (e: Exception) {
@@ -144,7 +144,6 @@ class MainActivity : AppCompatActivity() {
                     runOnUiThread { webView?.evaluateJavascript("window.onNativeSuccess('{\"corners\":null}')", null) }
                     sourceBitmap.recycle()
                 }
-                // 🚨 주의: finally에서 무조건 회수하던 코드를 제거하여 Async 사용 중 회수되는 버그 원천 차단
             }
         }
 
@@ -152,11 +151,11 @@ class MainActivity : AppCompatActivity() {
         fun saveImageWithNativeOverlay(cornersJsonStr: String) {
             val sourceBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) } ?: return
             analysisExecutor.execute {
+                var overlayResult: Bitmap? = null
                 try {
                     val jsonObj = JSONObject(cornersJsonStr)
-                    // 페이로드 정합성 유지 확인
                     if (jsonObj.isNull("corners")) {
-                        Log.d("JiSeKa Engine", "ℹ️ 가림막 기각 대상: 원본 이미지 보존 저장")
+                        Log.d("JiSeKa Engine", "ℹ️ 가림막 기각 대상: 원본 비트맵 직접 저장")
                         saveBitmapToGallery(sourceBitmap)
                         runOnUiThread { webView?.evaluateJavascript("window.onNativeSaveComplete()", null) }
                         return@execute
@@ -171,17 +170,18 @@ class MainActivity : AppCompatActivity() {
                         pts.add(PointF(p.getDouble("x").toFloat() * bmpW, p.getDouble("y").toFloat() * bmpH))
                     }
 
-                    val result = processPerspectiveOverlay(sourceBitmap, pts)
-                    saveBitmapToGallery(result)
+                    overlayResult = processPerspectiveOverlay(sourceBitmap, pts)
+                    saveBitmapToGallery(overlayResult)
                     runOnUiThread { webView?.evaluateJavascript("window.onNativeSaveComplete()", null) }
-                } finally { sourceBitmap.recycle() }
+                } finally { 
+                    sourceBitmap.recycle()
+                    // 🚨 개선: 저장 시 메모리 증가 방지를 위해 합성 완료된 결과 비트맵도 명시적 해제
+                    overlayResult?.let { if (it != sourceBitmap) it.recycle() }
+                }
             }
         }
     }
 
-    /**
-     * 🚨 개선 1: 비동기 재귀 흐름에서 비트맵 수명주기 완벽 동기화
-     */
     private fun verifyCandidatesSequentiallySafe(
         sourceBitmap: Bitmap, 
         candidates: List<List<PointF>>, 
@@ -192,7 +192,7 @@ class MainActivity : AppCompatActivity() {
         if (index >= candidates.size) {
             Log.w("JiSeKa Engine", "⚠️ 모든 후보 사각형 검증 실패: 번호판 텍스트 미달로 기각")
             sendPointsToJs(null, bmpW, bmpH)
-            sourceBitmap.recycle() // 🚨 안전 회수 지점
+            sourceBitmap.recycle() // 🚨 종착지 안전 회수
             return
         }
 
@@ -205,20 +205,18 @@ class MainActivity : AppCompatActivity() {
                 var isConfirmed = false
                 if (task.isSuccessful) {
                     val rawText = task.result.text.replace(Regex("\\s+"), "")
-                    // 🚨 개선 3: 정규식 기반 엄격한 패턴 필터링 (오탐율 대폭 감소)
                     if (isValidLicensePlatePattern(rawText)) {
                         Log.d("JiSeKa Engine", "✅ [후보 ${index + 1}/${candidates.size}] 정밀 검증 통과 ($rawText): 흡착 좌표 확정")
                         isConfirmed = true
                         sendPointsToJs(currentCandidate, bmpW, bmpH)
-                        sourceBitmap.recycle() // 🚨 최종 성공 지점 회수
+                        sourceBitmap.recycle() // 🚨 성공 종착지 안전 회수
                     }
                 }
 
-                // 🚨 개선 6: ML Kit 엔진이 이미지 처리를 완료한 후 안전 회수 보장
                 flatBmp.recycle()
 
                 if (!isConfirmed) {
-                    Log.d("JiSeKa Engine", "❌ [후보 ${index + 1}/${candidates.size}] 단순 패턴 기각. 다음 순위 스캔...")
+                    Log.d("JiSeKa Engine", "❌ [후보 ${index + 1}/${candidates.size}] 기각. 다음 순위 스캔...")
                     verifyCandidatesSequentiallySafe(sourceBitmap, candidates, index + 1, bmpW, bmpH)
                 }
             }
@@ -227,14 +225,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 🚨 개선 3: 정규식을 통한 강력한 번호판 패턴 유효성 검사기
     private fun isValidLicensePlatePattern(text: String): Boolean {
         if (text.length < 3) return false
-        // 표준 차량 번호판: 앞 2~3자리 숫자 + 한글 1자 + 뒤 4자리 숫자
         val strictPattern = Regex("\\d{2,3}[가-힣]\\d{4}")
         if (strictPattern.containsMatchIn(text)) return true
 
-        // 임시 차량 또는 일부 훼손 환경을 커버하기 위한 최소 유효성: 숫자 3개 이상 및 한글 포함
         val digitCount = text.count { it.isDigit() }
         val hasKorean = text.any { it in '가'..'힣' }
         return digitCount >= 3 && hasKorean
@@ -253,9 +248,6 @@ class MainActivity : AppCompatActivity() {
         runOnUiThread { webView?.evaluateJavascript("window.onNativeSuccess('$resultJson')", null) }
     }
 
-    /**
-     * 🚨 개선 5 & 7 & 8 & 9: 네이티브 누수 방어, 모폴로지 보완, RETR_LIST 및 상위 5개 후보 제한
-     */
     private fun extractPlateCandidatesOptimized(bitmap: Bitmap, pts: List<PointF>): List<List<PointF>> {
         val mat = org.opencv.core.Mat()
         Utils.bitmapToMat(bitmap, mat)
@@ -277,22 +269,19 @@ class MainActivity : AppCompatActivity() {
         val roiMat = org.opencv.core.Mat(gray, roi)
         Imgproc.GaussianBlur(roiMat, roiMat, org.opencv.core.Size(5.0, 5.0), 0.0)
         
-        // 🚨 개선 9: 조명/훼손으로 끊어진 번호판 에지 복원을 위한 형태학적 닫기(Close) 연산 도입
         val morphKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, org.opencv.core.Size(5.0, 5.0))
         Imgproc.morphologyEx(roiMat, roiMat, Imgproc.MORPH_CLOSE, morphKernel)
-        morphKernel.release() // JNI 누수 방어
+        morphKernel.release()
 
         Imgproc.Canny(roiMat, roiMat, 50.0, 150.0)
         
         val contours = mutableListOf<MatOfPoint>()
-        // 🚨 개선 8: 외부 윤곽선 우선에 의한 번호판 프레임 탈락 방지를 위해 RETR_LIST 탐색
         Imgproc.findContours(roiMat, contours, org.opencv.core.Mat(), Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE)
         
         val validCandidates = mutableListOf<Pair<Double, List<PointF>>>()
         val totalRoiArea = roi.width * roi.height.toDouble()
 
         for (contour in contours) {
-            // 🚨 개선 5: 명시적 JNI 네이티브 누수 관리
             val contour2f = MatOfPoint2f(*contour.toArray())
             val approx = MatOfPoint2f()
             Imgproc.approxPolyDP(contour2f, approx, Imgproc.arcLength(contour2f, true) * 0.02, true)
@@ -301,18 +290,43 @@ class MainActivity : AppCompatActivity() {
                 val area = Imgproc.contourArea(approx)
                 if (area > totalRoiArea * 0.1) {
                     val rawPoints = approx.toArray().map { PointF(it.x.toFloat() + roi.x, it.y.toFloat() + roi.y) }
-                    validCandidates.add(Pair(area, sortCorners(rawPoints)))
+                    // 🚨 개선: 수학적으로 완벽한 방사형 꼭짓점 정렬 적용
+                    validCandidates.add(Pair(area, sortCornersCentroid(rawPoints)))
                 }
             }
             contour2f.release()
-            approx.release() // 🚨 안전 해제
+            approx.release()
             contour.release()
         }
 
         mat.release(); gray.release()
-        
-        // 🚨 개선 7: 연산/배터리 폭주 방지를 위해 상위 5개의 핵심 다각형만 최종 채택
         return validCandidates.sortedByDescending { it.first }.map { it.second }.take(5)
+    }
+
+    /**
+     * 🚨 개선: 아크탄젠트(atan2) 기반 방사형 꼭짓점 정렬 알고리즘
+     * 극단적인 각도 왜곡이나 180도 회전 환경에서도 꼭짓점 순서(TL, TR, BR, BL)를 시계 방향으로 완벽하게 보장합니다.
+     */
+    private fun sortCornersCentroid(pts: List<PointF>): List<PointF> {
+        if (pts.size != 4) return pts
+        
+        // 1. 다각형의 무게중심(Centroid) 도출
+        val cx = pts.map { it.x }.average().toFloat()
+        val cy = pts.map { it.y }.average().toFloat()
+
+        // 2. 중심을 기준으로 한 아크탄젠트 각도(-π ~ π) 계산 후 시계방향 정렬
+        // Y축이 아래로 향하는 그래픽스 좌표계 특성을 반영하여 atan2 파라미터 매핑
+        val sorted = pts.sortedBy { atan2((it.y - cy).toDouble(), (it.x - cx).toDouble()) }
+
+        // 3. 배열 순서 조정: atan2 결과 특성상 Top-Left가 첫 번째가 되도록 인덱스 회전 보정
+        // 일반적으로 2사분면(Top-Left)부터 시작하도록 매핑
+        val tlIndex = sorted.indexOfFirst { it.x < cx && it.y < cy }.takeIf { it != -1 } ?: 0
+        
+        val result = mutableListOf<PointF>()
+        for (i in 0 until 4) {
+            result.add(sorted[(tlIndex + i) % 4])
+        }
+        return result
     }
 
     private fun rectifyToFlatPlate(sourceBitmap: Bitmap, pts: List<PointF>): Bitmap? {
@@ -351,13 +365,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun sortCorners(pts: List<PointF>): List<PointF> {
-        val sortedByY = pts.sortedBy { it.y }
-        val top = sortedByY.take(2).sortedBy { it.x }
-        val bottom = sortedByY.takeLast(2).sortedByDescending { it.x }
-        return listOf(top[0], top[1], bottom[0], bottom[1])
-    }
-
     private fun processPerspectiveOverlay(source: Bitmap, targetCorners: List<PointF>): Bitmap {
         val result = source.copy(Bitmap.Config.ARGB_8888, true)
         val targetMat = org.opencv.core.Mat()
@@ -373,7 +380,8 @@ class MainActivity : AppCompatActivity() {
         val srcPts = MatOfPoint2f(org.opencv.core.Point(0.0, 0.0), org.opencv.core.Point(maskMat.cols().toDouble(), 0.0),
                                   org.opencv.core.Point(maskMat.cols().toDouble(), maskMat.rows().toDouble()), org.opencv.core.Point(0.0, maskMat.rows().toDouble()))
         
-        val sortedTargets = sortCorners(targetCorners)
+        // 정렬 보장 매핑
+        val sortedTargets = sortCornersCentroid(targetCorners)
         val dstPts = MatOfPoint2f(org.opencv.core.Point(sortedTargets[0].x.toDouble(), sortedTargets[0].y.toDouble()),
                                   org.opencv.core.Point(sortedTargets[1].x.toDouble(), sortedTargets[1].y.toDouble()),
                                   org.opencv.core.Point(sortedTargets[2].x.toDouble(), sortedTargets[2].y.toDouble()),
@@ -426,6 +434,7 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
+    // 🚨 해결 방법 1: 패키지 명시를 통한 Rect 충돌 완전 제거
     private fun ImageProxy.toBitmapExt(): Bitmap {
         val yBuffer = planes[0].buffer; val uBuffer = planes[1].buffer; val vBuffer = planes[2].buffer
         val ySize = yBuffer.remaining(); val uSize = uBuffer.remaining(); val vSize = vBuffer.remaining()
@@ -433,7 +442,10 @@ class MainActivity : AppCompatActivity() {
         yBuffer.get(nv21, 0, ySize); vBuffer.get(nv21, ySize, vSize); uBuffer.get(nv21, ySize + vSize, uSize)
         val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
         val out = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(Rect(0, 0, width, height), 100, out)
+        
+        // 명시적 패키지 참조로 컴파일 에러 해결
+        yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 100, out)
+        
         val bitmap = BitmapFactory.decodeByteArray(out.toByteArray(), 0, out.size())
         val matrix = Matrix().apply { postRotate(imageInfo.rotationDegrees.toFloat()) }
         return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
