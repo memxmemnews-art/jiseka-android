@@ -32,7 +32,6 @@ import org.opencv.imgproc.Imgproc
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
-import java.io.OutputStream
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.abs
@@ -247,7 +246,7 @@ class MainActivity : AppCompatActivity() {
         if (flatBmp != null) {
             val inputImage = InputImage.fromBitmap(flatBmp, 0)
             recognizer.process(inputImage).addOnCompleteListener { task ->
-                // 🚨 완화된 조건 적용: OCR 결과 안에서 숫자 3개 이상만 감지되면 통과
+                // 완화된 조건 적용: OCR 결과 안에서 숫자 3개 이상만 감지되면 통과
                 val finalPoints = if (task.isSuccessful && isValidLicensePlatePattern(task.result.text)) {
                     Log.d("JiSeKa Engine", "✅ OCR 숫자 3개 이상 감지 통과: 정밀 미리보기 렌더링")
                     targetPoints
@@ -258,7 +257,6 @@ class MainActivity : AppCompatActivity() {
                 
                 val previewBitmap = processPerspectiveOverlay(sourceBitmap, finalPoints)
                 val fileUriStr = saveBitmapToCacheFile(previewBitmap)
-                
                 sendCachedPreviewToJs(finalPoints, fileUriStr, bmpW, bmpH)
                 
                 previewBitmap.recycle()
@@ -274,7 +272,6 @@ class MainActivity : AppCompatActivity() {
         return try {
             cachedPreviewFile?.let { file ->
                 if (file.exists()) file.delete()
-                
                 FileOutputStream(file).use { out ->
                     bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
                     out.flush()
@@ -303,9 +300,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * 🚨 개선된 OCR 판정 조건: 문자열 내 공백 제거 후 순수 숫자 갯수가 3개 이상인지 검사
-     */
     private fun isValidLicensePlatePattern(text: String): Boolean {
         val cleanText = text.replace(Regex("\\s+"), "")
         val digitCount = cleanText.count { it.isDigit() }
@@ -323,7 +317,8 @@ class MainActivity : AppCompatActivity() {
             Utils.bitmapToMat(bitmap, mat)
             Imgproc.cvtColor(mat, gray, Imgproc.COLOR_RGBA2GRAY)
             
-            val xs = pts.map { it.x }; val ys = pts.map { it.y }
+            val xs = pts.map { it.x }
+            val ys = pts.map { it.y }
             
             val minX = max(0, xs.minOrNull()?.toInt() ?: 0)
             val minY = max(0, ys.minOrNull()?.toInt() ?: 0)
@@ -490,22 +485,28 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 🚨 [핵심 개선] 원근 변환된 오버레이 마스크에 Feathering 및 Weighted Alpha Blending 적용
+     */
     private fun processPerspectiveOverlay(source: Bitmap, targetCorners: List<PointF>): Bitmap {
         val result = source.copy(Bitmap.Config.ARGB_8888, true)
         val targetMat = org.opencv.core.Mat()
         val maskMat = org.opencv.core.Mat()
         val warpedMask = org.opencv.core.Mat()
-        var overlayBmp: Bitmap? = null
+        val alphaMask = org.opencv.core.Mat()
+        val finalBlended = org.opencv.core.Mat()
 
         try {
             Utils.bitmapToMat(result, targetMat)
+            
+            // 1. 가림막 리소스 로드
             val resId = resources.getIdentifier("plate_mask", "drawable", packageName)
             val maskBmp = if (resId != 0) BitmapFactory.decodeResource(resources, resId) 
                           else Bitmap.createBitmap(600, 150, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.LTGRAY) }
-            
             Utils.bitmapToMat(maskBmp, maskMat)
             maskBmp.recycle()
 
+            // 2. 투시 변환 (Perspective Warp)
             val srcPts = MatOfPoint2f(
                 org.opencv.core.Point(0.0, 0.0), org.opencv.core.Point(maskMat.cols().toDouble(), 0.0),
                 org.opencv.core.Point(maskMat.cols().toDouble(), maskMat.rows().toDouble()), org.opencv.core.Point(0.0, maskMat.rows().toDouble())
@@ -519,16 +520,61 @@ class MainActivity : AppCompatActivity() {
             )
             val transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
             Imgproc.warpPerspective(maskMat, warpedMask, transform, targetMat.size(), Imgproc.INTER_LINEAR)
+
+            // 3. Edge Feathering (경계면 부드럽게 깎아주기)
+            Imgproc.cvtColor(warpedMask, alphaMask, Imgproc.COLOR_RGBA2GRAY)
+            Imgproc.threshold(alphaMask, alphaMask, 1.0, 255.0, Imgproc.THRESH_BINARY)
+            Imgproc.GaussianBlur(alphaMask, alphaMask, org.opencv.core.Size(7.0, 7.0), 0.0)
+
+            // 4. Alpha Blending (주변 픽셀과의 조화 및 그레인 매칭 유도)
+            val warpedMatFloat = org.opencv.core.Mat()
+            val targetMatFloat = org.opencv.core.Mat()
+            val alphaMaskFloat = org.opencv.core.Mat()
+
+            warpedMask.convertTo(warpedMatFloat, CvType.CV_32FC4)
+            targetMat.convertTo(targetMatFloat, CvType.CV_32FC4)
+            alphaMask.convertTo(alphaMaskFloat, CvType.CV_32FC1, 1.0 / 255.0)
+
+            val channels = mutableListOf<org.opencv.core.Mat>()
+            Core.split(warpedMatFloat, channels)
             
-            overlayBmp = Bitmap.createBitmap(result.width, result.height, Bitmap.Config.ARGB_8888)
-            Utils.matToBitmap(warpedMask, overlayBmp)
-            Canvas(result).drawBitmap(overlayBmp, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG))
+            for (i in 0 until 3) { 
+                Core.multiply(channels[i], alphaMaskFloat, channels[i])
+                val invAlpha = org.opencv.core.Mat()
+                Core.subtract(org.opencv.core.Mat.ones(alphaMaskFloat.size(), CvType.CV_32FC1), alphaMaskFloat, invAlpha)
+                
+                val targetChan = org.opencv.core.Mat()
+                val targetChannels = mutableListOf<org.opencv.core.Mat>()
+                Core.split(targetMatFloat, targetChannels)
+                Core.multiply(targetChannels[i], invAlpha, targetChan)
+                
+                Core.add(channels[i], targetChan, channels[i])
+                invAlpha.release()
+                targetChan.release()
+                targetChannels.forEach { it.release() }
+            }
+
+            // 원본 비트맵의 최종 렌더링 무결성을 위해 배경 타겟 이미지의 알파 채널을 유지
+            val targetChannelsForAlpha = mutableListOf<org.opencv.core.Mat>()
+            Core.split(targetMatFloat, targetChannelsForAlpha)
+            if (channels.size > 3 && targetChannelsForAlpha.size > 3) {
+                channels[3].release()
+                channels[3] = targetChannelsForAlpha[3].clone()
+            }
+            targetChannelsForAlpha.forEach { it.release() }
+            
+            Core.merge(channels, finalBlended)
+            finalBlended.convertTo(finalBlended, CvType.CV_8UC4)
+            Utils.matToBitmap(finalBlended, result)
 
             srcPts.release(); dstPts.release(); transform.release()
+            warpedMatFloat.release(); targetMatFloat.release(); alphaMaskFloat.release()
+            channels.forEach { it.release() }
+
             return result
         } finally {
             targetMat.release(); maskMat.release(); warpedMask.release()
-            overlayBmp?.recycle()
+            alphaMask.release(); finalBlended.release()
         }
     }
 
