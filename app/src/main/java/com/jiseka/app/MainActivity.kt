@@ -127,10 +127,9 @@ class MainActivity : AppCompatActivity() {
                         initialPoints.add(PointF(p.getDouble("x").toFloat() * bmpW, p.getDouble("y").toFloat() * bmpH))
                     }
 
-                    // 🚨 고도화: 허프 변환 직선 피팅 엔진 기반 정밀 좌표 추출
+                    // 허프 변환 직선 피팅 엔진 구동
                     val refinedPoints = extractPlateCornersViaLineFitting(sourceBitmap, initialPoints)
 
-                    // OCR 유효성 검증을 위한 1회차 평탄화 후보 생성
                     verifyCandidateAndRespond(sourceBitmap, refinedPoints, initialPoints, bmpW, bmpH)
 
                 } catch (e: Exception) {
@@ -168,7 +167,8 @@ class MainActivity : AppCompatActivity() {
                     runOnUiThread { webView?.evaluateJavascript("window.onNativeSaveComplete()", null) }
                 } finally { 
                     sourceBitmap.recycle()
-                    overlayResult?.let { if (it != sourceBitmap) it.recycle() }
+                    // 🚨 수정: 안전한 객체 주소 참조 비교(!==) 적용
+                    overlayResult?.let { if (it !== sourceBitmap) it.recycle() }
                 }
             }
         }
@@ -228,10 +228,6 @@ class MainActivity : AppCompatActivity() {
         runOnUiThread { webView?.evaluateJavascript("window.onNativeSuccess('$resultJson')", null) }
     }
 
-    /**
-     * 🚨 최우선순위 개선 적용: 허프 변환(HoughLinesP) 기반의 독립적 외곽선 추출 및 기하학적 피팅 엔진
-     * 끊어지거나 노이즈가 낀 다각형 대신, 상/하/좌/우 4개의 강력한 대표 선분을 도출하여 완벽한 수학적 교차점을 찾아냅니다.
-     */
     private fun extractPlateCornersViaLineFitting(bitmap: Bitmap, pts: List<PointF>): List<PointF> {
         val mat = org.opencv.core.Mat()
         Utils.bitmapToMat(bitmap, mat)
@@ -239,8 +235,12 @@ class MainActivity : AppCompatActivity() {
         Imgproc.cvtColor(mat, gray, Imgproc.COLOR_RGBA2GRAY)
         
         val xs = pts.map { it.x }; val ys = pts.map { it.y }
-        val minX = max(0, xs.min().toInt()); val minY = max(0, ys.min().toInt())
-        val maxX = min(mat.cols() - 1, xs.max().toInt()); val maxY = min(mat.rows() - 1, ys.max().toInt())
+        
+        // 🚨 2순위 수정: minOrNull() / maxOrNull() 적용으로 코틀린 최신 API 널 안정성 확보
+        val minX = max(0, xs.minOrNull()?.toInt() ?: 0)
+        val minY = max(0, ys.minOrNull()?.toInt() ?: 0)
+        val maxX = min(mat.cols() - 1, xs.maxOrNull()?.toInt() ?: (mat.cols() - 1))
+        val maxY = min(mat.rows() - 1, ys.maxOrNull()?.toInt() ?: (mat.rows() - 1))
         
         val roi = org.opencv.core.Rect(minX, minY, maxX - minX, maxY - minY)
         if (roi.width <= 20 || roi.height <= 20) {
@@ -251,26 +251,24 @@ class MainActivity : AppCompatActivity() {
         val roiMat = org.opencv.core.Mat(gray, roi)
         Imgproc.GaussianBlur(roiMat, roiMat, org.opencv.core.Size(5.0, 5.0), 0.0)
         
-        // 모폴로지 연산으로 문자 엣지 간섭 최소화 및 프레임 강화
         val morphKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, org.opencv.core.Size(3.0, 3.0))
         Imgproc.morphologyEx(roiMat, roiMat, Imgproc.MORPH_CLOSE, morphKernel)
         morphKernel.release()
         
         Imgproc.Canny(roiMat, roiMat, 50.0, 150.0)
 
-        // 1단계: HoughLinesP 가동 (선분 조각 수집)
         val lines = org.opencv.core.Mat()
         Imgproc.HoughLinesP(roiMat, lines, 1.0, Math.PI / 180, 30, roi.width * 0.3, 10.0)
 
-        val topLines = mutableListOf<Line()>()
-        val bottomLines = mutableListOf<Line()>()
-        val leftLines = mutableListOf<Line()>()
-        val rightLines = mutableListOf<Line()>()
+        // 🚨 1순위 수정: 제네릭 타입 파라미터 생성자 오타 완벽 해결 (Line() -> Line)
+        val topLines = mutableListOf<Line>()
+        val bottomLines = mutableListOf<Line>()
+        val leftLines = mutableListOf<Line>()
+        val rightLines = mutableListOf<Line>()
 
         val roiCenterY = roi.height / 2.0
         val roiCenterX = roi.width / 2.0
 
-        // 2단계: 추출된 선분들을 위치와 기울기 기반으로 상/하/좌/우 4개 엣지로 엄격히 분류
         for (i in 0 until lines.rows()) {
             val vec = lines.get(i, 0) ?: continue
             val x1 = vec[0]; val y1 = vec[1]; val x2 = vec[2]; val y2 = vec[3]
@@ -282,24 +280,19 @@ class MainActivity : AppCompatActivity() {
 
             val lineObj = Line(x1, y1, x2, y2, length)
 
-            // 수평선 계열 (각도가 0~35도 또는 145~180도)
             if (angle <= 35.0 || angle >= 145.0) {
                 if (midY < roiCenterY) topLines.add(lineObj) else bottomLines.add(lineObj)
-            } 
-            // 수직선 계열 (각도가 55~125도)
-            else if (angle in 55.0..125.0) {
+            } else if (angle in 55.0..125.0) {
                 if (midX < roiCenterX) leftLines.add(lineObj) else rightLines.add(lineObj)
             }
         }
         lines.release()
 
-        // 3단계: 각 그룹에서 가장 길고 뚜렷한 대표 직선(Best Line) 선택
         val topEdge = topLines.maxByOrNull { it.length }
         val bottomEdge = bottomLines.maxByOrNull { it.length }
         val leftEdge = leftLines.maxByOrNull { it.length }
         val rightEdge = rightLines.maxByOrNull { it.length }
 
-        // 4개의 엣지가 모두 확보된 경우에만 교차점 피팅을 가동, 누락 시 안전하게 근사화/폴백
         var fittedPoints = pts
         if (topEdge != null && bottomEdge != null && leftEdge != null && rightEdge != null) {
             val tl = getIntersection(topEdge, leftEdge)
@@ -308,7 +301,6 @@ class MainActivity : AppCompatActivity() {
             val bl = getIntersection(bottomEdge, leftEdge)
 
             if (tl != null && tr != null && br != null && bl != null) {
-                // ROI 내부 상대 좌표를 전체 이미지 절대 좌표로 매핑
                 val rawCorners = listOf(
                     PointF(tl.x.toFloat() + roi.x, tl.y.toFloat() + roi.y),
                     PointF(tr.x.toFloat() + roi.x, tr.y.toFloat() + roi.y),
@@ -316,36 +308,45 @@ class MainActivity : AppCompatActivity() {
                     PointF(bl.x.toFloat() + roi.x, bl.y.toFloat() + roi.y)
                 )
 
-                // 🚨 우선순위 4: 업계 표준 방식의 완벽한 정렬 적용 (x±y Ordering)
                 val sortedCorners = sortCornersStandard(rawCorners)
 
-                // 🚨 우선순위 3: 서브픽셀 정밀 흡착 (cornerSubPix Refinement)
-                // 수학적 교차점을 실제 엣지의 최적 그라디언트 중심으로 미세 소수점 보정 유도
-                val subPixMat = MatOfPoint2f()
-                subPixMat.fromArray(
-                    org.opencv.core.Point(sortedCorners[0].x.toDouble(), sortedCorners[0].y.toDouble()),
-                    org.opencv.core.Point(sortedCorners[1].x.toDouble(), sortedCorners[1].y.toDouble()),
-                    org.opencv.core.Point(sortedCorners[2].x.toDouble(), sortedCorners[2].y.toDouble()),
-                    org.opencv.core.Point(sortedCorners[3].x.toDouble(), sortedCorners[3].y.toDouble())
-                )
+                // 🚨 3순위 수정: OpenCV Subpixel 탐색 윈도우 바운더리 크래시 완벽 방어
+                val safePoints = sortedCorners.filter {
+                    it.x >= 4f && it.y >= 4f && 
+                    it.x < (gray.cols() - 4f) && 
+                    it.y < (gray.rows() - 4f)
+                }
 
-                val criteria = TermCriteria(TermCriteria.EPS + TermCriteria.MAX_ITER, 40, 0.05)
-                Imgproc.cornerSubPix(
-                    gray, 
-                    subPixMat, 
-                    org.opencv.core.Size(4.0, 4.0), 
-                    org.opencv.core.Size(-1.0, -1.0), 
-                    criteria
-                )
+                if (safePoints.size == 4) {
+                    val subPixMat = MatOfPoint2f()
+                    subPixMat.fromArray(
+                        org.opencv.core.Point(sortedCorners[0].x.toDouble(), sortedCorners[0].y.toDouble()),
+                        org.opencv.core.Point(sortedCorners[1].x.toDouble(), sortedCorners[1].y.toDouble()),
+                        org.opencv.core.Point(sortedCorners[2].x.toDouble(), sortedCorners[2].y.toDouble()),
+                        org.opencv.core.Point(sortedCorners[3].x.toDouble(), sortedCorners[3].y.toDouble())
+                    )
 
-                val subPixArray = subPixMat.toArray()
-                fittedPoints = listOf(
-                    PointF(subPixArray[0].x.toFloat(), subPixArray[0].y.toFloat()),
-                    PointF(subPixArray[1].x.toFloat(), subPixArray[1].y.toFloat()),
-                    PointF(subPixArray[2].x.toFloat(), subPixArray[2].y.toFloat()),
-                    PointF(subPixArray[3].x.toFloat(), subPixArray[3].y.toFloat())
-                )
-                subPixMat.release()
+                    val criteria = TermCriteria(TermCriteria.EPS + TermCriteria.MAX_ITER, 40, 0.05)
+                    Imgproc.cornerSubPix(
+                        gray, 
+                        subPixMat, 
+                        org.opencv.core.Size(4.0, 4.0), 
+                        org.opencv.core.Size(-1.0, -1.0), 
+                        criteria
+                    )
+
+                    val subPixArray = subPixMat.toArray()
+                    fittedPoints = listOf(
+                        PointF(subPixArray[0].x.toFloat(), subPixArray[0].y.toFloat()),
+                        PointF(subPixArray[1].x.toFloat(), subPixArray[1].y.toFloat()),
+                        PointF(subPixArray[2].x.toFloat(), subPixArray[2].y.toFloat()),
+                        PointF(subPixArray[3].x.toFloat(), subPixArray[3].y.toFloat())
+                    )
+                    subPixMat.release()
+                } else {
+                    Log.w("JiSeKa Engine", "⚠️ 외곽 근접 좌표 감지. Assertion 방어를 위해 Subpixel 생략")
+                    fittedPoints = sortedCorners
+                }
             }
         }
 
@@ -353,13 +354,8 @@ class MainActivity : AppCompatActivity() {
         return fittedPoints
     }
 
-    // 내부 연산용 데이터 클래스
     data class Line(val x1: Double, val y1: Double, val x2: Double, val y2: Double, val length: Double)
 
-    /**
-     * 🚨 우선순위 2: 두 직선의 방정식 교차점 도출 알고리즘 (Line Intersection)
-     * 크래머 공식(Cramer's Rule)을 사용하여 두 선분이 연장되었을 때 만나는 수학적 꼭짓점을 도출합니다.
-     */
     private fun getIntersection(line1: Line, line2: Line): PointF? {
         val a1 = line1.y2 - line1.y1
         val b1 = line1.x1 - line1.x2
@@ -370,17 +366,13 @@ class MainActivity : AppCompatActivity() {
         val c2 = a2 * line2.x1 + b2 * line2.y1
 
         val det = a1 * b2 - a2 * b1
-        if (abs(det) < 1e-6) return null // 평행선 방어
+        if (abs(det) < 1e-6) return null
 
         val cx = (b2 * c1 - b1 * c2) / det
         val cy = (a1 * c2 - a2 * c1) / det
         return PointF(cx.toFloat(), cy.toFloat())
     }
 
-    /**
-     * 🚨 우선순위 4: 업계 표준 방식인 (x+y), (x-y) 연산 기반 꼭짓점 정렬
-     * 꼬임 현상을 완벽히 차단하고 시계방향(TL ➔ TR ➔ BR ➔ BL) 슬롯을 보장합니다.
-     */
     private fun sortCornersStandard(pts: List<PointF>): List<PointF> {
         if (pts.size != 4) return pts
         val tl = pts.minByOrNull { it.x + it.y } ?: pts[0]
