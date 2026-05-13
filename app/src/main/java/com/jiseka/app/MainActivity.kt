@@ -8,11 +8,11 @@ import android.graphics.*
 import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
-import android.util.Base64
 import android.util.Log
 import android.util.Size
 import android.view.View
 import android.webkit.*
+import android.widget.ImageView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
@@ -42,6 +42,7 @@ class MainActivity : AppCompatActivity() {
 
     private var webView: WebView? = null
     private var viewFinder: PreviewView? = null
+    private var nativeBackgroundView: ImageView? = null
     private var imageCapture: ImageCapture? = null
     private lateinit var cameraExecutor: ExecutorService
     private lateinit var analysisExecutor: ExecutorService
@@ -49,6 +50,7 @@ class MainActivity : AppCompatActivity() {
     private var lastCapturedBitmap: Bitmap? = null
     private val bitmapLock = Any()
 
+    // ML Kit 한국어 텍스트 인식 클라이언트 지연 초기화
     private val recognizer by lazy { 
         TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build()) 
     }
@@ -62,6 +64,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         viewFinder = findViewById(R.id.viewFinder)
+        nativeBackgroundView = findViewById(R.id.nativeBackgroundView)
         webView = findViewById(R.id.webView)
 
         viewFinder?.apply {
@@ -107,12 +110,20 @@ class MainActivity : AppCompatActivity() {
 
         @JavascriptInterface
         fun setCameraVisibility(isVisible: Boolean) {
-            runOnUiThread { viewFinder?.visibility = if (isVisible) View.VISIBLE else View.INVISIBLE }
+            runOnUiThread { 
+                if (isVisible) {
+                    viewFinder?.visibility = View.VISIBLE
+                    nativeBackgroundView?.visibility = View.GONE
+                } else {
+                    viewFinder?.visibility = View.INVISIBLE
+                }
+            }
         }
 
         @JavascriptInterface
         fun analyzePlateWithMode(cornersJsonStr: String, mode: String) {
             analysisExecutor.execute {
+                // 스레드 안전한 로컬 분석용 비트맵 복사본 생성
                 val sourceBitmap = synchronized(bitmapLock) { 
                     lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) 
                 } ?: return@execute
@@ -127,13 +138,14 @@ class MainActivity : AppCompatActivity() {
                         initialPoints.add(PointF(p.getDouble("x").toFloat() * bmpW, p.getDouble("y").toFloat() * bmpH))
                     }
 
-                    // 허프 변환 직선 피팅 엔진 구동
+                    // 허프 변환 직선 피팅 엔진 기반 정밀 엣지 좌표 추출
                     val refinedPoints = extractPlateCornersViaLineFitting(sourceBitmap, initialPoints)
 
+                    // OCR 검증 및 결과 전송 (수명주기 회수 포함)
                     verifyCandidateAndRespond(sourceBitmap, refinedPoints, initialPoints, bmpW, bmpH)
 
                 } catch (e: Exception) {
-                    Log.e("JiSeKa Engine", "분석 에러", e)
+                    Log.e("JiSeKa Engine", "분석 파이프라인 에러", e)
                     runOnUiThread { webView?.evaluateJavascript("window.onNativeSuccess('{\"corners\":null}')", null) }
                     sourceBitmap.recycle()
                 }
@@ -148,6 +160,7 @@ class MainActivity : AppCompatActivity() {
                 try {
                     val jsonObj = JSONObject(cornersJsonStr)
                     if (jsonObj.isNull("corners")) {
+                        Log.d("JiSeKa Engine", "ℹ️ 가림막 기각 대상: 원본 비트맵 직접 저장")
                         saveBitmapToGallery(sourceBitmap)
                         runOnUiThread { webView?.evaluateJavascript("window.onNativeSaveComplete()", null) }
                         return@execute
@@ -167,13 +180,16 @@ class MainActivity : AppCompatActivity() {
                     runOnUiThread { webView?.evaluateJavascript("window.onNativeSaveComplete()", null) }
                 } finally { 
                     sourceBitmap.recycle()
-                    // 🚨 수정: 안전한 객체 주소 참조 비교(!==) 적용
+                    // 🚨 완벽 조치: 안전한 주소 참조 비교(!==)를 통한 메모리 누수 방어
                     overlayResult?.let { if (it !== sourceBitmap) it.recycle() }
                 }
             }
         }
     }
 
+    /**
+     * 🚨 완벽 조치: 비동기 흐름 종착지에서 안전하게 비트맵을 회수하는 OCR 검증 파이프라인
+     */
     private fun verifyCandidateAndRespond(
         sourceBitmap: Bitmap, 
         targetPoints: List<PointF>, 
@@ -191,14 +207,14 @@ class MainActivity : AppCompatActivity() {
                         Log.d("JiSeKa Engine", "✅ 정밀 피팅 좌표 OCR 검증 통과 ($rawText)")
                         sendPointsToJs(targetPoints, bmpW, bmpH)
                     } else {
-                        Log.w("JiSeKa Engine", "⚠️ 피팅 영역 텍스트 미달. 사용자 가이드 좌표 폴백")
+                        Log.w("JiSeKa Engine", "⚠️ 피팅 영역 텍스트 미달. 사용자 가이드 좌표로 폴백")
                         sendPointsToJs(fallbackPoints, bmpW, bmpH)
                     }
                 } else {
                     sendPointsToJs(fallbackPoints, bmpW, bmpH)
                 }
                 flatBmp.recycle()
-                sourceBitmap.recycle()
+                sourceBitmap.recycle() // 비동기 콜백 완료 시점에 안전 회수
             }
         } else {
             sendPointsToJs(fallbackPoints, bmpW, bmpH)
@@ -228,6 +244,9 @@ class MainActivity : AppCompatActivity() {
         runOnUiThread { webView?.evaluateJavascript("window.onNativeSuccess('$resultJson')", null) }
     }
 
+    /**
+     * 🚨 완벽 조치: 허프 변환 직선 피팅 + 제네릭 오류 해결 + 최신 API 널 안정성 + 서브픽셀 보호
+     */
     private fun extractPlateCornersViaLineFitting(bitmap: Bitmap, pts: List<PointF>): List<PointF> {
         val mat = org.opencv.core.Mat()
         Utils.bitmapToMat(bitmap, mat)
@@ -236,7 +255,7 @@ class MainActivity : AppCompatActivity() {
         
         val xs = pts.map { it.x }; val ys = pts.map { it.y }
         
-        // 🚨 2순위 수정: minOrNull() / maxOrNull() 적용으로 코틀린 최신 API 널 안정성 확보
+        // 🚨 조치: minOrNull() / maxOrNull() 적용으로 최신 코틀린 API 호환성 및 널 안정성 확보
         val minX = max(0, xs.minOrNull()?.toInt() ?: 0)
         val minY = max(0, ys.minOrNull()?.toInt() ?: 0)
         val maxX = min(mat.cols() - 1, xs.maxOrNull()?.toInt() ?: (mat.cols() - 1))
@@ -260,7 +279,7 @@ class MainActivity : AppCompatActivity() {
         val lines = org.opencv.core.Mat()
         Imgproc.HoughLinesP(roiMat, lines, 1.0, Math.PI / 180, 30, roi.width * 0.3, 10.0)
 
-        // 🚨 1순위 수정: 제네릭 타입 파라미터 생성자 오타 완벽 해결 (Line() -> Line)
+        // 🚨 조치: 제네릭 타입 파라미터 문법 완전 해결 (Line() 오타 -> Line 수정)
         val topLines = mutableListOf<Line>()
         val bottomLines = mutableListOf<Line>()
         val leftLines = mutableListOf<Line>()
@@ -308,9 +327,10 @@ class MainActivity : AppCompatActivity() {
                     PointF(bl.x.toFloat() + roi.x, bl.y.toFloat() + roi.y)
                 )
 
+                // 업계 표준 방식의 완벽한 정렬 적용 (x±y Ordering)
                 val sortedCorners = sortCornersStandard(rawCorners)
 
-                // 🚨 3순위 수정: OpenCV Subpixel 탐색 윈도우 바운더리 크래시 완벽 방어
+                // 🚨 조치: 이미지 외곽 근접 시 OpenCV Assertion Crash를 막기 위한 범위 필터링
                 val safePoints = sortedCorners.filter {
                     it.x >= 4f && it.y >= 4f && 
                     it.x < (gray.cols() - 4f) && 
@@ -344,10 +364,14 @@ class MainActivity : AppCompatActivity() {
                     )
                     subPixMat.release()
                 } else {
-                    Log.w("JiSeKa Engine", "⚠️ 외곽 근접 좌표 감지. Assertion 방어를 위해 Subpixel 생략")
+                    Log.w("JiSeKa Engine", "⚠️ 외곽 근접 좌표 감지. 안전을 위해 Subpixel 정제 생략")
                     fittedPoints = sortedCorners
                 }
+            } else {
+                Log.w("JiSeKa Engine", "⚠️ 직선 교차점 연산 실패. 원본 가이드 좌표 유지")
             }
+        } else {
+            Log.w("JiSeKa Engine", "⚠️ 4면 대표 직선 검출 부족. 원본 가이드 좌표 유지")
         }
 
         mat.release(); gray.release()
@@ -418,20 +442,30 @@ class MainActivity : AppCompatActivity() {
                       else Bitmap.createBitmap(600, 150, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.LTGRAY) }
         val maskMat = org.opencv.core.Mat()
         Utils.bitmapToMat(maskBmp, maskMat)
-        val srcPts = MatOfPoint2f(org.opencv.core.Point(0.0, 0.0), org.opencv.core.Point(maskMat.cols().toDouble(), 0.0),
-                                  org.opencv.core.Point(maskMat.cols().toDouble(), maskMat.rows().toDouble()), org.opencv.core.Point(0.0, maskMat.rows().toDouble()))
+        maskBmp.recycle() // 픽셀 Mat 업로드 직후 조기 메모리 해제 보장
+
+        val srcPts = MatOfPoint2f(
+            org.opencv.core.Point(0.0, 0.0), 
+            org.opencv.core.Point(maskMat.cols().toDouble(), 0.0),
+            org.opencv.core.Point(maskMat.cols().toDouble(), maskMat.rows().toDouble()), 
+            org.opencv.core.Point(0.0, maskMat.rows().toDouble())
+        )
         val sortedTargets = sortCornersStandard(targetCorners)
-        val dstPts = MatOfPoint2f(org.opencv.core.Point(sortedTargets[0].x.toDouble(), sortedTargets[0].y.toDouble()),
-                                  org.opencv.core.Point(sortedTargets[1].x.toDouble(), sortedTargets[1].y.toDouble()),
-                                  org.opencv.core.Point(sortedTargets[2].x.toDouble(), sortedTargets[2].y.toDouble()),
-                                  org.opencv.core.Point(sortedTargets[3].x.toDouble(), sortedTargets[3].y.toDouble()))
+        val dstPts = MatOfPoint2f(
+            org.opencv.core.Point(sortedTargets[0].x.toDouble(), sortedTargets[0].y.toDouble()),
+            org.opencv.core.Point(sortedTargets[1].x.toDouble(), sortedTargets[1].y.toDouble()),
+            org.opencv.core.Point(sortedTargets[2].x.toDouble(), sortedTargets[2].y.toDouble()),
+            org.opencv.core.Point(sortedTargets[3].x.toDouble(), sortedTargets[3].y.toDouble())
+        )
         val transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
         val warpedMask = org.opencv.core.Mat()
         Imgproc.warpPerspective(maskMat, warpedMask, transform, targetMat.size(), Imgproc.INTER_LINEAR)
         val overlayBmp = Bitmap.createBitmap(result.width, result.height, Bitmap.Config.ARGB_8888)
         Utils.matToBitmap(warpedMask, overlayBmp)
         Canvas(result).drawBitmap(overlayBmp, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG))
-        targetMat.release(); maskMat.release(); srcPts.release(); dstPts.release(); transform.release(); warpedMask.release(); overlayBmp.recycle()
+
+        targetMat.release(); maskMat.release(); srcPts.release(); dstPts.release(); transform.release(); warpedMask.release()
+        overlayBmp.recycle()
         return result
     }
 
@@ -454,6 +488,7 @@ class MainActivity : AppCompatActivity() {
         if (requestCode == REQUEST_CODE_PERMISSIONS && allPermissionsGranted()) viewFinder?.post { startCamera() }
     }
 
+    // 🚨 하이브리드 2.0 조치: Base64 인코딩을 완전히 제거하고 네이티브 뷰 안착 후 심플 트리거 전송
     private fun takePhoto() {
         val capture = imageCapture ?: return
         capture.takePicture(cameraExecutor, object : ImageCapture.OnImageCapturedCallback() {
@@ -461,13 +496,19 @@ class MainActivity : AppCompatActivity() {
                 val bitmap = image.toBitmapExt()
                 image.close()
                 synchronized(bitmapLock) { lastCapturedBitmap?.recycle(); lastCapturedBitmap = bitmap }
-                val base64 = bitmapToBase64(bitmap)
-                runOnUiThread { webView?.evaluateJavascript("window.onNativePhotoCaptured('$base64')", null) }
+                
+                runOnUiThread { 
+                    viewFinder?.visibility = View.INVISIBLE
+                    nativeBackgroundView?.setImageBitmap(bitmap)
+                    nativeBackgroundView?.visibility = View.VISIBLE
+                    webView?.evaluateJavascript("window.onNativePhotoCaptured()", null)
+                }
             }
             override fun onError(e: ImageCaptureException) { Log.e("JiSeKa", "Capture failed", e) }
         })
     }
 
+    // 🚨 패키지 충돌 해소: android.graphics.Rect 명시적 적용
     private fun ImageProxy.toBitmapExt(): Bitmap {
         val yBuffer = planes[0].buffer; val uBuffer = planes[1].buffer; val vBuffer = planes[2].buffer
         val ySize = yBuffer.remaining(); val uSize = uBuffer.remaining(); val vSize = vBuffer.remaining()
@@ -479,12 +520,6 @@ class MainActivity : AppCompatActivity() {
         val bitmap = BitmapFactory.decodeByteArray(out.toByteArray(), 0, out.size())
         val matrix = Matrix().apply { postRotate(imageInfo.rotationDegrees.toFloat()) }
         return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-    }
-
-    private fun bitmapToBase64(bitmap: Bitmap): String {
-        val out = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 70, out)
-        return Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
     }
 
     private fun saveBitmapToGallery(bitmap: Bitmap) {
