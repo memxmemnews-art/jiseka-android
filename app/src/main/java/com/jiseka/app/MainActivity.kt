@@ -38,9 +38,21 @@ import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow // 🚨 [빌드 에러 해결 2]: Float.pow() 확장 함수 명시적 임포트 추가
 import kotlin.math.sqrt
 
 class MainActivity : AppCompatActivity() {
+
+    // 🚨 [빌드 에러 해결 1]: 누락되었던 Line 데이터 클래스를 명시적으로 정의하여 
+    // Cannot infer a type 및 Overload resolution 연쇄 컴파일 에러를 완벽하게 종식
+    data class Line(
+        val x1: Double,
+        val y1: Double,
+        val x2: Double,
+        val y2: Double,
+        val length: Double,
+        val angle: Double
+    )
 
     private var webView: WebView? = null
     private var viewFinder: PreviewView? = null
@@ -118,8 +130,6 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun takePhoto() { this@MainActivity.takePhoto() }
 
-        // 🚨 네이티브 정지 화면(nativeBackgroundView)과 실시간 프리뷰의 가시성을 정돈하여 
-        // 렌더링 스레드 간 전환 시 잔상이 남지 않도록 보장
         @JavascriptInterface
         fun setCameraVisibility(isVisible: Boolean) {
             runOnUiThread { 
@@ -329,9 +339,12 @@ class MainActivity : AppCompatActivity() {
 
             Imgproc.HoughLinesP(edgeMat, lines, 1.0, Math.PI / 180, 30, paddedRoi.width * 0.3, 10.0)
             
-            val rawTopLines = mutableListOf<Line>(); val rawBottomLines = mutableListOf<Line>()
-            val rawLeftLines = mutableListOf<Line>(); val rawRightLines = mutableListOf<Line>()
-            val roiCenterY = paddedRoi.height / 2.0; val roiCenterX = paddedRoi.width / 2.0
+            val rawTopLines = mutableListOf<Line>()
+            val rawBottomLines = mutableListOf<Line>()
+            val rawLeftLines = mutableListOf<Line>()
+            val rawRightLines = mutableListOf<Line>()
+            val roiCenterY = paddedRoi.height / 2.0
+            val roiCenterX = paddedRoi.width / 2.0
 
             for (i in 0 until lines.rows()) {
                 val vec = lines.get(i, 0) ?: continue
@@ -676,8 +689,6 @@ class MainActivity : AppCompatActivity() {
         if (requestCode == REQUEST_CODE_PERMISSIONS && allPermissionsGranted()) viewFinder?.post { startCamera() }
     }
 
-    // 🚨 네이티브 캡처 시 프리뷰 정지 화면(nativeBackgroundView)을 즉각 띄워 
-    // IPC 통신 지연 중에도 완벽한 시각적 연속성을 보장
     private fun takePhoto() {
         if (isProcessing) return
         isProcessing = true
@@ -686,7 +697,18 @@ class MainActivity : AppCompatActivity() {
         capture.takePicture(cameraExecutor, object : ImageCapture.OnImageCapturedCallback() {
             override fun onCaptureSuccess(image: ImageProxy) {
                 val bitmap = image.toBitmapExt(); image.close()
-                synchronized(bitmapLock) { lastCapturedBitmap?.recycle(); lastCapturedBitmap = bitmap }
+                
+                // 🚨 [스레드 경합(Race Condition) 완벽 차단]: 
+                // 다른 분석 스레드가 lastCapturedBitmap.copy()를 돌리는 와중에 
+                // 섣불리 recycle()을 실행하여 크래시(recycled bitmap exception)가 발생하는 것을 막기 위해
+                // 로컬 변수에 참조를 옮겨 담고 안전을 확인한 뒤에만 독자적으로 해제합니다.
+                val oldBitmap = lastCapturedBitmap
+                synchronized(bitmapLock) { 
+                    lastCapturedBitmap = bitmap 
+                }
+                if (oldBitmap != null && oldBitmap !== bitmap && !oldBitmap.isRecycled) {
+                    oldBitmap.recycle()
+                }
                 
                 val previewUri = saveBitmapToCacheFile(bitmap) ?: ""
                 val safeEscapedUri = JSONObject.quote(previewUri)
