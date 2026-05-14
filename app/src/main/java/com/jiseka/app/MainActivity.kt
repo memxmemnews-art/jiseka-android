@@ -35,6 +35,7 @@ import java.io.FileOutputStream
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
@@ -48,15 +49,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cameraExecutor: ExecutorService
     private lateinit var analysisExecutor: ExecutorService
 
-    // 🚨 [개선] 스레드 경합 및 중복 촬영 방지를 위한 가시성 보장 플래그
     @Volatile
     private var isProcessing = false
 
-    // 스레드 경합 방지를 위한 메인 소스 비트맵 유지 변수
     private var lastCapturedBitmap: Bitmap? = null
     private val bitmapLock = Any()
 
-    // 로컬 파일 캐싱을 위한 파일 객체 관리
     private var cachedPreviewFile: File? = null
 
     private val recognizer by lazy { 
@@ -75,7 +73,6 @@ class MainActivity : AppCompatActivity() {
         nativeBackgroundView = findViewById(R.id.nativeBackgroundView)
         webView = findViewById(R.id.webView)
 
-        // 캐시 디렉토리 초기화
         cachedPreviewFile = File(externalCacheDir ?: cacheDir, "preview_cache.jpg")
 
         viewFinder?.apply {
@@ -121,16 +118,18 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun takePhoto() { this@MainActivity.takePhoto() }
 
+        // 🚨 네이티브 정지 화면(nativeBackgroundView)과 실시간 프리뷰의 가시성을 정돈하여 
+        // 렌더링 스레드 간 전환 시 잔상이 남지 않도록 보장
         @JavascriptInterface
         fun setCameraVisibility(isVisible: Boolean) {
             runOnUiThread { 
                 if (isVisible) {
-                    // 🚨 [개선] 카메라가 다시 켜질 때(다시 찍기 등) 촬영 가능 상태로 안전하게 복구
                     isProcessing = false
                     viewFinder?.visibility = View.VISIBLE
                     nativeBackgroundView?.visibility = View.GONE
                 } else {
                     viewFinder?.visibility = View.INVISIBLE
+                    nativeBackgroundView?.visibility = View.GONE
                 }
             }
         }
@@ -144,7 +143,6 @@ class MainActivity : AppCompatActivity() {
                         lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) 
                     } ?: return@execute
 
-                    // OOM 방지 안전 해상도 스케일링 강제
                     processingBitmap = scaleBitmapDownToLimit(rawBitmap, 1920, 1080)
                     if (processingBitmap !== rawBitmap) {
                         rawBitmap.recycle()
@@ -152,14 +150,12 @@ class MainActivity : AppCompatActivity() {
 
                     val bmpW = processingBitmap.width.toFloat()
                     val bmpH = processingBitmap.height.toFloat()
-                    
                     val viewW = viewFinder?.width?.toFloat() ?: 1f
                     val viewH = viewFinder?.height?.toFloat() ?: 1f
 
                     val inputCorners = JSONObject(cornersJsonStr).getJSONArray("corners")
                     val mappedPoints = mutableListOf<PointF>()
 
-                    // Letterbox/Pillarbox 수식 기반 정밀 픽셀 좌표 역매핑
                     val scale = min(viewW / bmpW, viewH / bmpH)
                     val displayedW = bmpW * scale
                     val displayedH = bmpH * scale
@@ -179,17 +175,13 @@ class MainActivity : AppCompatActivity() {
                         mappedPoints.add(PointF(targetBmpX, targetBmpY))
                     }
 
-                    // 허프 직선 피팅 기반 모서리 정제 가동
                     val refinedPoints = extractPlateCornersViaLineFitting(processingBitmap, mappedPoints)
-
-                    // OCR 검증 및 프리뷰 파일 렌더링 파이프라인 가동
                     verifyAndGenerateFilePreview(processingBitmap, refinedPoints, mappedPoints, bmpW, bmpH)
 
                 } catch (e: Exception) {
                     Log.e("JiSeKa Engine", "분석 파이프라인 크래시 방어", e)
-                    runOnUiThread { webView?.evaluateJavascript("window.onNativeSuccess('{\"corners\":null, \"preview\":null}')", null) }
-                } finally {
-                    processingBitmap?.recycle()
+                    val safeFallbackJson = JSONObject.quote("{\"corners\":null, \"preview\":null}")
+                    runOnUiThread { webView?.evaluateJavascript("window.onNativeSuccess($safeFallbackJson)", null) }
                 }
             }
         }
@@ -227,49 +219,49 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+        
+        @JavascriptInterface
+        fun showToast(msg: String) {
+            runOnUiThread { Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show() }
+        }
     }
 
     private fun scaleBitmapDownToLimit(bitmap: Bitmap, maxW: Int, maxH: Int): Bitmap {
-        val oW = bitmap.width
-        val oH = bitmap.height
+        val oW = bitmap.width; val oH = bitmap.height
         if (oW <= maxW && oH <= maxH) return bitmap
-
         val scale = min(maxW.toFloat() / oW, maxH.toFloat() / oH)
-        val scaledW = (oW * scale).toInt()
-        val scaledH = (oH * scale).toInt()
-
-        return Bitmap.createScaledBitmap(bitmap, scaledW, scaledH, true)
+        return Bitmap.createScaledBitmap(bitmap, (oW * scale).toInt(), (oH * scale).toInt(), true)
     }
 
     private fun verifyAndGenerateFilePreview(
-        sourceBitmap: Bitmap, 
-        targetPoints: List<PointF>, 
-        fallbackPoints: List<PointF>, 
-        bmpW: Float, 
-        bmpH: Float
+        sourceBitmap: Bitmap, targetPoints: List<PointF>, fallbackPoints: List<PointF>, bmpW: Float, bmpH: Float
     ) {
         val flatBmp = rectifyToFlatPlate(sourceBitmap, targetPoints)
         if (flatBmp != null) {
             val inputImage = InputImage.fromBitmap(flatBmp, 0)
             recognizer.process(inputImage).addOnCompleteListener { task ->
-                val finalPoints = if (task.isSuccessful && isValidLicensePlatePattern(task.result.text)) {
-                    Log.d("JiSeKa Engine", "✅ OCR 숫자 3개 이상 감지 통과: 정밀 미리보기 렌더링")
-                    targetPoints
-                } else {
-                    Log.w("JiSeKa Engine", "⚠️ 숫자 3개 미만 감지. 드롭 영역으로 폴백")
-                    fallbackPoints
+                try {
+                    val finalPoints = if (task.isSuccessful && isValidLicensePlatePattern(task.result.text)) {
+                        targetPoints
+                    } else {
+                        fallbackPoints
+                    }
+                    val previewBitmap = processPerspectiveOverlay(sourceBitmap, finalPoints)
+                    val fileUriStr = saveBitmapToCacheFile(previewBitmap)
+                    sendCachedPreviewToJs(finalPoints, fileUriStr, bmpW, bmpH)
+                    previewBitmap.recycle()
+                } finally {
+                    flatBmp.recycle()
+                    sourceBitmap.recycle()
                 }
-                
-                val previewBitmap = processPerspectiveOverlay(sourceBitmap, finalPoints)
-                val fileUriStr = saveBitmapToCacheFile(previewBitmap)
-                sendCachedPreviewToJs(finalPoints, fileUriStr, bmpW, bmpH)
-                
-                previewBitmap.recycle()
-                flatBmp.recycle()
             }
         } else {
-            val fileUriStr = saveBitmapToCacheFile(sourceBitmap)
-            sendCachedPreviewToJs(fallbackPoints, fileUriStr, bmpW, bmpH)
+            try {
+                val fileUriStr = saveBitmapToCacheFile(sourceBitmap)
+                sendCachedPreviewToJs(fallbackPoints, fileUriStr, bmpW, bmpH)
+            } finally {
+                sourceBitmap.recycle()
+            }
         }
     }
 
@@ -277,247 +269,342 @@ class MainActivity : AppCompatActivity() {
         return try {
             cachedPreviewFile?.let { file ->
                 if (file.exists()) file.delete()
-                FileOutputStream(file).use { out ->
-                    bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
-                    out.flush()
-                }
+                FileOutputStream(file).use { out -> bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out); out.flush() }
                 "file://${file.absolutePath}?t=${System.currentTimeMillis()}"
             }
-        } catch (e: Exception) {
-            Log.e("JiSeKa Engine", "캐시 파일 저장 실패", e)
-            null
-        }
+        } catch (e: Exception) { null }
     }
 
     private fun sendCachedPreviewToJs(points: List<PointF>, fileUriStr: String?, bmpW: Float, bmpH: Float) {
         val outputArray = JSONArray()
-        for (pt in points) {
-            outputArray.put(JSONObject().put("x", (pt.x / bmpW).toDouble()).put("y", (pt.y / bmpH).toDouble()))
-        }
+        for (pt in points) { outputArray.put(JSONObject().put("x", (pt.x / bmpW).toDouble()).put("y", (pt.y / bmpH).toDouble())) }
+        val resultJson = JSONObject().apply { put("corners", outputArray); put("preview", fileUriStr ?: JSONObject.NULL) }.toString()
         
-        val resultJson = JSONObject().apply {
-            put("corners", outputArray)
-            put("preview", fileUriStr ?: JSONObject.NULL)
-        }.toString()
-        
-        runOnUiThread { 
-            webView?.evaluateJavascript("window.onNativeSuccess('$resultJson')", null) 
-        }
+        val safeEscapedJson = JSONObject.quote(resultJson)
+        runOnUiThread { webView?.evaluateJavascript("window.onNativeSuccess($safeEscapedJson)", null) }
     }
 
-    private fun isValidLicensePlatePattern(text: String): Boolean {
-        val cleanText = text.replace(Regex("\\s+"), "")
-        val digitCount = cleanText.count { it.isDigit() }
-        return digitCount >= 3
-    }
+    private fun isValidLicensePlatePattern(text: String): Boolean = text.replace(Regex("\\s+"), "").count { it.isDigit() } >= 3
 
     private fun extractPlateCornersViaLineFitting(bitmap: Bitmap, pts: List<PointF>): List<PointF> {
-        val mat = org.opencv.core.Mat()
-        val gray = org.opencv.core.Mat()
-        val roiMat = org.opencv.core.Mat()
+        val mat = org.opencv.core.Mat(); val gray = org.opencv.core.Mat()
+        val roiMat = org.opencv.core.Mat(); val edgeMat = org.opencv.core.Mat()
         val lines = org.opencv.core.Mat()
-        var subPixMat: MatOfPoint2f? = null
 
         try {
             Utils.bitmapToMat(bitmap, mat)
             Imgproc.cvtColor(mat, gray, Imgproc.COLOR_RGBA2GRAY)
             
-            val xs = pts.map { it.x }
-            val ys = pts.map { it.y }
+            val claheObj = Imgproc.createCLAHE(2.5, org.opencv.core.Size(8.0, 8.0))
+            claheObj.apply(gray, gray)
             
-            val minX = max(0, xs.minOrNull()?.toInt() ?: 0)
-            val minY = max(0, ys.minOrNull()?.toInt() ?: 0)
-            val maxX = min(mat.cols() - 1, xs.maxOrNull()?.toInt() ?: (mat.cols() - 1))
-            val maxY = min(mat.rows() - 1, ys.maxOrNull()?.toInt() ?: (mat.rows() - 1))
+            val xs = pts.map { it.x }; val ys = pts.map { it.y }
+            val baseMinX = max(0, xs.minOrNull()?.toInt() ?: 0)
+            val baseMinY = max(0, ys.minOrNull()?.toInt() ?: 0)
+            val baseMaxX = min(mat.cols() - 1, xs.maxOrNull()?.toInt() ?: (mat.cols() - 1))
+            val baseMaxY = min(mat.rows() - 1, ys.maxOrNull()?.toInt() ?: (mat.rows() - 1))
             
-            val roi = org.opencv.core.Rect(minX, minY, maxX - minX, maxY - minY)
-            if (roi.width <= 20 || roi.height <= 20) return pts
+            val baseWidth = baseMaxX - baseMinX
+            val baseHeight = baseMaxY - baseMinY
+            if (baseWidth <= 20 || baseHeight <= 20) return pts
+
+            val padX = (baseWidth * 0.15).toInt()
+            val padY = (baseHeight * 0.20).toInt()
+
+            val safeMinX = max(0, baseMinX - padX)
+            val safeMinY = max(0, baseMinY - padY)
+            val safeMaxX = min(mat.cols() - 1, baseMaxX + padX)
+            val safeMaxY = min(mat.rows() - 1, baseMaxY + padY)
+
+            val paddedRoi = org.opencv.core.Rect(safeMinX, safeMinY, safeMaxX - safeMinX, safeMaxY - safeMinY)
             
-            gray.submat(roi).copyTo(roiMat)
+            gray.submat(paddedRoi).copyTo(roiMat)
             Imgproc.GaussianBlur(roiMat, roiMat, org.opencv.core.Size(5.0, 5.0), 0.0)
             
             val morphKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, org.opencv.core.Size(3.0, 3.0))
             Imgproc.morphologyEx(roiMat, roiMat, Imgproc.MORPH_CLOSE, morphKernel)
             morphKernel.release()
             
-            Imgproc.Canny(roiMat, roiMat, 50.0, 150.0)
-            Imgproc.HoughLinesP(roiMat, lines, 1.0, Math.PI / 180, 30, roi.width * 0.3, 10.0)
+            Imgproc.Canny(roiMat, edgeMat, 50.0, 150.0)
 
-            val topLines = mutableListOf<Line>()
-            val bottomLines = mutableListOf<Line>()
-            val leftLines = mutableListOf<Line>()
-            val rightLines = mutableListOf<Line>()
-
-            val roiCenterY = roi.height / 2.0
-            val roiCenterX = roi.width / 2.0
+            Imgproc.HoughLinesP(edgeMat, lines, 1.0, Math.PI / 180, 30, paddedRoi.width * 0.3, 10.0)
+            
+            val rawTopLines = mutableListOf<Line>(); val rawBottomLines = mutableListOf<Line>()
+            val rawLeftLines = mutableListOf<Line>(); val rawRightLines = mutableListOf<Line>()
+            val roiCenterY = paddedRoi.height / 2.0; val roiCenterX = paddedRoi.width / 2.0
 
             for (i in 0 until lines.rows()) {
                 val vec = lines.get(i, 0) ?: continue
-                val x1 = vec[0]; val y1 = vec[1]; val x2 = vec[2]; val y2 = vec[3]
-                
-                val dx = x2 - x1; val dy = y2 - y1
-                val angle = abs(Math.atan2(dy, dx) * 180.0 / Math.PI)
-                val midX = (x1 + x2) / 2.0; val midY = (y1 + y2) / 2.0
+                val dx = vec[2] - vec[0]; val dy = vec[3] - vec[1]
                 val length = sqrt(dx * dx + dy * dy)
+                var angle = Math.atan2(dy, dx) * 180.0 / Math.PI
+                if (angle < 0) angle += 180.0
 
-                val lineObj = Line(x1, y1, x2, y2, length)
+                val midX = (vec[0] + vec[2]) / 2.0; val midY = (vec[1] + vec[3]) / 2.0
+                val lineObj = Line(vec[0], vec[1], vec[2], vec[3], length, angle)
 
-                if (angle <= 35.0 || angle >= 145.0) {
-                    if (midY < roiCenterY) topLines.add(lineObj) else bottomLines.add(lineObj)
-                } else if (angle in 55.0..125.0) {
-                    if (midX < roiCenterX) leftLines.add(lineObj) else rightLines.add(lineObj)
+                if (abs(dx) > abs(dy)) {
+                    if (midY < roiCenterY) rawTopLines.add(lineObj) else rawBottomLines.add(lineObj)
+                } else {
+                    if (midX < roiCenterX) rawLeftLines.add(lineObj) else rawRightLines.add(lineObj)
                 }
             }
 
-            val topEdge = topLines.maxByOrNull { it.length }
-            val bottomEdge = bottomLines.maxByOrNull { it.length }
-            val leftEdge = leftLines.maxByOrNull { it.length }
-            val rightEdge = rightLines.maxByOrNull { it.length }
+            val tEdge = mergeLinesLinearRegression(filterByDominantAngle(rawTopLines), true, paddedRoi.width, paddedRoi.height)
+            val bEdge = mergeLinesLinearRegression(filterByDominantAngle(rawBottomLines), true, paddedRoi.width, paddedRoi.height)
+            val lEdge = mergeLinesLinearRegression(filterByDominantAngle(rawLeftLines), false, paddedRoi.width, paddedRoi.height)
+            val rEdge = mergeLinesLinearRegression(filterByDominantAngle(rawRightLines), false, paddedRoi.width, paddedRoi.height)
 
-            var fittedPoints = pts
-            if (topEdge != null && bottomEdge != null && leftEdge != null && rightEdge != null) {
-                val tl = getIntersection(topEdge, leftEdge)
-                val tr = getIntersection(topEdge, rightEdge)
-                val br = getIntersection(bottomEdge, rightEdge)
-                val bl = getIntersection(bottomEdge, leftEdge)
-
+            if (tEdge != null && bEdge != null && lEdge != null && rEdge != null) {
+                val tl = getIntersection(tEdge, lEdge); val tr = getIntersection(tEdge, rEdge)
+                val br = getIntersection(bEdge, rEdge); val bl = getIntersection(bEdge, lEdge)
                 if (tl != null && tr != null && br != null && bl != null) {
-                    val rawCorners = listOf(
-                        PointF(tl.x.toFloat() + roi.x, tl.y.toFloat() + roi.y),
-                        PointF(tr.x.toFloat() + roi.x, tr.y.toFloat() + roi.y),
-                        PointF(br.x.toFloat() + roi.x, br.y.toFloat() + roi.y),
-                        PointF(bl.x.toFloat() + roi.x, bl.y.toFloat() + roi.y)
-                    )
-
-                    val sortedCorners = sortCornersStandard(rawCorners)
-                    val safePoints = sortedCorners.filter {
-                        it.x >= 4f && it.y >= 4f && 
-                        it.x < (gray.cols() - 4f) && 
-                        it.y < (gray.rows() - 4f)
-                    }
-
-                    if (safePoints.size == 4) {
-                        subPixMat = MatOfPoint2f()
-                        subPixMat.fromArray(
-                            org.opencv.core.Point(sortedCorners[0].x.toDouble(), sortedCorners[0].y.toDouble()),
-                            org.opencv.core.Point(sortedCorners[1].x.toDouble(), sortedCorners[1].y.toDouble()),
-                            org.opencv.core.Point(sortedCorners[2].x.toDouble(), sortedCorners[2].y.toDouble()),
-                            org.opencv.core.Point(sortedCorners[3].x.toDouble(), sortedCorners[3].y.toDouble())
-                        )
-
-                        val criteria = TermCriteria(TermCriteria.EPS + TermCriteria.MAX_ITER, 40, 0.05)
-                        Imgproc.cornerSubPix(gray, subPixMat, org.opencv.core.Size(4.0, 4.0), org.opencv.core.Size(-1.0, -1.0), criteria)
-
-                        val subPixArray = subPixMat.toArray()
-                        fittedPoints = listOf(
-                            PointF(subPixArray[0].x.toFloat(), subPixArray[0].y.toFloat()),
-                            PointF(subPixArray[1].x.toFloat(), subPixArray[1].y.toFloat()),
-                            PointF(subPixArray[2].x.toFloat(), subPixArray[2].y.toFloat()),
-                            PointF(subPixArray[3].x.toFloat(), subPixArray[3].y.toFloat())
-                        )
+                    val candidateQuad = listOf(tl, tr, br, bl)
+                    
+                    if (validateQuadrilateral(candidateQuad, paddedRoi.width, paddedRoi.height)) {
+                        return applySubPixelRefinement(gray, paddedRoi, candidateQuad)
                     } else {
-                        fittedPoints = sortedCorners
+                        Log.w("JiSeKa Engine", "Hough 교점 기하학 검증 실패. 2순위 윤곽선 탐색으로 전환합니다.")
                     }
                 }
             }
-            return fittedPoints
+
+            val contours = mutableListOf<MatOfPoint>()
+            val hierarchy = org.opencv.core.Mat()
+            Imgproc.findContours(edgeMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+            
+            var bestContourPoints: List<PointF>? = null
+            var maxArea = 0.0
+
+            for (contour in contours) {
+                val m2f = MatOfPoint2f(*contour.toArray())
+                val peri = Imgproc.arcLength(m2f, true)
+                val approx = MatOfPoint2f()
+                Imgproc.approxPolyDP(m2f, approx, 0.02 * peri, true)
+
+                val rawPoints = approx.toArray().map { PointF(it.x.toFloat(), it.y.toFloat()) }
+                if (validateQuadrilateral(rawPoints, paddedRoi.width, paddedRoi.height)) {
+                    val contourMat = MatOfPoint(*approx.toArray())
+                    val area = abs(Imgproc.contourArea(contourMat))
+                    if (area > maxArea) {
+                        maxArea = area
+                        bestContourPoints = sortCornersStandard(rawPoints)
+                    }
+                    contourMat.release()
+                }
+                m2f.release(); approx.release()
+            }
+            hierarchy.release(); contours.forEach { it.release() }
+
+            if (bestContourPoints != null) {
+                return applySubPixelRefinement(gray, paddedRoi, bestContourPoints)
+            }
+
+            return pts
+
         } finally {
-            mat.release(); gray.release(); roiMat.release(); lines.release()
-            subPixMat?.release()
+            mat.release(); gray.release(); roiMat.release(); edgeMat.release(); lines.release()
         }
     }
 
-    data class Line(val x1: Double, val y1: Double, val x2: Double, val y2: Double, val length: Double)
+    private fun validateQuadrilateral(pts: List<PointF>, imageW: Int, imageH: Int): Boolean {
+        if (pts.size != 4) return false
+        val ordered = sortCornersStandard(pts)
+
+        val marginX = imageW * 0.5f
+        val marginY = imageH * 0.5f
+        val isInsideBounds = ordered.all {
+            it.x in -marginX..(imageW + marginX) && it.y in -marginY..(imageH + marginY)
+        }
+        if (!isInsideBounds) return false
+
+        val contour = MatOfPoint(*ordered.map { org.opencv.core.Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
+        try {
+            if (!Imgproc.isContourConvex(contour)) return false
+
+            val area = abs(Imgproc.contourArea(contour))
+            val totalArea = imageW * imageH.toDouble()
+            if (area < totalArea * 0.005 || area > totalArea * 0.7) return false
+
+            val distance = { p1: PointF, p2: PointF -> sqrt((p1.x - p2.x).pow(2) + (p1.y - p2.y).pow(2)) }
+            val topW = distance(ordered[0], ordered[1])
+            val bottomW = distance(ordered[3], ordered[2])
+            val leftH = distance(ordered[0], ordered[3])
+            val rightH = distance(ordered[1], ordered[2])
+
+            val avgW = (topW + bottomW) / 2f
+            val avgH = (leftH + rightH) / 2f
+            if (avgH <= 0f) return false
+
+            val ratio = avgW / avgH
+            if (ratio < 2.0f || ratio > 6.5f) return false
+
+            val minW = min(topW, bottomW); val maxW = max(topW, bottomW)
+            val minH = min(leftH, rightH); val maxH = max(leftH, rightH)
+            if (minW < 10f || minH < 5f || maxW / minW > 4.0f || maxH / minH > 4.0f) return false
+
+            return true
+        } finally {
+            contour.release()
+        }
+    }
+
+    private fun circularAngleDiff(a: Double, b: Double): Double {
+        val diff = abs(a - b)
+        return min(diff, 180.0 - diff)
+    }
+
+    private fun filterByDominantAngle(lines: List<Line>): List<Line> {
+        if (lines.size <= 1) return lines
+        val angleBuckets = HashMap<Int, Double>()
+        
+        for (line in lines) {
+            val normalizedAngle = ((line.angle + 90.0) % 180.0) - 90.0
+            val bucket = ((normalizedAngle + 2.5) / 5.0).toInt() * 5
+            angleBuckets[bucket] = (angleBuckets[bucket] ?: 0.0) + line.length
+        }
+        
+        val dominantBucket = angleBuckets.maxByOrNull { it.value }?.key?.toDouble() ?: return lines
+        val dominantAngle = if (dominantBucket < 0) dominantBucket + 180.0 else dominantBucket
+
+        return lines.filter { line ->
+            circularAngleDiff(line.angle, dominantAngle) <= 15.0
+        }
+    }
+
+    private fun applySubPixelRefinement(gray: org.opencv.core.Mat, roi: org.opencv.core.Rect, points: List<PointF>): List<PointF> {
+        val globalPoints = points.map { PointF(it.x + roi.x, it.y + roi.y) }
+        val sorted = sortCornersStandard(globalPoints)
+        
+        val winSizeInt = max(3, roi.width / 50)
+        val winSize = winSizeInt.toDouble()
+        
+        val isSafeToRefine = sorted.all { pt ->
+            pt.x >= winSizeInt && pt.y >= winSizeInt &&
+            pt.x < (gray.cols() - winSizeInt) && pt.y < (gray.rows() - winSizeInt)
+        }
+
+        if (!isSafeToRefine) return sorted
+
+        val subPixMat = MatOfPoint2f()
+        subPixMat.fromArray(*sorted.map { org.opencv.core.Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
+        
+        return try {
+            val searchWindow = org.opencv.core.Size(winSize, winSize)
+            val criteria = TermCriteria(TermCriteria.EPS + TermCriteria.MAX_ITER, 40, 0.01)
+            
+            Imgproc.cornerSubPix(gray, subPixMat, searchWindow, org.opencv.core.Size(-1.0, -1.0), criteria)
+            subPixMat.toArray().map { PointF(it.x.toFloat(), it.y.toFloat()) }
+        } catch (e: Exception) { sorted } finally { subPixMat.release() }
+    }
+
+    private fun mergeLinesLinearRegression(lines: List<Line>, isHorizontal: Boolean, roiWidth: Int, roiHeight: Int): Line? {
+        if (lines.isEmpty()) return null
+        if (lines.size == 1) return lines[0]
+        var sumW = 0.0; var sumX = 0.0; var sumY = 0.0
+        var sumXY = 0.0; var sumX2 = 0.0; var sumY2 = 0.0
+
+        for (line in lines) {
+            val w = line.length; sumW += w * 2.0
+            sumX += w * line.x1; sumY += w * line.y1
+            sumXY += w * line.x1 * line.y1; sumX2 += w * line.x1 * line.x1; sumY2 += w * line.y1 * line.y1
+            sumX += w * line.x2; sumY += w * line.y2
+            sumXY += w * line.x2 * line.y2; sumX2 += w * line.x2 * line.x2; sumY2 += w * line.y2 * line.y2
+        }
+        if (sumW <= 0.0) return null
+        val meanX = sumX / sumW; val meanY = sumY / sumW
+
+        return if (isHorizontal) {
+            val denom = sumX2 - sumW * meanX * meanX
+            if (abs(denom) < 1e-5) Line(meanX, 0.0, meanX, roiHeight.toDouble(), sumW, 90.0)
+            else {
+                val slope = (sumXY - sumW * meanX * meanY) / denom
+                val intercept = meanY - slope * meanX
+                Line(0.0, intercept, roiWidth.toDouble(), slope * roiWidth + intercept, sumW, Math.atan(slope) * 180.0 / Math.PI)
+            }
+        } else {
+            val denom = sumY2 - sumW * meanY * meanY
+            if (abs(denom) < 1e-5) Line(0.0, meanY, roiWidth.toDouble(), meanY, sumW, 0.0)
+            else {
+                val slope = (sumXY - sumW * meanX * meanY) / denom
+                val intercept = meanX - slope * meanY
+                Line(intercept, 0.0, slope * roiHeight + intercept, roiHeight.toDouble(), sumW, 90.0 - Math.atan(slope) * 180.0 / Math.PI)
+            }
+        }
+    }
 
     private fun getIntersection(line1: Line, line2: Line): PointF? {
-        val a1 = line1.y2 - line1.y1
-        val b1 = line1.x1 - line1.x2
-        val c1 = a1 * line1.x1 + b1 * line1.y1
-
-        val a2 = line2.y2 - line2.y1
-        val b2 = line2.x1 - line2.x2
-        val c2 = a2 * line2.x1 + b2 * line2.y1
-
+        val a1 = line1.y2 - line1.y1; val b1 = line1.x1 - line1.x2; val c1 = a1 * line1.x1 + b1 * line1.y1
+        val a2 = line2.y2 - line2.y1; val b2 = line2.x1 - line2.x2; val c2 = a2 * line2.x1 + b2 * line2.y1
         val det = a1 * b2 - a2 * b1
         if (abs(det) < 1e-6) return null
-
-        val cx = (b2 * c1 - b1 * c2) / det
-        val cy = (a1 * c2 - a2 * c1) / det
-        return PointF(cx.toFloat(), cy.toFloat())
+        return PointF(((b2 * c1 - b1 * c2) / det).toFloat(), ((a1 * c2 - a2 * c1) / det).toFloat())
     }
 
     private fun sortCornersStandard(pts: List<PointF>): List<PointF> {
         if (pts.size != 4) return pts
-        val tl = pts.minByOrNull { it.x + it.y } ?: pts[0]
-        val br = pts.maxByOrNull { it.x + it.y } ?: pts[1]
-        val tr = pts.maxByOrNull { it.x - it.y } ?: pts[2]
-        val bl = pts.minByOrNull { it.x - it.y } ?: pts[3]
-        return listOf(tl, tr, br, bl)
+        val cx = pts.map { it.x }.average().toFloat()
+        val cy = pts.map { it.y }.average().toFloat()
+
+        val radialSorted = pts.sortedBy { atan2(it.y - cy, it.x - cx) }
+
+        var startIndex = 0
+        var minSum = Float.MAX_VALUE
+        for (i in 0 until 4) {
+            val sum = radialSorted[i].x + radialSorted[i].y
+            if (sum < minSum) {
+                minSum = sum
+                startIndex = i
+            }
+        }
+
+        return listOf(
+            radialSorted[startIndex],
+            radialSorted[(startIndex + 1) % 4],
+            radialSorted[(startIndex + 2) % 4],
+            radialSorted[(startIndex + 3) % 4]
+        )
     }
 
     private fun rectifyToFlatPlate(sourceBitmap: Bitmap, pts: List<PointF>): Bitmap? {
-        val srcMat = org.opencv.core.Mat()
-        val destMat = org.opencv.core.Mat()
+        val srcMat = org.opencv.core.Mat(); val destMat = org.opencv.core.Mat()
         var flatBitmap: Bitmap? = null
-        try {
+        return try {
             Utils.bitmapToMat(sourceBitmap, srcMat)
             val targetW = 400; val targetH = 100
-            val srcPts = MatOfPoint2f(
-                org.opencv.core.Point(pts[0].x.toDouble(), pts[0].y.toDouble()),
-                org.opencv.core.Point(pts[1].x.toDouble(), pts[1].y.toDouble()),
-                org.opencv.core.Point(pts[2].x.toDouble(), pts[2].y.toDouble()),
-                org.opencv.core.Point(pts[3].x.toDouble(), pts[3].y.toDouble())
-            )
+            val srcPts = MatOfPoint2f(*pts.map { org.opencv.core.Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
             val dstPts = MatOfPoint2f(
-                org.opencv.core.Point(0.0, 0.0),
-                org.opencv.core.Point(targetW.toDouble(), 0.0),
-                org.opencv.core.Point(targetW.toDouble(), targetH.toDouble()),
-                org.opencv.core.Point(0.0, targetH.toDouble())
+                org.opencv.core.Point(0.0, 0.0), org.opencv.core.Point(targetW.toDouble(), 0.0),
+                org.opencv.core.Point(targetW.toDouble(), targetH.toDouble()), org.opencv.core.Point(0.0, targetH.toDouble())
             )
             val transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
             Imgproc.warpPerspective(srcMat, destMat, transform, org.opencv.core.Size(targetW.toDouble(), targetH.toDouble()))
-            
             flatBitmap = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(destMat, flatBitmap)
-            
-            srcPts.release(); dstPts.release(); transform.release()
-            return flatBitmap
-        } catch (e: Exception) { 
-            flatBitmap?.recycle()
-            return null 
-        } finally {
-            srcMat.release(); destMat.release()
-        }
+            srcPts.release(); dstPts.release(); transform.release(); flatBitmap
+        } catch (e: Exception) { flatBitmap?.recycle(); null } finally { srcMat.release(); destMat.release() }
     }
 
     private fun processPerspectiveOverlay(source: Bitmap, targetCorners: List<PointF>): Bitmap {
         val result = source.copy(Bitmap.Config.ARGB_8888, true)
-        val targetMat = org.opencv.core.Mat()
-        val maskMat = org.opencv.core.Mat()
-        val warpedMask = org.opencv.core.Mat()
-        val alphaMask = org.opencv.core.Mat()
+        val targetMat = org.opencv.core.Mat(); val maskMat = org.opencv.core.Mat()
+        val warpedMask = org.opencv.core.Mat(); val alphaMask = org.opencv.core.Mat()
         val finalBlended = org.opencv.core.Mat()
 
         try {
             Utils.bitmapToMat(result, targetMat)
-            
             val resId = resources.getIdentifier("plate_mask", "drawable", packageName)
             val maskBmp = if (resId != 0) BitmapFactory.decodeResource(resources, resId) 
                           else Bitmap.createBitmap(600, 150, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.LTGRAY) }
-            Utils.bitmapToMat(maskBmp, maskMat)
-            maskBmp.recycle()
+            Utils.bitmapToMat(maskBmp, maskMat); maskBmp.recycle()
 
             val srcPts = MatOfPoint2f(
                 org.opencv.core.Point(0.0, 0.0), org.opencv.core.Point(maskMat.cols().toDouble(), 0.0),
                 org.opencv.core.Point(maskMat.cols().toDouble(), maskMat.rows().toDouble()), org.opencv.core.Point(0.0, maskMat.rows().toDouble())
             )
             val sortedTargets = sortCornersStandard(targetCorners)
-            val dstPts = MatOfPoint2f(
-                org.opencv.core.Point(sortedTargets[0].x.toDouble(), sortedTargets[0].y.toDouble()),
-                org.opencv.core.Point(sortedTargets[1].x.toDouble(), sortedTargets[1].y.toDouble()),
-                org.opencv.core.Point(sortedTargets[2].x.toDouble(), sortedTargets[2].y.toDouble()),
-                org.opencv.core.Point(sortedTargets[3].x.toDouble(), sortedTargets[3].y.toDouble())
-            )
+            val dstPts = MatOfPoint2f(*sortedTargets.map { org.opencv.core.Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
+            
             val transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
             Imgproc.warpPerspective(maskMat, warpedMask, transform, targetMat.size(), Imgproc.INTER_LINEAR)
 
@@ -525,48 +612,43 @@ class MainActivity : AppCompatActivity() {
             Imgproc.threshold(alphaMask, alphaMask, 1.0, 255.0, Imgproc.THRESH_BINARY)
             Imgproc.GaussianBlur(alphaMask, alphaMask, org.opencv.core.Size(7.0, 7.0), 0.0)
 
-            val warpedMatFloat = org.opencv.core.Mat()
-            val targetMatFloat = org.opencv.core.Mat()
+            val warpedMatFloat = org.opencv.core.Mat(); val targetMatFloat = org.opencv.core.Mat()
             val alphaMaskFloat = org.opencv.core.Mat()
 
             warpedMask.convertTo(warpedMatFloat, CvType.CV_32FC4)
             targetMat.convertTo(targetMatFloat, CvType.CV_32FC4)
             alphaMask.convertTo(alphaMaskFloat, CvType.CV_32FC1, 1.0 / 255.0)
 
-            val channels = mutableListOf<org.opencv.core.Mat>()
-            Core.split(warpedMatFloat, channels)
-            
+            val warpedChannels = mutableListOf<org.opencv.core.Mat>()
+            val targetChannels = mutableListOf<org.opencv.core.Mat>()
+
+            Core.split(warpedMatFloat, warpedChannels)
+            Core.split(targetMatFloat, targetChannels)
+
+            val invAlpha = org.opencv.core.Mat()
+            Core.subtract(org.opencv.core.Mat.ones(alphaMaskFloat.size(), CvType.CV_32FC1), alphaMaskFloat, invAlpha)
+
+            val targetChan = org.opencv.core.Mat()
             for (i in 0 until 3) { 
-                Core.multiply(channels[i], alphaMaskFloat, channels[i])
-                val invAlpha = org.opencv.core.Mat()
-                Core.subtract(org.opencv.core.Mat.ones(alphaMaskFloat.size(), CvType.CV_32FC1), alphaMaskFloat, invAlpha)
-                
-                val targetChan = org.opencv.core.Mat()
-                val targetChannels = mutableListOf<org.opencv.core.Mat>()
-                Core.split(targetMatFloat, targetChannels)
+                Core.multiply(warpedChannels[i], alphaMaskFloat, warpedChannels[i])
                 Core.multiply(targetChannels[i], invAlpha, targetChan)
-                
-                Core.add(channels[i], targetChan, channels[i])
-                invAlpha.release()
-                targetChan.release()
-                targetChannels.forEach { it.release() }
+                Core.add(warpedChannels[i], targetChan, warpedChannels[i])
             }
 
-            val targetChannelsForAlpha = mutableListOf<org.opencv.core.Mat>()
-            Core.split(targetMatFloat, targetChannelsForAlpha)
-            if (channels.size > 3 && targetChannelsForAlpha.size > 3) {
-                channels[3].release()
-                channels[3] = targetChannelsForAlpha[3].clone()
+            if (warpedChannels.size > 3 && targetChannels.size > 3) {
+                warpedChannels[3].release()
+                warpedChannels[3] = targetChannels[3].clone()
             }
-            targetChannelsForAlpha.forEach { it.release() }
             
-            Core.merge(channels, finalBlended)
+            Core.merge(warpedChannels, finalBlended)
             finalBlended.convertTo(finalBlended, CvType.CV_8UC4)
             Utils.matToBitmap(finalBlended, result)
 
+            invAlpha.release(); targetChan.release()
             srcPts.release(); dstPts.release(); transform.release()
             warpedMatFloat.release(); targetMatFloat.release(); alphaMaskFloat.release()
-            channels.forEach { it.release() }
+            warpedChannels.forEach { it.release() }
+            targetChannels.forEach { it.release() }
 
             return result
         } finally {
@@ -594,40 +676,29 @@ class MainActivity : AppCompatActivity() {
         if (requestCode == REQUEST_CODE_PERMISSIONS && allPermissionsGranted()) viewFinder?.post { startCamera() }
     }
 
+    // 🚨 네이티브 캡처 시 프리뷰 정지 화면(nativeBackgroundView)을 즉각 띄워 
+    // IPC 통신 지연 중에도 완벽한 시각적 연속성을 보장
     private fun takePhoto() {
-        // 🚨 [개선] 경합 방어 로직 진입점: 처리 중일 때 중복 촬영 차단
-        if (isProcessing) {
-            Log.w("JiSeKa Engine", "중복 촬영 요청 무시 (Race condition 방어)")
-            return
-        }
+        if (isProcessing) return
         isProcessing = true
-
-        val capture = imageCapture ?: run {
-            isProcessing = false
-            return
-        }
+        val capture = imageCapture ?: run { isProcessing = false; return }
         
         capture.takePicture(cameraExecutor, object : ImageCapture.OnImageCapturedCallback() {
             override fun onCaptureSuccess(image: ImageProxy) {
-                val bitmap = image.toBitmapExt()
-                image.close()
-                synchronized(bitmapLock) { 
-                    lastCapturedBitmap?.recycle()
-                    lastCapturedBitmap = bitmap 
-                }
+                val bitmap = image.toBitmapExt(); image.close()
+                synchronized(bitmapLock) { lastCapturedBitmap?.recycle(); lastCapturedBitmap = bitmap }
+                
+                val previewUri = saveBitmapToCacheFile(bitmap) ?: ""
+                val safeEscapedUri = JSONObject.quote(previewUri)
                 
                 runOnUiThread { 
                     viewFinder?.visibility = View.INVISIBLE
                     nativeBackgroundView?.setImageBitmap(bitmap)
                     nativeBackgroundView?.visibility = View.VISIBLE
-                    webView?.evaluateJavascript("window.onNativePhotoCaptured()", null)
+                    webView?.evaluateJavascript("window.onNativePhotoCaptured($safeEscapedUri)", null)
                 }
             }
-            override fun onError(e: ImageCaptureException) { 
-                Log.e("JiSeKa", "Capture failed", e)
-                // 🚨 [개선] 캡처 실패 시 다시 시도할 수 있도록 상태 락 해제
-                isProcessing = false
-            }
+            override fun onError(e: ImageCaptureException) { isProcessing = false }
         })
     }
 
@@ -659,16 +730,9 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() { 
         super.onDestroy()
-        cameraExecutor.shutdown()
-        analysisExecutor.shutdown()
-        recognizer.close()
-        
+        cameraExecutor.shutdown(); analysisExecutor.shutdown(); recognizer.close()
         try { cachedPreviewFile?.let { if (it.exists()) it.delete() } } catch (e: Exception) {}
-
-        synchronized(bitmapLock) {
-            lastCapturedBitmap?.recycle()
-            lastCapturedBitmap = null
-        }
+        synchronized(bitmapLock) { lastCapturedBitmap?.recycle(); lastCapturedBitmap = null }
     }
 
     companion object {
