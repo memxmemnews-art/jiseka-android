@@ -123,8 +123,8 @@ class MainActivity : AppCompatActivity() {
             webChromeClient = WebChromeClient()
             addJavascriptInterface(AndroidBridge(), "AndroidBridge")
             
-            // 🚨 [웹 주소로 변경 완료]: 로컬 에셋 파일 대신 깃허브 웹 주소를 로드하도록 수정되었습니다.
-            loadUrl("https://memxmemnews-art.github.io/jiseka-android/app/src/main/assets/index.html")
+            // 🚨 Vercel 서버의 실시간 라이브 주소로 로드하도록 수정되었습니다.
+            loadUrl("https://ziseka-app.vercel.app/")
         }
     }
 
