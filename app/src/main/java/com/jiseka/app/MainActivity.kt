@@ -87,7 +87,8 @@ class MainActivity : AppCompatActivity() {
 
         viewFinder?.apply {
             scaleType = PreviewView.ScaleType.FIT_CENTER
-            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+            // [해결책 4] COMPATIBLE(TextureView) 대신 PERFORMANCE(SurfaceView) 모드 사용하여 블랙 스크린 회피
+            implementationMode = PreviewView.ImplementationMode.PERFORMANCE
         }
 
         setupWebView()
@@ -137,7 +138,8 @@ class MainActivity : AppCompatActivity() {
                     viewFinder?.visibility = View.VISIBLE
                     nativeBackgroundView?.visibility = View.GONE
                 } else {
-                    viewFinder?.visibility = View.INVISIBLE
+                    // [해결책 3] INVISIBLE 대신 GONE을 사용하여 GPU Surface 레이어 충돌 차단
+                    viewFinder?.visibility = View.GONE
                     nativeBackgroundView?.visibility = View.GONE
                 }
             }
@@ -148,15 +150,14 @@ class MainActivity : AppCompatActivity() {
             analysisExecutor.execute {
                 var processingBitmap: Bitmap? = null
                 try {
-                    // [안전성] 뷰에 바인딩된 원본이 수정되거나 리사이클되지 않도록 복사본(copy)을 사용하여 격리
                     val rawBitmap = synchronized(bitmapLock) { 
                         lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) 
                     } ?: return@execute
 
                     processingBitmap = scaleBitmapDownToLimit(rawBitmap, 1920, 1080)
-                    if (processingBitmap !== rawBitmap) {
-                        rawBitmap.recycle()
-                    }
+
+                    // [해결책 2] 수동 recycle() 제거: GC에 위임
+                    // if (processingBitmap !== rawBitmap) { rawBitmap.recycle() } (제거됨)
 
                     val bmpW = processingBitmap.width.toFloat()
                     val bmpH = processingBitmap.height.toFloat()
@@ -223,10 +224,11 @@ class MainActivity : AppCompatActivity() {
                     overlayResult = processPerspectiveOverlay(baseBitmap, pts)
                     saveBitmapToGallery(overlayResult!!)
                     runOnUiThread { webView?.evaluateJavascript("window.onNativeSaveComplete()", null) }
-                } finally { 
-                    baseBitmap?.recycle()
-                    overlayResult?.let { if (it !== baseBitmap) it.recycle() }
+                } catch (e: Exception) {
+                    Log.e("JiSeKa Engine", "오버레이 저장 실패", e)
                 }
+                // [해결책 2] 수동 recycle() 제거: GC에 위임
+                // finally 블록 전체 제거됨
             }
         }
         
@@ -252,28 +254,20 @@ class MainActivity : AppCompatActivity() {
         if (flatBmp != null) {
             val inputImage = InputImage.fromBitmap(flatBmp, 0)
             recognizer.process(inputImage).addOnCompleteListener { task ->
-                try {
-                    val finalPoints = if (task.isSuccessful && isValidLicensePlatePattern(task.result.text)) {
-                        targetPoints
-                    } else {
-                        fallbackPoints
-                    }
-                    val previewBitmap = processPerspectiveOverlay(sourceBitmap, finalPoints)
-                    val fileUriStr = saveBitmapToCacheFile(previewBitmap)
-                    sendCachedPreviewToJs(finalPoints, fileUriStr, bmpW, bmpH)
-                    previewBitmap.recycle()
-                } finally {
-                    flatBmp.recycle()
-                    sourceBitmap.recycle()
+                val finalPoints = if (task.isSuccessful && isValidLicensePlatePattern(task.result.text)) {
+                    targetPoints
+                } else {
+                    fallbackPoints
                 }
+                val previewBitmap = processPerspectiveOverlay(sourceBitmap, finalPoints)
+                val fileUriStr = saveBitmapToCacheFile(previewBitmap)
+                sendCachedPreviewToJs(finalPoints, fileUriStr, bmpW, bmpH)
+                // [해결책 2] 수동 recycle() 제거: previewBitmap, flatBmp, sourceBitmap 처리 위임
             }
         } else {
-            try {
-                val fileUriStr = saveBitmapToCacheFile(sourceBitmap)
-                sendCachedPreviewToJs(fallbackPoints, fileUriStr, bmpW, bmpH)
-            } finally {
-                sourceBitmap.recycle()
-            }
+            val fileUriStr = saveBitmapToCacheFile(sourceBitmap)
+            sendCachedPreviewToJs(fallbackPoints, fileUriStr, bmpW, bmpH)
+            // [해결책 2] 수동 recycle() 제거
         }
     }
 
@@ -641,7 +635,6 @@ class MainActivity : AppCompatActivity() {
             transform.release()
             flatBitmap
         } catch (e: Exception) { 
-            flatBitmap?.recycle()
             null 
         } finally { 
             srcMat.release()
@@ -765,7 +758,6 @@ class MainActivity : AppCompatActivity() {
                 try {
                     val bitmap = image.toBitmapExt()
                     
-                    // [안전성] GC에 수명 관리를 위임하여 뷰 랜더링 충돌(recycled bitmap usage) 원천 차단
                     synchronized(bitmapLock) { 
                         lastCapturedBitmap = bitmap 
                     }
@@ -778,8 +770,12 @@ class MainActivity : AppCompatActivity() {
                             
                             val safeEscapedUri = JSONObject.quote(previewUri)
                             
-                            viewFinder?.visibility = View.INVISIBLE
-                            nativeBackgroundView?.setImageBitmap(bitmap)
+                            // [해결책 3] INVISIBLE 대신 GONE 사용 (Surface 겹침 방지)
+                            viewFinder?.visibility = View.GONE
+                            
+                            // [해결책 1] 원본 Bitmap 공유 절대 금지 -> UI 전용 복사본(copy) 생성 및 바인딩
+                            val uiBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false)
+                            nativeBackgroundView?.setImageBitmap(uiBitmap)
                             nativeBackgroundView?.visibility = View.VISIBLE
                             
                             webView?.evaluateJavascript("window.onNativePhotoCaptured($safeEscapedUri)", null)
@@ -826,7 +822,6 @@ class MainActivity : AppCompatActivity() {
                     throw RuntimeException("Invalid YUV planes: ${planes.size}")
                 }
                 
-                // [핵심 교정]: YUV stride(패딩)를 정확히 계산하여 이미지 깨짐/초록줄 현상 차단
                 val yPlane = planes[0]
                 val uPlane = planes[1]
                 val vPlane = planes[2]
@@ -838,7 +833,6 @@ class MainActivity : AppCompatActivity() {
                 val nv21 = ByteArray(width * height * 3 / 2)
                 var pos = 0
 
-                // Y plane 추출 (rowStride 고려)
                 val yRowStride = yPlane.rowStride
                 for (row in 0 until height) {
                     yBuffer.position(row * yRowStride)
@@ -846,7 +840,6 @@ class MainActivity : AppCompatActivity() {
                     pos += width
                 }
 
-                // V, U plane 추출 (NV21 포맷 요구사항: V U V U...)
                 val uvHeight = height / 2
                 val uvWidth = width / 2
                 val vRowStride = vPlane.rowStride
@@ -875,19 +868,17 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // [핵심 교정] 메모리(OOM) 방지: 원본 크기 상태에서 먼저 스케일링 수행
-        // 단, 회전 전이므로 기기 센서 방향에 따라 타겟 한계치(가로/세로)를 동적으로 스왑(Swap) 적용
         val isLandscape = imageInfo.rotationDegrees % 180 == 0
         val targetW = if (isLandscape) 1920 else 1080
         val targetH = if (isLandscape) 1080 else 1920
         
         val scaledBitmap = scaleBitmapDownToLimit(bitmap, targetW, targetH)
         
+        // 함수 내부의 생명주기가 끝나는 중간 객체만 안전하게 즉시 해제
         if (scaledBitmap !== bitmap) {
             bitmap.recycle()
         }
 
-        // 축소 완료된 안전한 이미지를 최종 방향에 맞게 회전
         val matrix = Matrix().apply { 
             postRotate(imageInfo.rotationDegrees.toFloat()) 
         }
@@ -928,8 +919,8 @@ class MainActivity : AppCompatActivity() {
         analysisExecutor.shutdown()
         recognizer.close()
         try { cachedPreviewFile?.let { if (it.exists()) it.delete() } } catch (e: Exception) {}
+        // [해결책 2] 수동 recycle() 제거 (lastCapturedBitmap GC 위임)
         synchronized(bitmapLock) { 
-            lastCapturedBitmap?.recycle()
             lastCapturedBitmap = null 
         }
     }
