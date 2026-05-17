@@ -20,6 +20,8 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.webkit.WebViewAssetLoader
+import androidx.webkit.WebViewClientCompat
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
@@ -66,6 +68,9 @@ class MainActivity : AppCompatActivity() {
     private val bitmapLock = Any()
 
     private var cachedPreviewFile: File? = null
+    
+    // [해결책] WebViewAssetLoader 선언
+    private lateinit var assetLoader: WebViewAssetLoader
 
     private val recognizer by lazy { 
         TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build()) 
@@ -83,11 +88,19 @@ class MainActivity : AppCompatActivity() {
         nativeBackgroundView = findViewById(R.id.nativeBackgroundView)
         webView = findViewById(R.id.webView)
 
-        cachedPreviewFile = File(externalCacheDir ?: cacheDir, "preview_cache.jpg")
+        // 캐시 파일 설정 (AssetLoader와 경로를 맞추기 위해 내부 cacheDir 사용)
+        cachedPreviewFile = File(cacheDir, "preview_cache.jpg")
+
+        // [해결책] WebViewAssetLoader 초기화 (로컬 파일을 가상 HTTPS 도메인으로 서빙)
+        assetLoader = WebViewAssetLoader.Builder()
+            .addPathHandler(
+                "/cache/",
+                WebViewAssetLoader.InternalStoragePathHandler(this, cacheDir)
+            )
+            .build()
 
         viewFinder?.apply {
             scaleType = PreviewView.ScaleType.FIT_CENTER
-            // [해결책 4] COMPATIBLE(TextureView) 대신 PERFORMANCE(SurfaceView) 모드 사용하여 블랙 스크린 회피
             implementationMode = PreviewView.ImplementationMode.PERFORMANCE
         }
 
@@ -115,10 +128,22 @@ class MainActivity : AppCompatActivity() {
                 allowContentAccess = true
                 allowFileAccessFromFileURLs = true
                 allowUniversalAccessFromFileURLs = true
+                // [해결책] HTTPS 페이지 안에서의 다양한 콘텐츠 로드 허용
+                mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             }
-            webViewClient = object : WebViewClient() {
-                override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?) = false
+            
+            // [해결책] WebViewClientCompat을 사용하여 AssetLoader로 리소스 요청 가로채기
+            webViewClient = object : WebViewClientCompat() {
+                override fun shouldInterceptRequest(
+                    view: WebView,
+                    request: WebResourceRequest
+                ): WebResourceResponse? {
+                    return assetLoader.shouldInterceptRequest(request.url)
+                }
+
+                override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest) = false
             }
+            
             webChromeClient = WebChromeClient()
             addJavascriptInterface(AndroidBridge(), "AndroidBridge")
             
@@ -138,7 +163,6 @@ class MainActivity : AppCompatActivity() {
                     viewFinder?.visibility = View.VISIBLE
                     nativeBackgroundView?.visibility = View.GONE
                 } else {
-                    // [해결책 3] INVISIBLE 대신 GONE을 사용하여 GPU Surface 레이어 충돌 차단
                     viewFinder?.visibility = View.GONE
                     nativeBackgroundView?.visibility = View.GONE
                 }
@@ -155,9 +179,6 @@ class MainActivity : AppCompatActivity() {
                     } ?: return@execute
 
                     processingBitmap = scaleBitmapDownToLimit(rawBitmap, 1920, 1080)
-
-                    // [해결책 2] 수동 recycle() 제거: GC에 위임
-                    // if (processingBitmap !== rawBitmap) { rawBitmap.recycle() } (제거됨)
 
                     val bmpW = processingBitmap.width.toFloat()
                     val bmpH = processingBitmap.height.toFloat()
@@ -227,8 +248,6 @@ class MainActivity : AppCompatActivity() {
                 } catch (e: Exception) {
                     Log.e("JiSeKa Engine", "오버레이 저장 실패", e)
                 }
-                // [해결책 2] 수동 recycle() 제거: GC에 위임
-                // finally 블록 전체 제거됨
             }
         }
         
@@ -262,12 +281,10 @@ class MainActivity : AppCompatActivity() {
                 val previewBitmap = processPerspectiveOverlay(sourceBitmap, finalPoints)
                 val fileUriStr = saveBitmapToCacheFile(previewBitmap)
                 sendCachedPreviewToJs(finalPoints, fileUriStr, bmpW, bmpH)
-                // [해결책 2] 수동 recycle() 제거: previewBitmap, flatBmp, sourceBitmap 처리 위임
             }
         } else {
             val fileUriStr = saveBitmapToCacheFile(sourceBitmap)
             sendCachedPreviewToJs(fallbackPoints, fileUriStr, bmpW, bmpH)
-            // [해결책 2] 수동 recycle() 제거
         }
     }
 
@@ -275,13 +292,18 @@ class MainActivity : AppCompatActivity() {
         return try {
             cachedPreviewFile?.let { file ->
                 if (file.exists()) file.delete()
+                
                 FileOutputStream(file).use { out -> 
                     bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
                     out.flush() 
                 }
-                "file://${file.absolutePath}?t=${System.currentTimeMillis()}"
+                // [해결책] WebViewAssetLoader의 가상 HTTPS 주소로 반환하여 CORS 차단 원천 봉쇄
+                "https://appassets.androidplatform.net/cache/preview_cache.jpg?t=${System.currentTimeMillis()}"
             }
-        } catch (e: Exception) { null }
+        } catch (e: Exception) { 
+            Log.e("JiSeKa Engine", "캐시 저장 실패", e)
+            null 
+        }
     }
 
     private fun sendCachedPreviewToJs(points: List<PointF>, fileUriStr: String?, bmpW: Float, bmpH: Float) {
@@ -770,10 +792,8 @@ class MainActivity : AppCompatActivity() {
                             
                             val safeEscapedUri = JSONObject.quote(previewUri)
                             
-                            // [해결책 3] INVISIBLE 대신 GONE 사용 (Surface 겹침 방지)
                             viewFinder?.visibility = View.GONE
                             
-                            // [해결책 1] 원본 Bitmap 공유 절대 금지 -> UI 전용 복사본(copy) 생성 및 바인딩
                             val uiBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false)
                             nativeBackgroundView?.setImageBitmap(uiBitmap)
                             nativeBackgroundView?.visibility = View.VISIBLE
@@ -874,7 +894,6 @@ class MainActivity : AppCompatActivity() {
         
         val scaledBitmap = scaleBitmapDownToLimit(bitmap, targetW, targetH)
         
-        // 함수 내부의 생명주기가 끝나는 중간 객체만 안전하게 즉시 해제
         if (scaledBitmap !== bitmap) {
             bitmap.recycle()
         }
@@ -919,7 +938,6 @@ class MainActivity : AppCompatActivity() {
         analysisExecutor.shutdown()
         recognizer.close()
         try { cachedPreviewFile?.let { if (it.exists()) it.delete() } } catch (e: Exception) {}
-        // [해결책 2] 수동 recycle() 제거 (lastCapturedBitmap GC 위임)
         synchronized(bitmapLock) { 
             lastCapturedBitmap = null 
         }
