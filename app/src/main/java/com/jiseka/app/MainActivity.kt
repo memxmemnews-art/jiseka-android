@@ -148,6 +148,7 @@ class MainActivity : AppCompatActivity() {
             analysisExecutor.execute {
                 var processingBitmap: Bitmap? = null
                 try {
+                    // [안전성] 뷰에 바인딩된 원본이 수정되거나 리사이클되지 않도록 복사본(copy)을 사용하여 격리
                     val rawBitmap = synchronized(bitmapLock) { 
                         lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) 
                     } ?: return@execute
@@ -764,6 +765,7 @@ class MainActivity : AppCompatActivity() {
                 try {
                     val bitmap = image.toBitmapExt()
                     
+                    // [안전성] GC에 수명 관리를 위임하여 뷰 랜더링 충돌(recycled bitmap usage) 원천 차단
                     synchronized(bitmapLock) { 
                         lastCapturedBitmap = bitmap 
                     }
@@ -811,40 +813,100 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun ImageProxy.toBitmapExt(): Bitmap {
-        val yBuffer = planes[0].buffer
-        val uBuffer = planes[1].buffer
-        val vBuffer = planes[2].buffer
-        val ySize = yBuffer.remaining()
-        val uSize = uBuffer.remaining()
-        val vSize = vBuffer.remaining()
-        val nv21 = ByteArray(ySize + uSize + vSize)
+        val bitmap = when (format) {
+            ImageFormat.JPEG -> {
+                val buffer = planes[0].buffer
+                val bytes = ByteArray(buffer.remaining())
+                buffer.get(bytes)
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    ?: throw RuntimeException("JPEG decode failed")
+            }
+            ImageFormat.YUV_420_888 -> {
+                if (planes.size < 3) {
+                    throw RuntimeException("Invalid YUV planes: ${planes.size}")
+                }
+                
+                // [핵심 교정]: YUV stride(패딩)를 정확히 계산하여 이미지 깨짐/초록줄 현상 차단
+                val yPlane = planes[0]
+                val uPlane = planes[1]
+                val vPlane = planes[2]
+
+                val yBuffer = yPlane.buffer
+                val uBuffer = uPlane.buffer
+                val vBuffer = vPlane.buffer
+
+                val nv21 = ByteArray(width * height * 3 / 2)
+                var pos = 0
+
+                // Y plane 추출 (rowStride 고려)
+                val yRowStride = yPlane.rowStride
+                for (row in 0 until height) {
+                    yBuffer.position(row * yRowStride)
+                    yBuffer.get(nv21, pos, width)
+                    pos += width
+                }
+
+                // V, U plane 추출 (NV21 포맷 요구사항: V U V U...)
+                val uvHeight = height / 2
+                val uvWidth = width / 2
+                val vRowStride = vPlane.rowStride
+                val vPixelStride = vPlane.pixelStride
+                val uRowStride = uPlane.rowStride
+                val uPixelStride = uPlane.pixelStride
+
+                for (row in 0 until uvHeight) {
+                    for (col in 0 until uvWidth) {
+                        vBuffer.position(row * vRowStride + col * vPixelStride)
+                        nv21[pos++] = vBuffer.get()
+                        uBuffer.position(row * uRowStride + col * uPixelStride)
+                        nv21[pos++] = uBuffer.get()
+                    }
+                }
+                
+                val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+                
+                ByteArrayOutputStream().use { out ->
+                    yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 100, out)
+                    BitmapFactory.decodeByteArray(out.toByteArray(), 0, out.size())
+                } ?: throw RuntimeException("YUV decode failed")
+            }
+            else -> {
+                throw RuntimeException("Unsupported image format: $format")
+            }
+        }
+
+        // [핵심 교정] 메모리(OOM) 방지: 원본 크기 상태에서 먼저 스케일링 수행
+        // 단, 회전 전이므로 기기 센서 방향에 따라 타겟 한계치(가로/세로)를 동적으로 스왑(Swap) 적용
+        val isLandscape = imageInfo.rotationDegrees % 180 == 0
+        val targetW = if (isLandscape) 1920 else 1080
+        val targetH = if (isLandscape) 1080 else 1920
         
-        yBuffer.get(nv21, 0, ySize)
-        vBuffer.get(nv21, ySize, vSize)
-        uBuffer.get(nv21, ySize + vSize, uSize)
+        val scaledBitmap = scaleBitmapDownToLimit(bitmap, targetW, targetH)
         
-        val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
-        
-        val bitmap = ByteArrayOutputStream().use { out ->
-            yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 100, out)
-            BitmapFactory.decodeByteArray(out.toByteArray(), 0, out.size())
-        } ?: throw RuntimeException("Bitmap decode failed: Out of memory or corrupted data")
-        
-        val matrix = Matrix().apply { postRotate(imageInfo.rotationDegrees.toFloat()) }
-        
-        val rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-        
-        if (bitmap !== rotatedBitmap) {
+        if (scaledBitmap !== bitmap) {
             bitmap.recycle()
         }
 
-        val scaledBitmap = scaleBitmapDownToLimit(rotatedBitmap, 1920, 1080)
+        // 축소 완료된 안전한 이미지를 최종 방향에 맞게 회전
+        val matrix = Matrix().apply { 
+            postRotate(imageInfo.rotationDegrees.toFloat()) 
+        }
+        
+        val rotatedBitmap = Bitmap.createBitmap(
+            scaledBitmap, 
+            0, 
+            0, 
+            scaledBitmap.width, 
+            scaledBitmap.height, 
+            matrix, 
+            true
+        )
         
         if (rotatedBitmap !== scaledBitmap) {
-            rotatedBitmap.recycle()
+            scaledBitmap.recycle()
         }
 
-        return scaledBitmap
+        return rotatedBitmap
     }
 
     private fun saveBitmapToGallery(bitmap: Bitmap) {
