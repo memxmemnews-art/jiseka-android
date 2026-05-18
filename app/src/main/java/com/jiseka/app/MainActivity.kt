@@ -27,6 +27,7 @@ import android.webkit.WebView
 import android.widget.ImageView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.core.AspectRatio
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
@@ -192,7 +193,6 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread { 
                 if (isDestroyed || isFinishing) return@runOnUiThread
                 if (isVisible) {
-                    // 다시 찍기(재시도)를 눌러서 카메라가 활성화될 때 lock을 안전하게 해제
                     isProcessing = false
                     viewFinder?.visibility = View.VISIBLE
                     nativeBackgroundView?.visibility = View.GONE
@@ -205,19 +205,18 @@ class MainActivity : AppCompatActivity() {
 
         @JavascriptInterface
         fun analyzePlateWithMode(cornersJsonStr: String, mode: String) {
-            // 브릿지가 유실되지 않고 호출되었는지 검증하기 위한 디버그 로그 배치
             Log.d("JiSeKa Engine", "JS -> Android 브릿지 정상 호출됨: analyzePlateWithMode")
             
             analysisExecutor.execute {
                 if (isDestroyed || isFinishing) return@execute
                 
-                var processingBitmap: Bitmap? = null
                 try {
                     val rawBitmap = synchronized(bitmapLock) { 
                         lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) 
                     } ?: return@execute
 
-                    processingBitmap = scaleBitmapDownToLimit(rawBitmap, 1920, 1080)
+                    // 분석용 맵
+                    val processingBitmap = scaleBitmapDownToLimit(rawBitmap, 1920, 1080)
                     if (processingBitmap !== rawBitmap) rawBitmap.recycle()
 
                     val bmpW = processingBitmap.width.toFloat()
@@ -228,6 +227,7 @@ class MainActivity : AppCompatActivity() {
                     val inputCorners = JSONObject(cornersJsonStr).getJSONArray("corners")
                     val mappedPoints = mutableListOf<PointF>()
 
+                    // 💡 [핵심] fitCenter일 때의 레터박스 간극(Offset)과 배율(Scale)을 계산하여 좌표 동기화
                     val scale = min(viewW / bmpW, viewH / bmpH)
                     val displayedW = bmpW * scale
                     val displayedH = bmpH * scale
@@ -242,6 +242,7 @@ class MainActivity : AppCompatActivity() {
                         val screenPixelX = normX * viewW
                         val screenPixelY = normY * viewH
 
+                        // 실제 비트맵 상의 픽셀 좌표로 역산
                         val targetBmpX = ((screenPixelX - offsetX) / scale).coerceIn(0f, bmpW - 1f)
                         val targetBmpY = ((screenPixelY - offsetY) / scale).coerceIn(0f, bmpH - 1f)
                         mappedPoints.add(PointF(targetBmpX, targetBmpY))
@@ -863,9 +864,20 @@ class MainActivity : AppCompatActivity() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             val cameraProvider = cameraProviderFuture.get()
-            val preview = Preview.Builder().build().also { it.setSurfaceProvider(viewFinder?.surfaceProvider) }
-            imageCapture = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-                .setTargetResolution(Size(1920, 1080)).build()
+            
+            // 💡 [핵심 해결] 비율 일치
+            val targetRatio = AspectRatio.RATIO_16_9 
+
+            val preview = Preview.Builder()
+                .setTargetAspectRatio(targetRatio)
+                .build()
+                .also { it.setSurfaceProvider(viewFinder?.surfaceProvider) }
+
+            imageCapture = ImageCapture.Builder()
+                .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                .setTargetAspectRatio(targetRatio)
+                .build()
+
             try {
                 cameraProvider.unbindAll()
                 cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageCapture)
@@ -895,7 +907,9 @@ class MainActivity : AppCompatActivity() {
         capture.takePicture(outputOptions, cameraExecutor, object : ImageCapture.OnImageSavedCallback {
             override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
                 try {
-                    val safeBitmap = loadSafeBitmap(photoFile.absolutePath, 1920, 1080)
+                    val targetW = viewFinder?.width ?: 1080
+                    val targetH = viewFinder?.height ?: 1920
+                    val safeBitmap = loadSafeBitmap(photoFile.absolutePath, targetW, targetH)
                     
                     synchronized(bitmapLock) { 
                         lastCapturedBitmap?.let {
@@ -921,6 +935,7 @@ class MainActivity : AppCompatActivity() {
                             if (!it.isRecycled) it.recycle()
                         }
 
+                        // UI 렌더링용 크기 최적화 방어
                         val previewW = max(1, safeBitmap.width / 2)
                         val previewH = max(1, safeBitmap.height / 2)
                         
@@ -939,7 +954,7 @@ class MainActivity : AppCompatActivity() {
                     Log.e("JiSeKa Engine", "비트맵 적재 중 크래시 발생", t)
                     runOnUiThread {
                         if (!isDestroyed && !isFinishing) {
-                            isProcessing = false
+                            isProcessing = false // 💡 에러 발생 시 확실히 락 해제
                             viewFinder?.visibility = View.VISIBLE
                             nativeBackgroundView?.visibility = View.GONE
                             Toast.makeText(this@MainActivity, "사진 처리 중 문제가 발생했습니다.", Toast.LENGTH_SHORT).show()
@@ -951,7 +966,7 @@ class MainActivity : AppCompatActivity() {
             override fun onError(e: ImageCaptureException) { 
                 runOnUiThread {
                     if (!isDestroyed && !isFinishing) {
-                        isProcessing = false
+                        isProcessing = false // 💡 에러 발생 시 확실히 락 해제
                         Toast.makeText(this@MainActivity, "캡처 실패: ${e.message}", Toast.LENGTH_SHORT).show()
                     }
                 }
