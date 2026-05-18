@@ -409,12 +409,9 @@ class MainActivity : AppCompatActivity() {
             Utils.bitmapToMat(bitmap, mat)
             Imgproc.cvtColor(mat, gray, Imgproc.COLOR_RGBA2GRAY)
             
+            // [수정됨] CLAHE 객체의 release()를 제거하여 OpenCV 라이브러리의 Unresolved reference 오류 해결
             val claheObj = Imgproc.createCLAHE(2.5, org.opencv.core.Size(8.0, 8.0))
-            try {
-                claheObj.apply(gray, gray)
-            } finally {
-                claheObj.release()
-            }
+            claheObj.apply(gray, gray)
             
             val xs = pts.map { it.x }
             val ys = pts.map { it.y }
@@ -618,7 +615,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // [개선 1] 한 줄로 된 try-catch-finally를 완전한 블록 구조로 전면 분리하여 CI 빌드 에러 차단
     private fun applySubPixelRefinement(gray: org.opencv.core.Mat, roi: org.opencv.core.Rect, points: List<PointF>): List<PointF> {
         val globalPoints = points.map { PointF(it.x + roi.x, it.y + roi.y) }
         val sorted = sortCornersStandard(globalPoints)
@@ -746,7 +742,6 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    // [개선 1] 한 줄로 된 try-catch-finally를 완전한 블록 구조로 전면 분리
     private fun rectifyToFlatPlate(sourceBitmap: Bitmap, pts: List<PointF>): Bitmap? {
         val srcMat = org.opencv.core.Mat()
         val destMat = org.opencv.core.Mat()
@@ -922,7 +917,6 @@ class MainActivity : AppCompatActivity() {
                             if (!it.isRecycled) it.recycle()
                         }
 
-                        // [개선 3] 가로/세로 1픽셀 이미지가 입력될 경우 IllegalArgumentException 방어
                         val previewW = max(1, safeBitmap.width / 2)
                         val previewH = max(1, safeBitmap.height / 2)
                         
@@ -1027,6 +1021,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all { ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED }
 
+    // [수정됨] 삭제 대상이었던 변수(cachedPreviewFile) 참조 코드를 완전히 제거했습니다.
     override fun onDestroy() { 
         synchronized(bitmapLock) { 
             lastCapturedBitmap?.let {
@@ -1044,7 +1039,7 @@ class MainActivity : AppCompatActivity() {
         cameraExecutor.shutdownNow()
         analysisExecutor.shutdownNow()
         
-        try { cachedPreviewFile?.let { if (it.exists()) it.delete() } } catch (e: Exception) {}
+        previewDir.listFiles()?.forEach { it.delete() }
         
         webView?.apply {
             stopLoading()
