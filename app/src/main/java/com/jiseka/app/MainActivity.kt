@@ -192,6 +192,7 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread { 
                 if (isDestroyed || isFinishing) return@runOnUiThread
                 if (isVisible) {
+                    // 다시 찍기(재시도)를 눌러서 카메라가 활성화될 때 lock을 안전하게 해제
                     isProcessing = false
                     viewFinder?.visibility = View.VISIBLE
                     nativeBackgroundView?.visibility = View.GONE
@@ -204,6 +205,9 @@ class MainActivity : AppCompatActivity() {
 
         @JavascriptInterface
         fun analyzePlateWithMode(cornersJsonStr: String, mode: String) {
+            // 브릿지가 유실되지 않고 호출되었는지 검증하기 위한 디버그 로그 배치
+            Log.d("JiSeKa Engine", "JS -> Android 브릿지 정상 호출됨: analyzePlateWithMode")
+            
             analysisExecutor.execute {
                 if (isDestroyed || isFinishing) return@execute
                 
@@ -292,7 +296,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
-        
+       
         @JavascriptInterface
         fun showToast(msg: String) {
             runOnUiThread { 
@@ -384,7 +388,7 @@ class MainActivity : AppCompatActivity() {
     private fun sendCachedPreviewToJs(points: List<PointF>, fileUriStr: String?, bmpW: Float, bmpH: Float) {
         val outputArray = JSONArray()
         for (pt in points) { outputArray.put(JSONObject().put("x", (pt.x / bmpW).toDouble()).put("y", (pt.y / bmpH).toDouble())) }
-        
+       
         val resultJson = JSONObject().apply { 
             put("corners", outputArray)
             put("preview", fileUriStr ?: JSONObject.NULL) 
@@ -409,10 +413,9 @@ class MainActivity : AppCompatActivity() {
             Utils.bitmapToMat(bitmap, mat)
             Imgproc.cvtColor(mat, gray, Imgproc.COLOR_RGBA2GRAY)
             
-            // [수정됨] CLAHE 객체의 release()를 제거하여 OpenCV 라이브러리의 Unresolved reference 오류 해결
             val claheObj = Imgproc.createCLAHE(2.5, org.opencv.core.Size(8.0, 8.0))
             claheObj.apply(gray, gray)
-            
+           
             val xs = pts.map { it.x }
             val ys = pts.map { it.y }
             val baseMinX = max(0, xs.minOrNull()?.toInt() ?: 0)
@@ -485,7 +488,7 @@ class MainActivity : AppCompatActivity() {
                 val bl = getIntersection(bEdge, lEdge)
                 if (tl != null && tr != null && br != null && bl != null) {
                     val candidateQuad = listOf(tl, tr, br, bl)
-                    
+                        
                     if (validateQuadrilateral(candidateQuad, paddedRoi.width, paddedRoi.height)) {
                         return applySubPixelRefinement(gray, paddedRoi, candidateQuad)
                     } else {
@@ -497,7 +500,7 @@ class MainActivity : AppCompatActivity() {
             val contours = mutableListOf<MatOfPoint>()
             val hierarchy = org.opencv.core.Mat()
             Imgproc.findContours(edgeMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
-            
+             
             var bestContourPoints: List<PointF>? = null
             var maxArea = 0.0
 
@@ -623,8 +626,7 @@ class MainActivity : AppCompatActivity() {
         val winSize = winSizeInt.toDouble()
         
         val isSafeToRefine = sorted.all { pt ->
-            pt.x >= winSizeInt && pt.y >= winSizeInt &&
-            pt.x < (gray.cols() - winSizeInt) && pt.y < (gray.rows() - winSizeInt)
+            pt.x >= winSizeInt && pt.y >= winSizeInt && pt.x < (gray.cols() - winSizeInt) && pt.y < (gray.rows() - winSizeInt)
         }
 
         if (!isSafeToRefine) return sorted
@@ -647,7 +649,7 @@ class MainActivity : AppCompatActivity() {
                 org.opencv.core.Size(-1.0, -1.0), 
                 criteria
             )
-            
+             
             subPixMat.toArray().map { 
                 PointF(it.x.toFloat(), it.y.toFloat()) 
             }
@@ -688,7 +690,8 @@ class MainActivity : AppCompatActivity() {
 
         return if (isHorizontal) {
             val denom = sumX2 - sumW * meanX * meanX
-            if (abs(denom) < 1e-5) Line(meanX, 0.0, meanX, roiHeight.toDouble(), sumW, 90.0)
+            if (abs(denom) < 1e-5) 
+                Line(meanX, 0.0, meanX, roiHeight.toDouble(), sumW, 90.0)
             else {
                 val slope = (sumXY - sumW * meanX * meanY) / denom
                 val intercept = meanY - slope * meanX
@@ -911,6 +914,7 @@ class MainActivity : AppCompatActivity() {
                         nativeBackgroundView?.setImageDrawable(null)
                         
                         val safeEscapedUri = JSONObject.quote(previewUri)
+                        
                         viewFinder?.visibility = View.GONE
                         
                         previewBitmapRef?.let {
@@ -1021,7 +1025,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all { ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED }
 
-    // [수정됨] 삭제 대상이었던 변수(cachedPreviewFile) 참조 코드를 완전히 제거했습니다.
     override fun onDestroy() { 
         synchronized(bitmapLock) { 
             lastCapturedBitmap?.let {
