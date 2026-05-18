@@ -344,7 +344,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // [개선 포인트] 오래된 프리뷰 캐시 파일 자동 삭제
     private fun cleanupOldPreviewFiles() {
         previewDir.listFiles()?.forEach {
             if (System.currentTimeMillis() - it.lastModified() > 60_000) {
@@ -362,7 +361,6 @@ class MainActivity : AppCompatActivity() {
         return try {
             cleanupOldPreviewFiles()
 
-            // [개선 포인트] UUID를 적용하여 WebView 캐시 꼬임 및 I/O 충돌 회피
             val fileName = "preview_${UUID.randomUUID()}.jpg"
             val file = File(previewDir, fileName)
 
@@ -370,7 +368,6 @@ class MainActivity : AppCompatActivity() {
                 val success = bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
                 out.flush() 
                 
-                // [개선 포인트] 압축(저장) 성공 여부를 반환하여 파일 오염 시 방어
                 if (!success) {
                     Log.e("JiSeKa Engine", "Bitmap compress 실패 (저장소 부족 등)")
                     file.delete()
@@ -621,6 +618,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // [개선 1] 한 줄로 된 try-catch-finally를 완전한 블록 구조로 전면 분리하여 CI 빌드 에러 차단
     private fun applySubPixelRefinement(gray: org.opencv.core.Mat, roi: org.opencv.core.Rect, points: List<PointF>): List<PointF> {
         val globalPoints = points.map { PointF(it.x + roi.x, it.y + roi.y) }
         val sorted = sortCornersStandard(globalPoints)
@@ -640,11 +638,28 @@ class MainActivity : AppCompatActivity() {
         
         return try {
             val searchWindow = org.opencv.core.Size(winSize, winSize)
-            val criteria = TermCriteria(TermCriteria.EPS + TermCriteria.MAX_ITER, 40, 0.01)
+            val criteria = TermCriteria(
+                TermCriteria.EPS + TermCriteria.MAX_ITER, 
+                40, 
+                0.01
+            )
             
-            Imgproc.cornerSubPix(gray, subPixMat, searchWindow, org.opencv.core.Size(-1.0, -1.0), criteria)
-            subPixMat.toArray().map { PointF(it.x.toFloat(), it.y.toFloat()) }
-        } catch (e: Exception) { sorted } finally { subPixMat.release() }
+            Imgproc.cornerSubPix(
+                gray, 
+                subPixMat, 
+                searchWindow, 
+                org.opencv.core.Size(-1.0, -1.0), 
+                criteria
+            )
+            
+            subPixMat.toArray().map { 
+                PointF(it.x.toFloat(), it.y.toFloat()) 
+            }
+        } catch (e: Exception) { 
+            sorted 
+        } finally { 
+            subPixMat.release() 
+        }
     }
 
     private fun mergeLinesLinearRegression(lines: List<Line>, isHorizontal: Boolean, roiWidth: Int, roiHeight: Int): Line? {
@@ -731,6 +746,7 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
+    // [개선 1] 한 줄로 된 try-catch-finally를 완전한 블록 구조로 전면 분리
     private fun rectifyToFlatPlate(sourceBitmap: Bitmap, pts: List<PointF>): Bitmap? {
         val srcMat = org.opencv.core.Mat()
         val destMat = org.opencv.core.Mat()
@@ -867,4 +883,182 @@ class MainActivity : AppCompatActivity() {
     private fun takePhoto() {
         if (isProcessing) return
         isProcessing = true
-        val capture = imageCapture ?: run {
+        val capture = imageCapture ?: run { 
+            isProcessing = false
+            return 
+        }
+
+        cleanupOldPreviewFiles()
+        val fileName = "capture_${UUID.randomUUID()}.jpg"
+        val photoFile = File(previewDir, fileName)
+
+        val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
+
+        capture.takePicture(outputOptions, cameraExecutor, object : ImageCapture.OnImageSavedCallback {
+            override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                try {
+                    val safeBitmap = loadSafeBitmap(photoFile.absolutePath, 1920, 1080)
+                    
+                    synchronized(bitmapLock) { 
+                        lastCapturedBitmap?.let {
+                            if (!it.isRecycled) {
+                                it.recycle()
+                            }
+                        }
+                        lastCapturedBitmap = safeBitmap 
+                    }
+                    
+                    val previewUri = "https://appassets.androidplatform.net/preview/$fileName"
+                    
+                    runOnUiThread { 
+                        if (isDestroyed || isFinishing) return@runOnUiThread
+
+                        nativeBackgroundView?.setImageDrawable(null)
+                        
+                        val safeEscapedUri = JSONObject.quote(previewUri)
+                        viewFinder?.visibility = View.GONE
+                        
+                        previewBitmapRef?.let {
+                            if (!it.isRecycled) it.recycle()
+                        }
+
+                        // [개선 3] 가로/세로 1픽셀 이미지가 입력될 경우 IllegalArgumentException 방어
+                        val previewW = max(1, safeBitmap.width / 2)
+                        val previewH = max(1, safeBitmap.height / 2)
+                        
+                        previewBitmapRef = Bitmap.createScaledBitmap(
+                            safeBitmap,
+                            previewW,
+                            previewH,
+                            true
+                        )
+                        nativeBackgroundView?.setImageBitmap(previewBitmapRef)
+                        nativeBackgroundView?.visibility = View.VISIBLE
+                        
+                        safeEvaluate("window.onNativePhotoCaptured($safeEscapedUri)")
+                    }
+                } catch (t: Throwable) { 
+                    Log.e("JiSeKa Engine", "비트맵 적재 중 크래시 발생", t)
+                    runOnUiThread {
+                        if (!isDestroyed && !isFinishing) {
+                            isProcessing = false
+                            viewFinder?.visibility = View.VISIBLE
+                            nativeBackgroundView?.visibility = View.GONE
+                            Toast.makeText(this@MainActivity, "사진 처리 중 문제가 발생했습니다.", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
+            }
+
+            override fun onError(e: ImageCaptureException) { 
+                runOnUiThread {
+                    if (!isDestroyed && !isFinishing) {
+                        isProcessing = false
+                        Toast.makeText(this@MainActivity, "캡처 실패: ${e.message}", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        })
+    }
+
+    private fun loadSafeBitmap(path: String, maxW: Int, maxH: Int): Bitmap {
+        val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(path, options)
+
+        options.inSampleSize = calculateInSampleSize(options, maxW, maxH)
+        options.inJustDecodeBounds = false
+
+        val bitmap = BitmapFactory.decodeFile(path, options) ?: throw RuntimeException("Bitmap load failed")
+
+        val exif = ExifInterface(path)
+        val orientation = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+
+        val matrix = Matrix()
+        when (orientation) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+            ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+            ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+        }
+
+        if (matrix.isIdentity) return bitmap
+        val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+        if (rotated !== bitmap) bitmap.recycle()
+        return rotated
+    }
+
+    private fun calculateInSampleSize(options: BitmapFactory.Options, reqWidth: Int, reqHeight: Int): Int {
+        val (height: Int, width: Int) = options.outHeight to options.outWidth
+        var inSampleSize = 1
+        if (height > reqHeight || width > reqWidth) {
+            val halfHeight: Int = height / 2
+            val halfWidth: Int = width / 2
+            while (halfHeight / inSampleSize >= reqHeight && halfWidth / inSampleSize >= reqWidth) {
+                inSampleSize *= 2
+            }
+        }
+        return inSampleSize
+    }
+
+    private fun saveBitmapToGallery(bitmap: Bitmap) {
+        val contentValues = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, "JiSeKa_${System.currentTimeMillis()}.jpg")
+            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/JiSeKa")
+        }
+        
+        var success = false
+        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
+        uri?.let { 
+            contentResolver.openOutputStream(it)?.use { stream -> 
+                success = bitmap.compress(Bitmap.CompressFormat.JPEG, 100, stream) 
+            } 
+        }
+        
+        runOnUiThread { 
+            if (!isDestroyed && !isFinishing) {
+                if (success) {
+                    Toast.makeText(this, "갤러리에 저장되었습니다.", Toast.LENGTH_SHORT).show() 
+                } else {
+                    Toast.makeText(this, "저장공간 부족 등으로 저장에 실패했습니다.", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all { ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED }
+
+    override fun onDestroy() { 
+        synchronized(bitmapLock) { 
+            lastCapturedBitmap?.let {
+                if (!it.isRecycled) it.recycle()
+            }
+            lastCapturedBitmap = null 
+        }
+        
+        previewBitmapRef?.let {
+            if (!it.isRecycled) it.recycle()
+        }
+        previewBitmapRef = null
+
+        recognizer.close()
+        cameraExecutor.shutdownNow()
+        analysisExecutor.shutdownNow()
+        
+        try { cachedPreviewFile?.let { if (it.exists()) it.delete() } } catch (e: Exception) {}
+        
+        webView?.apply {
+            stopLoading()
+            clearHistory()
+            removeAllViews()
+            destroy()
+        }
+        webView = null
+
+        super.onDestroy()
+    }
+
+    companion object {
+        private const val REQUEST_CODE_PERMISSIONS = 1001
+        private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
+    }
+}
