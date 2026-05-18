@@ -4,18 +4,34 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.pm.PackageManager
-import android.graphics.*
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Color
+import android.graphics.ImageFormat
+import android.graphics.Matrix
+import android.graphics.PointF
+import android.graphics.YuvImage
+import android.media.ExifInterface
 import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
 import android.util.Log
 import android.util.Size
 import android.view.View
-import android.webkit.*
+import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebSettings
+import android.webkit.WebView
 import android.widget.ImageView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
-import androidx.camera.core.*
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
@@ -29,11 +45,17 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
-import org.opencv.core.*
+import org.opencv.core.Core
+import org.opencv.core.CvType
+import org.opencv.core.Mat
+import org.opencv.core.MatOfPoint
+import org.opencv.core.MatOfPoint2f
+import org.opencv.core.TermCriteria
 import org.opencv.imgproc.Imgproc
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.util.UUID
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.abs
@@ -65,11 +87,10 @@ class MainActivity : AppCompatActivity() {
     private var isProcessing = false
 
     private var lastCapturedBitmap: Bitmap? = null
+    private var previewBitmapRef: Bitmap? = null
     private val bitmapLock = Any()
 
-    private var cachedPreviewFile: File? = null
-    
-    // [해결책] WebViewAssetLoader 선언
+    private lateinit var previewDir: File
     private lateinit var assetLoader: WebViewAssetLoader
 
     private val recognizer by lazy { 
@@ -88,14 +109,18 @@ class MainActivity : AppCompatActivity() {
         nativeBackgroundView = findViewById(R.id.nativeBackgroundView)
         webView = findViewById(R.id.webView)
 
-        // 캐시 파일 설정 (AssetLoader와 경로를 맞추기 위해 내부 cacheDir 사용)
-        cachedPreviewFile = File(cacheDir, "preview_cache.jpg")
+        cameraExecutor = Executors.newSingleThreadExecutor()
+        analysisExecutor = Executors.newSingleThreadExecutor()
 
-        // [해결책] WebViewAssetLoader 초기화 (로컬 파일을 가상 HTTPS 도메인으로 서빙)
+        previewDir = File(filesDir, "preview")
+        if (!previewDir.exists()) {
+            previewDir.mkdirs()
+        }
+
         assetLoader = WebViewAssetLoader.Builder()
             .addPathHandler(
-                "/cache/",
-                WebViewAssetLoader.InternalStoragePathHandler(this, cacheDir)
+                "/preview/",
+                WebViewAssetLoader.InternalStoragePathHandler(this, previewDir)
             )
             .build()
 
@@ -111,9 +136,18 @@ class MainActivity : AppCompatActivity() {
         } else {
             ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
         }
+    }
 
-        cameraExecutor = Executors.newSingleThreadExecutor()
-        analysisExecutor = Executors.newSingleThreadExecutor()
+    private fun safeEvaluate(js: String) {
+        runOnUiThread {
+            if (!isDestroyed && !isFinishing && webView != null) {
+                try {
+                    webView?.evaluateJavascript(js, null)
+                } catch (e: Exception) {
+                    Log.e("JiSeKa Engine", "JS evaluate 실패", e)
+                }
+            }
+        }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -128,11 +162,9 @@ class MainActivity : AppCompatActivity() {
                 allowContentAccess = true
                 allowFileAccessFromFileURLs = true
                 allowUniversalAccessFromFileURLs = true
-                // [해결책] HTTPS 페이지 안에서의 다양한 콘텐츠 로드 허용
                 mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             }
             
-            // [해결책] WebViewClientCompat을 사용하여 AssetLoader로 리소스 요청 가로채기
             webViewClient = object : WebViewClientCompat() {
                 override fun shouldInterceptRequest(
                     view: WebView,
@@ -158,6 +190,7 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun setCameraVisibility(isVisible: Boolean) {
             runOnUiThread { 
+                if (isDestroyed || isFinishing) return@runOnUiThread
                 if (isVisible) {
                     isProcessing = false
                     viewFinder?.visibility = View.VISIBLE
@@ -172,6 +205,8 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun analyzePlateWithMode(cornersJsonStr: String, mode: String) {
             analysisExecutor.execute {
+                if (isDestroyed || isFinishing) return@execute
+                
                 var processingBitmap: Bitmap? = null
                 try {
                     val rawBitmap = synchronized(bitmapLock) { 
@@ -179,6 +214,7 @@ class MainActivity : AppCompatActivity() {
                     } ?: return@execute
 
                     processingBitmap = scaleBitmapDownToLimit(rawBitmap, 1920, 1080)
+                    if (processingBitmap !== rawBitmap) rawBitmap.recycle()
 
                     val bmpW = processingBitmap.width.toFloat()
                     val bmpH = processingBitmap.height.toFloat()
@@ -213,7 +249,8 @@ class MainActivity : AppCompatActivity() {
                 } catch (e: Exception) {
                     Log.e("JiSeKa Engine", "분석 파이프라인 크래시 방어", e)
                     val safeFallbackJson = JSONObject.quote("{\"corners\":null, \"preview\":null}")
-                    runOnUiThread { webView?.evaluateJavascript("window.onNativeSuccess($safeFallbackJson)", null) }
+                    safeEvaluate("window.onNativeSuccess($safeFallbackJson)")
+                    isProcessing = false 
                 }
             }
         }
@@ -221,6 +258,8 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun saveImageWithNativeOverlay(cornersJsonStr: String) {
             analysisExecutor.execute {
+                if (isDestroyed || isFinishing) return@execute
+                
                 var baseBitmap: Bitmap? = null
                 var overlayResult: Bitmap? = null
                 try {
@@ -229,7 +268,7 @@ class MainActivity : AppCompatActivity() {
 
                     if (jsonObj.isNull("corners")) {
                         saveBitmapToGallery(baseBitmap)
-                        runOnUiThread { webView?.evaluateJavascript("window.onNativeSaveComplete()", null) }
+                        safeEvaluate("window.onNativeSaveComplete()")
                         return@execute
                     }
 
@@ -244,16 +283,21 @@ class MainActivity : AppCompatActivity() {
 
                     overlayResult = processPerspectiveOverlay(baseBitmap, pts)
                     saveBitmapToGallery(overlayResult!!)
-                    runOnUiThread { webView?.evaluateJavascript("window.onNativeSaveComplete()", null) }
+                    safeEvaluate("window.onNativeSaveComplete()")
                 } catch (e: Exception) {
                     Log.e("JiSeKa Engine", "오버레이 저장 실패", e)
+                } finally {
+                    baseBitmap?.recycle()
+                    overlayResult?.let { if (it !== baseBitmap) it.recycle() }
                 }
             }
         }
         
         @JavascriptInterface
         fun showToast(msg: String) {
-            runOnUiThread { Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show() }
+            runOnUiThread { 
+                if (!isDestroyed && !isFinishing) Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show() 
+            }
         }
     }
 
@@ -273,33 +317,67 @@ class MainActivity : AppCompatActivity() {
         if (flatBmp != null) {
             val inputImage = InputImage.fromBitmap(flatBmp, 0)
             recognizer.process(inputImage).addOnCompleteListener { task ->
-                val finalPoints = if (task.isSuccessful && isValidLicensePlatePattern(task.result.text)) {
-                    targetPoints
-                } else {
-                    fallbackPoints
+                if (isDestroyed || isFinishing) {
+                    flatBmp.recycle()
+                    sourceBitmap.recycle()
+                    return@addOnCompleteListener
                 }
-                val previewBitmap = processPerspectiveOverlay(sourceBitmap, finalPoints)
-                val fileUriStr = saveBitmapToCacheFile(previewBitmap)
-                sendCachedPreviewToJs(finalPoints, fileUriStr, bmpW, bmpH)
+                try {
+                    val finalPoints = if (task.isSuccessful && isValidLicensePlatePattern(task.result.text)) {
+                        targetPoints
+                    } else {
+                        fallbackPoints
+                    }
+                    val previewBitmap = processPerspectiveOverlay(sourceBitmap, finalPoints)
+                    val fileUriStr = saveBitmapToCacheFile(previewBitmap)
+                    sendCachedPreviewToJs(finalPoints, fileUriStr, bmpW, bmpH)
+                    previewBitmap.recycle()
+                } finally {
+                    flatBmp.recycle()
+                    sourceBitmap.recycle()
+                }
             }
         } else {
             val fileUriStr = saveBitmapToCacheFile(sourceBitmap)
             sendCachedPreviewToJs(fallbackPoints, fileUriStr, bmpW, bmpH)
+            sourceBitmap.recycle()
+        }
+    }
+
+    // [개선 포인트] 오래된 프리뷰 캐시 파일 자동 삭제
+    private fun cleanupOldPreviewFiles() {
+        previewDir.listFiles()?.forEach {
+            if (System.currentTimeMillis() - it.lastModified() > 60_000) {
+                it.delete()
+            }
         }
     }
 
     private fun saveBitmapToCacheFile(bitmap: Bitmap): String? {
+        if (bitmap.isRecycled) {
+            Log.e("JiSeKa Engine", "이미 recycle된 bitmap 접근 시도")
+            return null
+        }
+
         return try {
-            cachedPreviewFile?.let { file ->
-                if (file.exists()) file.delete()
+            cleanupOldPreviewFiles()
+
+            // [개선 포인트] UUID를 적용하여 WebView 캐시 꼬임 및 I/O 충돌 회피
+            val fileName = "preview_${UUID.randomUUID()}.jpg"
+            val file = File(previewDir, fileName)
+
+            FileOutputStream(file).use { out -> 
+                val success = bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
+                out.flush() 
                 
-                FileOutputStream(file).use { out -> 
-                    bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
-                    out.flush() 
+                // [개선 포인트] 압축(저장) 성공 여부를 반환하여 파일 오염 시 방어
+                if (!success) {
+                    Log.e("JiSeKa Engine", "Bitmap compress 실패 (저장소 부족 등)")
+                    file.delete()
+                    return null
                 }
-                // [해결책] WebViewAssetLoader의 가상 HTTPS 주소로 반환하여 CORS 차단 원천 봉쇄
-                "https://appassets.androidplatform.net/cache/preview_cache.jpg?t=${System.currentTimeMillis()}"
             }
+            "https://appassets.androidplatform.net/preview/$fileName"
         } catch (e: Exception) { 
             Log.e("JiSeKa Engine", "캐시 저장 실패", e)
             null 
@@ -316,7 +394,9 @@ class MainActivity : AppCompatActivity() {
         }.toString()
         
         val safeEscapedJson = JSONObject.quote(resultJson)
-        runOnUiThread { webView?.evaluateJavascript("window.onNativeSuccess($safeEscapedJson)", null) }
+        safeEvaluate("window.onNativeSuccess($safeEscapedJson)")
+        
+        isProcessing = false 
     }
 
     private fun isValidLicensePlatePattern(text: String): Boolean = text.replace(Regex("\\s+"), "").count { it.isDigit() } >= 3
@@ -333,7 +413,11 @@ class MainActivity : AppCompatActivity() {
             Imgproc.cvtColor(mat, gray, Imgproc.COLOR_RGBA2GRAY)
             
             val claheObj = Imgproc.createCLAHE(2.5, org.opencv.core.Size(8.0, 8.0))
-            claheObj.apply(gray, gray)
+            try {
+                claheObj.apply(gray, gray)
+            } finally {
+                claheObj.release()
+            }
             
             val xs = pts.map { it.x }
             val ys = pts.map { it.y }
@@ -364,6 +448,8 @@ class MainActivity : AppCompatActivity() {
             morphKernel.release()
             
             Imgproc.Canny(roiMat, edgeMat, 50.0, 150.0)
+            
+            if (isDestroyed || isFinishing) return pts
 
             Imgproc.HoughLinesP(edgeMat, lines, 1.0, Math.PI / 180, 30, paddedRoi.width * 0.3, 10.0)
             
@@ -421,27 +507,37 @@ class MainActivity : AppCompatActivity() {
             var bestContourPoints: List<PointF>? = null
             var maxArea = 0.0
 
-            for (contour in contours) {
-                val m2f = MatOfPoint2f(*contour.toArray())
-                val peri = Imgproc.arcLength(m2f, true)
-                val approx = MatOfPoint2f()
-                Imgproc.approxPolyDP(m2f, approx, 0.02 * peri, true)
+            if (isDestroyed || isFinishing) return pts
 
-                val rawPoints = approx.toArray().map { PointF(it.x.toFloat(), it.y.toFloat()) }
-                if (validateQuadrilateral(rawPoints, paddedRoi.width, paddedRoi.height)) {
-                    val contourMat = MatOfPoint(*approx.toArray())
-                    val area = abs(Imgproc.contourArea(contourMat))
-                    if (area > maxArea) {
-                        maxArea = area
-                        bestContourPoints = sortCornersStandard(rawPoints)
+            for (contour in contours) {
+                val m2f = MatOfPoint2f()
+                val approx = MatOfPoint2f()
+                var contourMat: MatOfPoint? = null
+
+                try {
+                    m2f.fromArray(*contour.toArray())
+                    val peri = Imgproc.arcLength(m2f, true)
+                    Imgproc.approxPolyDP(m2f, approx, 0.02 * peri, true)
+
+                    val approxArray = approx.toArray()
+                    val rawPoints = approxArray.map { PointF(it.x.toFloat(), it.y.toFloat()) }
+                    
+                    if (validateQuadrilateral(rawPoints, paddedRoi.width, paddedRoi.height)) {
+                        contourMat = MatOfPoint(*approxArray)
+                        val area = abs(Imgproc.contourArea(contourMat))
+                        if (area > maxArea) {
+                            maxArea = area
+                            bestContourPoints = sortCornersStandard(rawPoints)
+                        }
                     }
-                    contourMat.release()
+                } finally {
+                    contourMat?.release()
+                    approx.release()
+                    m2f.release()
+                    contour.release()
                 }
-                m2f.release()
-                approx.release()
             }
             hierarchy.release()
-            contours.forEach { it.release() }
 
             if (bestContourPoints != null) {
                 return applySubPixelRefinement(gray, paddedRoi, bestContourPoints)
@@ -719,8 +815,9 @@ class MainActivity : AppCompatActivity() {
             }
 
             if (warpedChannels.size > 3 && targetChannels.size > 3) {
+                val alphaClone = targetChannels[3].clone()
                 warpedChannels[3].release()
-                warpedChannels[3] = targetChannels[3].clone()
+                warpedChannels[3] = alphaClone
             }
             
             Core.merge(warpedChannels, finalBlended)
@@ -770,181 +867,4 @@ class MainActivity : AppCompatActivity() {
     private fun takePhoto() {
         if (isProcessing) return
         isProcessing = true
-        val capture = imageCapture ?: run { 
-            isProcessing = false
-            return 
-        }
-        
-        capture.takePicture(cameraExecutor, object : ImageCapture.OnImageCapturedCallback() {
-            override fun onCaptureSuccess(image: ImageProxy) {
-                try {
-                    val bitmap = image.toBitmapExt()
-                    
-                    synchronized(bitmapLock) { 
-                        lastCapturedBitmap = bitmap 
-                    }
-                    
-                    val previewUri = saveBitmapToCacheFile(bitmap)
-                    
-                    runOnUiThread { 
-                        if (previewUri != null) {
-                            nativeBackgroundView?.setImageDrawable(null)
-                            
-                            val safeEscapedUri = JSONObject.quote(previewUri)
-                            
-                            viewFinder?.visibility = View.GONE
-                            
-                            val uiBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false)
-                            nativeBackgroundView?.setImageBitmap(uiBitmap)
-                            nativeBackgroundView?.visibility = View.VISIBLE
-                            
-                            webView?.evaluateJavascript("window.onNativePhotoCaptured($safeEscapedUri)", null)
-                        } else {
-                            isProcessing = false
-                            viewFinder?.visibility = View.VISIBLE
-                            nativeBackgroundView?.visibility = View.GONE
-                            Toast.makeText(this@MainActivity, "이미지 캐시 생성에 실패했습니다.", Toast.LENGTH_SHORT).show()
-                        }
-                    }
-                } catch (t: Throwable) { 
-                    Log.e("JiSeKa Engine", "비트맵 처리 또는 저장 중 크래시 발생", t)
-                    runOnUiThread {
-                        isProcessing = false
-                        viewFinder?.visibility = View.VISIBLE
-                        nativeBackgroundView?.visibility = View.GONE
-                        Toast.makeText(this@MainActivity, "사진 처리 중 문제가 발생했습니다.", Toast.LENGTH_SHORT).show()
-                    }
-                } finally {
-                    image.close()
-                }
-            }
-
-            override fun onError(e: ImageCaptureException) { 
-                runOnUiThread {
-                    isProcessing = false
-                    Toast.makeText(this@MainActivity, "캡처 실패: ${e.message}", Toast.LENGTH_SHORT).show()
-                }
-            }
-        })
-    }
-
-    private fun ImageProxy.toBitmapExt(): Bitmap {
-        val bitmap = when (format) {
-            ImageFormat.JPEG -> {
-                val buffer = planes[0].buffer
-                val bytes = ByteArray(buffer.remaining())
-                buffer.get(bytes)
-                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                    ?: throw RuntimeException("JPEG decode failed")
-            }
-            ImageFormat.YUV_420_888 -> {
-                if (planes.size < 3) {
-                    throw RuntimeException("Invalid YUV planes: ${planes.size}")
-                }
-                
-                val yPlane = planes[0]
-                val uPlane = planes[1]
-                val vPlane = planes[2]
-
-                val yBuffer = yPlane.buffer
-                val uBuffer = uPlane.buffer
-                val vBuffer = vPlane.buffer
-
-                val nv21 = ByteArray(width * height * 3 / 2)
-                var pos = 0
-
-                val yRowStride = yPlane.rowStride
-                for (row in 0 until height) {
-                    yBuffer.position(row * yRowStride)
-                    yBuffer.get(nv21, pos, width)
-                    pos += width
-                }
-
-                val uvHeight = height / 2
-                val uvWidth = width / 2
-                val vRowStride = vPlane.rowStride
-                val vPixelStride = vPlane.pixelStride
-                val uRowStride = uPlane.rowStride
-                val uPixelStride = uPlane.pixelStride
-
-                for (row in 0 until uvHeight) {
-                    for (col in 0 until uvWidth) {
-                        vBuffer.position(row * vRowStride + col * vPixelStride)
-                        nv21[pos++] = vBuffer.get()
-                        uBuffer.position(row * uRowStride + col * uPixelStride)
-                        nv21[pos++] = uBuffer.get()
-                    }
-                }
-                
-                val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
-                
-                ByteArrayOutputStream().use { out ->
-                    yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 100, out)
-                    BitmapFactory.decodeByteArray(out.toByteArray(), 0, out.size())
-                } ?: throw RuntimeException("YUV decode failed")
-            }
-            else -> {
-                throw RuntimeException("Unsupported image format: $format")
-            }
-        }
-
-        val isLandscape = imageInfo.rotationDegrees % 180 == 0
-        val targetW = if (isLandscape) 1920 else 1080
-        val targetH = if (isLandscape) 1080 else 1920
-        
-        val scaledBitmap = scaleBitmapDownToLimit(bitmap, targetW, targetH)
-        
-        if (scaledBitmap !== bitmap) {
-            bitmap.recycle()
-        }
-
-        val matrix = Matrix().apply { 
-            postRotate(imageInfo.rotationDegrees.toFloat()) 
-        }
-        
-        val rotatedBitmap = Bitmap.createBitmap(
-            scaledBitmap, 
-            0, 
-            0, 
-            scaledBitmap.width, 
-            scaledBitmap.height, 
-            matrix, 
-            true
-        )
-        
-        if (rotatedBitmap !== scaledBitmap) {
-            scaledBitmap.recycle()
-        }
-
-        return rotatedBitmap
-    }
-
-    private fun saveBitmapToGallery(bitmap: Bitmap) {
-        val contentValues = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, "JiSeKa_${System.currentTimeMillis()}.jpg")
-            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/JiSeKa")
-        }
-        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
-        uri?.let { contentResolver.openOutputStream(it)?.use { stream -> bitmap.compress(Bitmap.CompressFormat.JPEG, 100, stream) } }
-        runOnUiThread { Toast.makeText(this, "갤러리에 저장되었습니다.", Toast.LENGTH_SHORT).show() }
-    }
-
-    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all { ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED }
-
-    override fun onDestroy() { 
-        super.onDestroy()
-        cameraExecutor.shutdown()
-        analysisExecutor.shutdown()
-        recognizer.close()
-        try { cachedPreviewFile?.let { if (it.exists()) it.delete() } } catch (e: Exception) {}
-        synchronized(bitmapLock) { 
-            lastCapturedBitmap = null 
-        }
-    }
-
-    companion object {
-        private const val REQUEST_CODE_PERMISSIONS = 1001
-        private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
-    }
-}
+        val capture = imageCapture ?: run {
