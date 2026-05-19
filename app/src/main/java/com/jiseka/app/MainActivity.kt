@@ -997,4 +997,74 @@ class MainActivity : AppCompatActivity() {
         var inSampleSize = 1
         if (height > reqHeight || width > reqWidth) {
             val halfHeight: Int = height / 2
-            val halfWidth
+            val halfWidth: Int = width / 2
+            while (halfHeight / inSampleSize >= reqHeight && halfWidth / inSampleSize >= reqWidth) {
+                inSampleSize *= 2
+            }
+        }
+        return inSampleSize
+    }
+
+    private fun saveBitmapToGallery(bitmap: Bitmap) {
+        val contentValues = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, "JiSeKa_${System.currentTimeMillis()}.jpg")
+            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/JiSeKa")
+        }
+        
+        var success = false
+        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
+        uri?.let { 
+            contentResolver.openOutputStream(it)?.use { stream -> 
+                success = bitmap.compress(Bitmap.CompressFormat.JPEG, 100, stream) 
+            } 
+        }
+        
+        runOnUiThread { 
+            if (!isDestroyed && !isFinishing) {
+                if (success) {
+                    Toast.makeText(this, "갤러리에 저장되었습니다.", Toast.LENGTH_SHORT).show() 
+                } else {
+                    Toast.makeText(this, "저장공간 부족 등으로 저장에 실패했습니다.", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all { ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED }
+
+    override fun onDestroy() { 
+        synchronized(bitmapLock) { 
+            lastCapturedBitmap?.let {
+                if (!it.isRecycled) it.recycle()
+            }
+            lastCapturedBitmap = null 
+        }
+        
+        previewBitmapRef?.let {
+            if (!it.isRecycled) it.recycle()
+        }
+        previewBitmapRef = null
+
+        recognizer.close()
+        cameraExecutor.shutdownNow()
+        analysisExecutor.shutdownNow()
+        
+        previewDir.listFiles()?.forEach { it.delete() }
+        
+        webView?.apply {
+            stopLoading()
+            clearHistory()
+            removeAllViews()
+            destroy()
+        }
+        webView = null
+
+        super.onDestroy()
+    }
+
+    companion object {
+        private const val REQUEST_CODE_PERMISSIONS = 1001
+        private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
+    }
+}
