@@ -180,6 +180,7 @@ class MainActivity : AppCompatActivity() {
             webChromeClient = WebChromeClient()
             addJavascriptInterface(AndroidBridge(), "AndroidBridge")
             
+            // 💡 [수정] 앱 실행 시 웹뷰 캐시 무력화 (항상 최신 Vercel 배포본 로드)
             loadUrl("https://ziseka-app.vercel.app/?v=" + System.currentTimeMillis())
         }
     }
@@ -221,30 +222,19 @@ class MainActivity : AppCompatActivity() {
 
                     val bmpW = processingBitmap.width.toFloat()
                     val bmpH = processingBitmap.height.toFloat()
-                    val viewW = viewFinder?.width?.toFloat() ?: 1f
-                    val viewH = viewFinder?.height?.toFloat() ?: 1f
 
                     val inputCorners = JSONObject(cornersJsonStr).getJSONArray("corners")
                     val mappedPoints = mutableListOf<PointF>()
 
-                    // 💡 [핵심] fitCenter일 때의 레터박스 간극(Offset)과 배율(Scale)을 계산하여 좌표 동기화
-                    val scale = min(viewW / bmpW, viewH / bmpH)
-                    val displayedW = bmpW * scale
-                    val displayedH = bmpH * scale
-                    val offsetX = (viewW - displayedW) / 2f
-                    val offsetY = (viewH - displayedH) / 2f
-
+                    // 💡 [핵심 수정] JS가 완벽하게 정제된 이미지 기준 정규화 좌표(0.0~1.0)를 보내주므로, 
+                    // 복잡한 오프셋 역산 로직을 폐기하고 현재 비트맵 크기에 단순 곱셈만 수행합니다. (True SSOT)
                     for (i in 0 until 4) {
                         val p = inputCorners.getJSONObject(i)
                         val normX = p.getDouble("x").toFloat()
                         val normY = p.getDouble("y").toFloat()
 
-                        val screenPixelX = normX * viewW
-                        val screenPixelY = normY * viewH
-
-                        // 실제 비트맵 상의 픽셀 좌표로 역산
-                        val targetBmpX = ((screenPixelX - offsetX) / scale).coerceIn(0f, bmpW - 1f)
-                        val targetBmpY = ((screenPixelY - offsetY) / scale).coerceIn(0f, bmpH - 1f)
+                        val targetBmpX = (normX * bmpW).coerceIn(0f, bmpW - 1f)
+                        val targetBmpY = (normY * bmpH).coerceIn(0f, bmpH - 1f)
                         mappedPoints.add(PointF(targetBmpX, targetBmpY))
                     }
 
@@ -297,7 +287,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
-       
+        
         @JavascriptInterface
         fun showToast(msg: String) {
             runOnUiThread { 
@@ -389,7 +379,7 @@ class MainActivity : AppCompatActivity() {
     private fun sendCachedPreviewToJs(points: List<PointF>, fileUriStr: String?, bmpW: Float, bmpH: Float) {
         val outputArray = JSONArray()
         for (pt in points) { outputArray.put(JSONObject().put("x", (pt.x / bmpW).toDouble()).put("y", (pt.y / bmpH).toDouble())) }
-       
+        
         val resultJson = JSONObject().apply { 
             put("corners", outputArray)
             put("preview", fileUriStr ?: JSONObject.NULL) 
@@ -489,7 +479,7 @@ class MainActivity : AppCompatActivity() {
                 val bl = getIntersection(bEdge, lEdge)
                 if (tl != null && tr != null && br != null && bl != null) {
                     val candidateQuad = listOf(tl, tr, br, bl)
-                        
+                    
                     if (validateQuadrilateral(candidateQuad, paddedRoi.width, paddedRoi.height)) {
                         return applySubPixelRefinement(gray, paddedRoi, candidateQuad)
                     } else {
@@ -501,7 +491,7 @@ class MainActivity : AppCompatActivity() {
             val contours = mutableListOf<MatOfPoint>()
             val hierarchy = org.opencv.core.Mat()
             Imgproc.findContours(edgeMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
-             
+            
             var bestContourPoints: List<PointF>? = null
             var maxArea = 0.0
 
@@ -948,7 +938,10 @@ class MainActivity : AppCompatActivity() {
                         nativeBackgroundView?.setImageBitmap(previewBitmapRef)
                         nativeBackgroundView?.visibility = View.VISIBLE
                         
-                        safeEvaluate("window.onNativePhotoCaptured($safeEscapedUri)")
+                        // 💡 [핵심 수정] JS로 URI와 함께 EXIF 처리가 완료된 "실제 원본 비트맵의 폭/높이"를 함께 넘겨줍니다.
+                        val bmpW = safeBitmap.width
+                        val bmpH = safeBitmap.height
+                        safeEvaluate("window.onNativePhotoCaptured($safeEscapedUri, $bmpW, $bmpH)")
                     }
                 } catch (t: Throwable) { 
                     Log.e("JiSeKa Engine", "비트맵 적재 중 크래시 발생", t)
@@ -1004,74 +997,4 @@ class MainActivity : AppCompatActivity() {
         var inSampleSize = 1
         if (height > reqHeight || width > reqWidth) {
             val halfHeight: Int = height / 2
-            val halfWidth: Int = width / 2
-            while (halfHeight / inSampleSize >= reqHeight && halfWidth / inSampleSize >= reqWidth) {
-                inSampleSize *= 2
-            }
-        }
-        return inSampleSize
-    }
-
-    private fun saveBitmapToGallery(bitmap: Bitmap) {
-        val contentValues = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, "JiSeKa_${System.currentTimeMillis()}.jpg")
-            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/JiSeKa")
-        }
-        
-        var success = false
-        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
-        uri?.let { 
-            contentResolver.openOutputStream(it)?.use { stream -> 
-                success = bitmap.compress(Bitmap.CompressFormat.JPEG, 100, stream) 
-            } 
-        }
-        
-        runOnUiThread { 
-            if (!isDestroyed && !isFinishing) {
-                if (success) {
-                    Toast.makeText(this, "갤러리에 저장되었습니다.", Toast.LENGTH_SHORT).show() 
-                } else {
-                    Toast.makeText(this, "저장공간 부족 등으로 저장에 실패했습니다.", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
-    }
-
-    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all { ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED }
-
-    override fun onDestroy() { 
-        synchronized(bitmapLock) { 
-            lastCapturedBitmap?.let {
-                if (!it.isRecycled) it.recycle()
-            }
-            lastCapturedBitmap = null 
-        }
-        
-        previewBitmapRef?.let {
-            if (!it.isRecycled) it.recycle()
-        }
-        previewBitmapRef = null
-
-        recognizer.close()
-        cameraExecutor.shutdownNow()
-        analysisExecutor.shutdownNow()
-        
-        previewDir.listFiles()?.forEach { it.delete() }
-        
-        webView?.apply {
-            stopLoading()
-            clearHistory()
-            removeAllViews()
-            destroy()
-        }
-        webView = null
-
-        super.onDestroy()
-    }
-
-    companion object {
-        private const val REQUEST_CODE_PERMISSIONS = 1001
-        private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
-    }
-}
+            val halfWidth
