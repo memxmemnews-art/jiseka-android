@@ -180,7 +180,7 @@ class MainActivity : AppCompatActivity() {
             webChromeClient = WebChromeClient()
             addJavascriptInterface(AndroidBridge(), "AndroidBridge")
             
-            loadUrl("https://ziseka-app.vercel.app/")
+            loadUrl("https://ziseka-app.vercel.app/?v=" + System.currentTimeMillis())
         }
     }
 
