@@ -173,7 +173,6 @@ class MainActivity : AppCompatActivity() {
                 ): WebResourceResponse? {
                     return assetLoader.shouldInterceptRequest(request.url)
                 }
-
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest) = false
             }
             
@@ -283,7 +282,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
-       
+        
         @JavascriptInterface
         fun showToast(msg: String) {
             runOnUiThread { 
@@ -300,6 +299,10 @@ class MainActivity : AppCompatActivity() {
         return Bitmap.createScaledBitmap(bitmap, (oW * scale).toInt(), (oH * scale).toInt(), true)
     }
 
+    private fun isValidLicensePlatePattern(text: String): Boolean {
+        return text.replace(Regex("[^a-zA-Z0-9가-힣]"), "").length >= 3
+    }
+
     private fun verifyAndGenerateFilePreview(
         sourceBitmap: Bitmap, targetPoints: List<PointF>, fallbackPoints: List<PointF>, bmpW: Float, bmpH: Float
     ) {
@@ -308,29 +311,29 @@ class MainActivity : AppCompatActivity() {
         if (flatBmp != null) {
             val inputImage = InputImage.fromBitmap(flatBmp, 0)
             recognizer.process(inputImage).addOnCompleteListener { task ->
-                if (isDestroyed || isFinishing) {
-                    flatBmp.recycle()
-                    sourceBitmap.recycle()
+                if (isDestroyed || isFinishing || flatBmp.isRecycled) {
+                    if (!flatBmp.isRecycled) flatBmp.recycle()
+                    if (!sourceBitmap.isRecycled) sourceBitmap.recycle()
                     return@addOnCompleteListener
                 }
                 try {
-                    // 💡 개선 1. OCR은 부가 정보 획득 용도로만 제한
                     val hasText = task.isSuccessful && isValidLicensePlatePattern(task.result.text)
-                    if (hasText) {
-                        Log.d("JiSeKa Engine", "OCR: 텍스트 감지됨 -> ${task.result.text.replace('\n', ' ')}")
+                    
+                    val finalPoints = if (hasText) {
+                        Log.d("JiSeKa Engine", "OCR 합격 (텍스트 감지됨): ${task.result.text.replace('\n', ' ')}")
+                        targetPoints 
                     } else {
-                        Log.w("JiSeKa Engine", "OCR: 텍스트 미감지. 기하학 필터(OpenCV) 결과를 유지합니다.")
+                        Log.w("JiSeKa Engine", "OCR 불합격 (텍스트 부족). 유저 가이드라인(Fallback) 적용")
+                        fallbackPoints 
                     }
 
-                    // 💡 개선 2. OCR 통과 여부와 상관없이 무조건 OpenCV가 실제 찾은 targetPoints 사용
-                    val finalPoints = targetPoints
                     val previewBitmap = processPerspectiveOverlay(sourceBitmap, finalPoints)
                     val fileUriStr = saveBitmapToCacheFile(previewBitmap)
                     sendCachedPreviewToJs(finalPoints, fileUriStr, bmpW, bmpH)
                     previewBitmap.recycle()
                 } finally {
-                    flatBmp.recycle()
-                    sourceBitmap.recycle()
+                    if (!flatBmp.isRecycled) flatBmp.recycle()
+                    if (!sourceBitmap.isRecycled) sourceBitmap.recycle()
                 }
             }
         } else {
@@ -380,7 +383,7 @@ class MainActivity : AppCompatActivity() {
     private fun sendCachedPreviewToJs(points: List<PointF>, fileUriStr: String?, bmpW: Float, bmpH: Float) {
         val outputArray = JSONArray()
         for (pt in points) { outputArray.put(JSONObject().put("x", (pt.x / bmpW).toDouble()).put("y", (pt.y / bmpH).toDouble())) }
-         
+        
         val resultJson = JSONObject().apply { 
             put("corners", outputArray)
             put("preview", fileUriStr ?: JSONObject.NULL) 
@@ -392,9 +395,38 @@ class MainActivity : AppCompatActivity() {
         isProcessing = false 
     }
 
-    private fun isValidLicensePlatePattern(text: String): Boolean {
-        // 💡 개선 3. 공백/기호 제외 의미 있는 문자가 하나라도 있으면 OCR 통과 처리
-        return text.replace(Regex("[^a-zA-Z0-9가-힣]"), "").isNotEmpty()
+    private fun computeMedian(mat: org.opencv.core.Mat): Double {
+        val hist = org.opencv.core.Mat()
+        val ranges = org.opencv.core.MatOfFloat(0f, 256f)
+        val histSize = org.opencv.core.MatOfInt(256)
+        
+        return try {
+            Imgproc.calcHist(listOf(mat), org.opencv.core.MatOfInt(0), org.opencv.core.Mat(), hist, histSize, ranges)
+            
+            val total = mat.total()
+            var sum = 0.0
+            for (i in 0 until 256) {
+                sum += hist.get(i, 0)[0]
+                if (sum >= total / 2.0) return i.toDouble()
+            }
+            127.0
+        } finally {
+            hist.release()
+            ranges.release()
+            histSize.release()
+        }
+    }
+
+    private fun extractFourCorners(pts: List<PointF>): List<PointF>? {
+        if (pts.size < 4 || pts.size > 10) return null
+        if (pts.size == 4) return pts
+
+        val tl = pts.minByOrNull { it.x + it.y } ?: return null
+        val br = pts.maxByOrNull { it.x + it.y } ?: return null
+        val tr = pts.maxByOrNull { it.x - it.y } ?: return null
+        val bl = pts.minByOrNull { it.x - it.y } ?: return null
+
+        return listOf(tl, tr, br, bl)
     }
 
     private fun extractPlateCornersViaLineFitting(bitmap: Bitmap, pts: List<PointF>): List<PointF> {
@@ -403,14 +435,19 @@ class MainActivity : AppCompatActivity() {
         val roiMat = org.opencv.core.Mat()
         val edgeMat = org.opencv.core.Mat()
         val lines = org.opencv.core.Mat()
+        val contours = mutableListOf<MatOfPoint>()
 
         try {
             Utils.bitmapToMat(bitmap, mat)
             Imgproc.cvtColor(mat, gray, Imgproc.COLOR_RGBA2GRAY)
             
-            val claheObj = Imgproc.createCLAHE(2.5, org.opencv.core.Size(8.0, 8.0))
-            claheObj.apply(gray, gray)
-           
+            val claheObj = Imgproc.createCLAHE(4.0, org.opencv.core.Size(8.0, 8.0))
+            try {
+                claheObj.apply(gray, gray)
+            } finally {
+                claheObj.collectGarbage()
+            }
+            
             val xs = pts.map { it.x }
             val ys = pts.map { it.y }
             val baseMinX = max(0, xs.minOrNull()?.toInt() ?: 0)
@@ -422,8 +459,9 @@ class MainActivity : AppCompatActivity() {
             val baseHeight = baseMaxY - baseMinY
             if (baseWidth <= 20 || baseHeight <= 20) return pts
 
-            val padX = (baseWidth * 0.15).toInt()
-            val padY = (baseHeight * 0.20).toInt()
+            // 💡 패딩(여유 공간) 10%로 축소 적용
+            val padX = (baseWidth * 0.10).toInt()
+            val padY = (baseHeight * 0.10).toInt()
 
             val safeMinX = max(0, baseMinX - padX)
             val safeMinY = max(0, baseMinY - padY)
@@ -433,18 +471,21 @@ class MainActivity : AppCompatActivity() {
             val paddedRoi = org.opencv.core.Rect(safeMinX, safeMinY, safeMaxX - safeMinX, safeMaxY - safeMinY)
             
             gray.submat(paddedRoi).copyTo(roiMat)
-            Imgproc.GaussianBlur(roiMat, roiMat, org.opencv.core.Size(5.0, 5.0), 0.0)
             
-            val morphKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, org.opencv.core.Size(3.0, 3.0))
-            Imgproc.morphologyEx(roiMat, roiMat, Imgproc.MORPH_CLOSE, morphKernel)
+            Imgproc.GaussianBlur(roiMat, roiMat, org.opencv.core.Size(3.0, 3.0), 0.0)
+            
+            val median = computeMedian(roiMat)
+            val lower = max(0.0, 0.66 * median)
+            val upper = min(255.0, 1.33 * median)
+            Imgproc.Canny(roiMat, edgeMat, lower, upper)
+            
+            val morphKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, org.opencv.core.Size(5.0, 5.0))
+            Imgproc.morphologyEx(edgeMat, edgeMat, Imgproc.MORPH_CLOSE, morphKernel)
             morphKernel.release()
-            
-            Imgproc.Canny(roiMat, edgeMat, 50.0, 150.0)
             
             if (isDestroyed || isFinishing) return pts
 
-            // 💡 개선 4. 박스를 여유 있게 잡아도 짧은 번호판 선을 놓치지 않도록 최소 길이 완화 (0.3 -> 0.15)
-            Imgproc.HoughLinesP(edgeMat, lines, 1.0, Math.PI / 180, 30, paddedRoi.width * 0.15, 10.0)
+            Imgproc.HoughLinesP(edgeMat, lines, 1.0, Math.PI / 180, 30, paddedRoi.width * 0.10, 10.0)
             
             val rawTopLines = mutableListOf<Line>()
             val rawBottomLines = mutableListOf<Line>()
@@ -481,24 +522,20 @@ class MainActivity : AppCompatActivity() {
             if (tEdge != null && bEdge != null && lEdge != null && rEdge != null) {
                 val tl = getIntersection(tEdge, lEdge)
                 val tr = getIntersection(tEdge, rEdge)
-                 
                 val br = getIntersection(bEdge, rEdge)
                 val bl = getIntersection(bEdge, lEdge)
+                
                 if (tl != null && tr != null && br != null && bl != null) {
                     val candidateQuad = listOf(tl, tr, br, bl)
-                       
                     if (validateQuadrilateral(candidateQuad, paddedRoi.width, paddedRoi.height)) {
                         return applySubPixelRefinement(gray, paddedRoi, candidateQuad)
-                    } else {
-                        Log.w("JiSeKa Engine", "Hough 교점 기하학 검증 실패. 2순위 윤곽선 탐색으로 전환합니다.")
                     }
                 }
             }
 
-            val contours = mutableListOf<MatOfPoint>()
             val hierarchy = org.opencv.core.Mat()
             Imgproc.findContours(edgeMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
-             
+              
             var bestContourPoints: List<PointF>? = null
             var maxArea = 0.0
 
@@ -517,19 +554,20 @@ class MainActivity : AppCompatActivity() {
                     val approxArray = approx.toArray()
                     val rawPoints = approxArray.map { PointF(it.x.toFloat(), it.y.toFloat()) }
                     
-                    if (validateQuadrilateral(rawPoints, paddedRoi.width, paddedRoi.height)) {
+                    val quadPoints = extractFourCorners(rawPoints)
+            
+                    if (quadPoints != null && validateQuadrilateral(quadPoints, paddedRoi.width, paddedRoi.height)) {
                         contourMat = MatOfPoint(*approxArray)
                         val area = abs(Imgproc.contourArea(contourMat))
                         if (area > maxArea) {
                             maxArea = area
-                            bestContourPoints = sortCornersStandard(rawPoints)
+                            bestContourPoints = sortCornersStandard(quadPoints)
                         }
                     }
                 } finally {
                     contourMat?.release()
                     approx.release()
                     m2f.release()
-                    contour.release()
                 }
             }
             hierarchy.release()
@@ -546,6 +584,9 @@ class MainActivity : AppCompatActivity() {
             roiMat.release()
             edgeMat.release()
             lines.release()
+            
+            contours.forEach { it.release() }
+            contours.clear()
         }
     }
 
@@ -561,36 +602,8 @@ class MainActivity : AppCompatActivity() {
         if (!isInsideBounds) return false
 
         val contour = MatOfPoint(*ordered.map { org.opencv.core.Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
-        try {
-            if (!Imgproc.isContourConvex(contour)) return false
-
-            val area = abs(Imgproc.contourArea(contour))
-            val totalArea = imageW * imageH.toDouble()
-            if (area < totalArea * 0.005 || area > totalArea * 0.7) return false
-
-            val distance = { p1: PointF, p2: PointF -> sqrt((p1.x - p2.x).pow(2) + (p1.y - p2.y).pow(2)) }
-            val topW = distance(ordered[0], ordered[1])
-            val bottomW = distance(ordered[3], ordered[2])
-            val leftH = distance(ordered[0], ordered[3])
-            val rightH = distance(ordered[1], ordered[2])
-
-            val avgW = (topW + bottomW) / 2f
-            val avgH = (leftH + rightH) / 2f
-            if (avgH <= 0f) return false
-
-            val ratio = avgW / avgH
-            // 💡 개선 5. 측면/원근 촬영 종횡비 필터 완화 (2.0~6.5 -> 1.5~8.5)
-            if (ratio < 1.5f || ratio > 8.5f) return false
-
-            val minW = min(topW, bottomW)
-            val maxW = max(topW, bottomW)
-            val minH = min(leftH, rightH)
-            val maxH = max(leftH, rightH)
-            
-            // 💡 개선 6. 대칭 차이 왜곡률 완화 (4.0 -> 8.0)
-            if (minW < 10f || minH < 5f || maxW / minW > 8.0f || maxH / minH > 8.0f) return false
-
-            return true
+        return try {
+            Imgproc.isContourConvex(contour)
         } finally {
             contour.release()
         }
@@ -620,6 +633,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun applySubPixelRefinement(gray: org.opencv.core.Mat, roi: org.opencv.core.Rect, points: List<PointF>): List<PointF> {
+        if (gray.empty()) return sortCornersStandard(points.map { PointF(it.x + roi.x, it.y + roi.y) })
+
         val globalPoints = points.map { PointF(it.x + roi.x, it.y + roi.y) }
         val sorted = sortCornersStandard(globalPoints)
         
@@ -943,7 +958,7 @@ class MainActivity : AppCompatActivity() {
                         )
                         nativeBackgroundView?.setImageBitmap(previewBitmapRef)
                         nativeBackgroundView?.visibility = View.VISIBLE
-                        
+                       
                         val bmpW = safeBitmap.width
                         val bmpH = safeBitmap.height
                         safeEvaluate("window.onNativePhotoCaptured($safeEscapedUri, $bmpW, $bmpH)")
@@ -1021,7 +1036,7 @@ class MainActivity : AppCompatActivity() {
         val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
         uri?.let { 
             contentResolver.openOutputStream(it)?.use { stream -> 
-                success = bitmap.compress(Bitmap.CompressFormat.JPEG, 100, stream) 
+                success = bitmap.compress(Bitmap.CompressFormat.JPEG, 95, stream) 
             } 
         }
         
