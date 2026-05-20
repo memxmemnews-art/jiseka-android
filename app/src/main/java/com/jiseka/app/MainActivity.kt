@@ -204,8 +204,6 @@ class MainActivity : AppCompatActivity() {
 
         @JavascriptInterface
         fun analyzePlateWithMode(cornersJsonStr: String, mode: String) {
-            Log.d("JiSeKa Engine", "JS -> Android 브릿지 정상 호출됨: Text-First 분석 파이프라인 시작")
-            
             analysisExecutor.execute {
                 if (isDestroyed || isFinishing) return@execute
                 
@@ -235,7 +233,6 @@ class MainActivity : AppCompatActivity() {
                         mappedPoints.add(PointF(targetBmpX, targetBmpY))
                     }
 
-                    // 1단계: 가이드 박스 기반 관심 영역(ROI) 1차 크롭 (10% 패딩)
                     val xs = mappedPoints.map { it.x }
                     val ys = mappedPoints.map { it.y }
                     val baseMinX = max(0, xs.minOrNull()?.toInt() ?: 0)
@@ -245,6 +242,10 @@ class MainActivity : AppCompatActivity() {
 
                     val baseWidth = baseMaxX - baseMinX
                     val baseHeight = baseMaxY - baseMinY
+                    if (baseWidth <= 20 || baseHeight <= 20) {
+                        verifyAndGenerateFilePreview(processingBitmap, mappedPoints, mappedPoints, bmpW, bmpH)
+                        return@execute
+                    }
 
                     val padX = (baseWidth * 0.10).toInt()
                     val padY = (baseHeight * 0.10).toInt()
@@ -257,11 +258,9 @@ class MainActivity : AppCompatActivity() {
                     val guideRect = android.graphics.Rect(safeMinX, safeMinY, safeMaxX, safeMaxY)
                     guideBitmap = Bitmap.createBitmap(processingBitmap, guideRect.left, guideRect.top, guideRect.width(), guideRect.height())
 
-                    // 2단계: OCR로 텍스트 마스터 사각형 확보
                     val inputImage = InputImage.fromBitmap(guideBitmap, 0)
                     
                     recognizer.process(inputImage).addOnCompleteListener { task ->
-                        // 💡 비동기 콜백이 UI 스레드를 막지 않도록 다시 Background Executor로 진입
                         analysisExecutor.execute {
                             if (isDestroyed || isFinishing) {
                                 guideBitmap?.recycle()
@@ -269,7 +268,8 @@ class MainActivity : AppCompatActivity() {
                                 return@execute
                             }
 
-                            var finalPoints = mappedPoints // 최악의 경우를 대비한 가이드 박스 백업
+                            // 💡 해결: 타입 불일치를 해결하기 위해 List<PointF> 명시적 선언
+                            var finalPoints: List<PointF> = mappedPoints 
 
                             try {
                                 if (task.isSuccessful && task.result.textBlocks.isNotEmpty()) {
@@ -292,12 +292,10 @@ class MainActivity : AppCompatActivity() {
                                         }
                                     }
 
-                                    // 3단계: 텍스트 사각형 상하좌우 30% 확장
                                     if (hasValidText && tMinX < tMaxX && tMinY < tMaxY) {
                                         val tW = tMaxX - tMinX
                                         val tH = tMaxY - tMinY
 
-                                        // 💡 상하좌우 30% 강제 확장 (노이즈 침범을 막고 번호판 물리적 테두리만 포함하는 최적의 수치)
                                         val ePadX = (tW * 0.30f).toInt()
                                         val ePadY = (tH * 0.30f).toInt()
 
@@ -308,26 +306,16 @@ class MainActivity : AppCompatActivity() {
 
                                         val expandedRect = org.opencv.core.Rect(eMinX, eMinY, eMaxX - eMinX, eMaxY - eMinY)
 
-                                        // 4~5단계: 확장된 사각형 안쪽만 OpenCV 전처리 및 테두리 스케치
                                         val refinedPointsLocal = performTextAnchoredEdgeDetection(guideBitmap!!, expandedRect)
                                         
                                         if (refinedPointsLocal != null) {
-                                            // OpenCV 좌표계를 원본 해상도(processingBitmap) 좌표계로 다시 매핑
                                             finalPoints = refinedPointsLocal.map {
                                                 PointF(it.x + guideRect.left, it.y + guideRect.top)
                                             }
-                                            Log.d("JiSeKa Engine", "텍스트 앵커링 테두리 검출 및 맵핑 성공!")
-                                        } else {
-                                            Log.w("JiSeKa Engine", "테두리 검출 실패. 유저 가이드박스(Fallback) 사용")
                                         }
-                                    } else {
-                                        Log.w("JiSeKa Engine", "유효한 텍스트 사각형 없음. 유저 가이드박스(Fallback) 사용")
                                     }
-                                } else {
-                                    Log.w("JiSeKa Engine", "OCR 실패. 유저 가이드박스(Fallback) 사용")
                                 }
 
-                                // 6단계: 검증된 점(finalPoints)으로 가림막 합성 및 JS 전송
                                 val previewBitmap = processPerspectiveOverlay(processingBitmap!!, finalPoints)
                                 val fileUriStr = saveBitmapToCacheFile(previewBitmap)
                                 sendCachedPreviewToJs(finalPoints, fileUriStr, bmpW, bmpH)
@@ -411,156 +399,34 @@ class MainActivity : AppCompatActivity() {
         return text.replace(Regex("[^a-zA-Z0-9가-힣]"), "").length >= 3
     }
 
-    // 💡 Text-First 구조에 맞게 완전히 새롭게 작성된 OpenCV 정밀 탐지 로직
-    private fun performTextAnchoredEdgeDetection(bitmap: Bitmap, expandedRect: org.opencv.core.Rect): List<PointF>? {
-        val mat = org.opencv.core.Mat()
-        val gray = org.opencv.core.Mat()
-        val roiMat = org.opencv.core.Mat()
-        val edgeMat = org.opencv.core.Mat()
-        val lines = org.opencv.core.Mat()
-        val contours = mutableListOf<MatOfPoint>()
-
-        try {
-            Utils.bitmapToMat(bitmap, mat)
-            Imgproc.cvtColor(mat, gray, Imgproc.COLOR_RGBA2GRAY)
-
-            val claheObj = Imgproc.createCLAHE(4.0, org.opencv.core.Size(8.0, 8.0))
-            try { claheObj.apply(gray, gray) } finally { claheObj.collectGarbage() }
-
-            // 💡 핵심: 그릴이나 범퍼를 피하기 위해, 텍스트가 있는 공간(expandedRect)만 칼같이 오려냅니다.
-            gray.submat(expandedRect).copyTo(roiMat)
-
-            Imgproc.GaussianBlur(roiMat, roiMat, org.opencv.core.Size(3.0, 3.0), 0.0)
-
-            val median = computeMedian(roiMat)
-            val lower = max(0.0, 0.66 * median)
-            val upper = min(255.0, 1.33 * median)
-            Imgproc.Canny(roiMat, edgeMat, lower, upper)
-
-            val morphKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, org.opencv.core.Size(5.0, 5.0))
-            Imgproc.morphologyEx(edgeMat, edgeMat, Imgproc.MORPH_CLOSE, morphKernel)
-            morphKernel.release()
-
-            if (isDestroyed || isFinishing) return null
-
-            Imgproc.HoughLinesP(edgeMat, lines, 1.0, Math.PI / 180, 30, expandedRect.width * 0.10, 10.0)
-
-            val rawTopLines = mutableListOf<Line>()
-            val rawBottomLines = mutableListOf<Line>()
-            val rawLeftLines = mutableListOf<Line>()
-            val rawRightLines = mutableListOf<Line>()
-            val roiCenterY = expandedRect.height / 2.0
-            val roiCenterX = expandedRect.width / 2.0
-
-            for (i in 0 until lines.rows()) {
-                val vec = lines.get(i, 0) ?: continue
-                val dx = vec[2] - vec[0]
-                val dy = vec[3] - vec[1]
-
-                val length = sqrt(dx * dx + dy * dy)
-                var angle = Math.atan2(dy, dx) * 180.0 / Math.PI
-                if (angle < 0) angle += 180.0
-
-                val midX = (vec[0] + vec[2]) / 2.0
-                val midY = (vec[1] + vec[3]) / 2.0
-                val lineObj = Line(vec[0], vec[1], vec[2], vec[3], length, angle)
-
-                if (abs(dx) > abs(dy)) {
-                    if (midY < roiCenterY) rawTopLines.add(lineObj) else rawBottomLines.add(lineObj)
-                } else {
-                    if (midX < roiCenterX) rawLeftLines.add(lineObj) else rawRightLines.add(lineObj)
+    private fun verifyAndGenerateFilePreview(
+        sourceBitmap: Bitmap, targetPoints: List<PointF>, fallbackPoints: List<PointF>, bmpW: Float, bmpH: Float
+    ) {
+        val flatBmp = rectifyToFlatPlate(sourceBitmap, targetPoints)
+    
+        if (flatBmp != null) {
+            recognizer.process(InputImage.fromBitmap(flatBmp, 0)).addOnCompleteListener { task ->
+                if (isDestroyed || isFinishing || flatBmp.isRecycled) {
+                    if (!flatBmp.isRecycled) flatBmp.recycle()
+                    if (!sourceBitmap.isRecycled) sourceBitmap.recycle()
+                    return@addOnCompleteListener
                 }
-            }
-
-            val tEdge = mergeLinesLinearRegression(filterByDominantAngle(rawTopLines), true, expandedRect.width, expandedRect.height)
-            val bEdge = mergeLinesLinearRegression(filterByDominantAngle(rawBottomLines), true, expandedRect.width, expandedRect.height)
-            val lEdge = mergeLinesLinearRegression(filterByDominantAngle(rawLeftLines), false, expandedRect.width, expandedRect.height)
-            val rEdge = mergeLinesLinearRegression(filterByDominantAngle(rawRightLines), false, expandedRect.width, expandedRect.height)
-
-            if (tEdge != null && bEdge != null && lEdge != null && rEdge != null) {
-                val tl = getIntersection(tEdge, lEdge)
-                val tr = getIntersection(tEdge, rEdge)
-                val br = getIntersection(bEdge, rEdge)
-                val bl = getIntersection(bEdge, lEdge)
-
-                if (tl != null && tr != null && br != null && bl != null) {
-                    val candidateQuad = listOf(tl, tr, br, bl)
-                    if (validateQuadrilateral(candidateQuad, expandedRect.width, expandedRect.height)) {
-                        // 💡 검출된 점을 원래 해상도에 맞게 오프셋(+ left, top) 처리
-                        return applySubPixelRefinement(gray, expandedRect, candidateQuad)
-                    }
-                }
-            }
-
-            val hierarchy = org.opencv.core.Mat()
-            Imgproc.findContours(edgeMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
-
-            var bestContourPoints: List<PointF>? = null
-            var maxArea = 0.0
-
-            if (isDestroyed || isFinishing) return null
-
-            for (contour in contours) {
-                val m2f = MatOfPoint2f()
-                val approx = MatOfPoint2f()
                 try {
-                    m2f.fromArray(*contour.toArray())
-                    val peri = Imgproc.arcLength(m2f, true)
-                    Imgproc.approxPolyDP(m2f, approx, 0.02 * peri, true)
-
-                    val approxArray = approx.toArray()
-                    val rawPoints = approxArray.map { PointF(it.x.toFloat(), it.y.toFloat()) }
-                    val quadPoints = extractFourCorners(rawPoints)
-
-                    if (quadPoints != null && validateQuadrilateral(quadPoints, expandedRect.width, expandedRect.height)) {
-                        val contourMat = MatOfPoint(*approxArray)
-                        val area = abs(Imgproc.contourArea(contourMat))
-                        if (area > maxArea) {
-                            maxArea = area
-                            bestContourPoints = sortCornersStandard(quadPoints)
-                        }
-                        contourMat.release()
-                    }
+                    val hasText = task.isSuccessful && isValidLicensePlatePattern(task.result.text)
+                    val finalPoints = if (hasText) targetPoints else fallbackPoints
+                    val previewBitmap = processPerspectiveOverlay(sourceBitmap, finalPoints)
+                    val fileUriStr = saveBitmapToCacheFile(previewBitmap)
+                    sendCachedPreviewToJs(finalPoints, fileUriStr, bmpW, bmpH)
+                    previewBitmap.recycle()
                 } finally {
-                    approx.release()
-                    m2f.release()
+                    if (!flatBmp.isRecycled) flatBmp.recycle()
+                    if (!sourceBitmap.isRecycled) sourceBitmap.recycle()
                 }
             }
-            hierarchy.release()
-
-            if (bestContourPoints != null) {
-                return applySubPixelRefinement(gray, expandedRect, bestContourPoints)
-            }
-
-            return null
-        } finally {
-            mat.release()
-            gray.release()
-            roiMat.release()
-            edgeMat.release()
-            lines.release()
-            contours.forEach { it.release() }
-            contours.clear()
-        }
-    }
-
-    private fun validateQuadrilateral(pts: List<PointF>, imageW: Int, imageH: Int): Boolean {
-        if (pts.size != 4) return false
-        val ordered = sortCornersStandard(pts)
-        val contour = MatOfPoint(*ordered.map { org.opencv.core.Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
-        
-        return try {
-            if (!Imgproc.isContourConvex(contour)) return false
-            
-            // 💡 텍스트 앵커링 구조에서는 이미 그릴이나 범퍼가 잘려나간 상태이므로, 
-            // 발견된 다각형이 ROI 면적의 10% 이상을 차지하기만 하면 진짜 번호판으로 인정합니다.
-            val area = abs(Imgproc.contourArea(contour))
-            val totalArea = imageW * imageH.toDouble()
-            if (area < totalArea * 0.1) return false
-            
-            true
-        } finally {
-            contour.release()
+        } else {
+            val fileUriStr = saveBitmapToCacheFile(sourceBitmap)
+            sendCachedPreviewToJs(fallbackPoints, fileUriStr, bmpW, bmpH)
+            sourceBitmap.recycle()
         }
     }
 
@@ -632,6 +498,152 @@ class MainActivity : AppCompatActivity() {
         val tr = pts.maxByOrNull { it.x - it.y } ?: return null
         val bl = pts.minByOrNull { it.x - it.y } ?: return null
         return listOf(tl, tr, br, bl)
+    }
+
+    private fun performTextAnchoredEdgeDetection(bitmap: Bitmap, expandedRect: org.opencv.core.Rect): List<PointF>? {
+        val mat = org.opencv.core.Mat()
+        val gray = org.opencv.core.Mat()
+        val roiMat = org.opencv.core.Mat()
+        val edgeMat = org.opencv.core.Mat()
+        val lines = org.opencv.core.Mat()
+        val contours = mutableListOf<MatOfPoint>()
+
+        try {
+            Utils.bitmapToMat(bitmap, mat)
+            Imgproc.cvtColor(mat, gray, Imgproc.COLOR_RGBA2GRAY)
+
+            val claheObj = Imgproc.createCLAHE(4.0, org.opencv.core.Size(8.0, 8.0))
+            try { claheObj.apply(gray, gray) } finally { claheObj.collectGarbage() }
+
+            gray.submat(expandedRect).copyTo(roiMat)
+
+            Imgproc.GaussianBlur(roiMat, roiMat, org.opencv.core.Size(3.0, 3.0), 0.0)
+
+            val median = computeMedian(roiMat)
+            val lower = max(0.0, 0.66 * median)
+            val upper = min(255.0, 1.33 * median)
+            Imgproc.Canny(roiMat, edgeMat, lower, upper)
+
+            val morphKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, org.opencv.core.Size(5.0, 5.0))
+            Imgproc.morphologyEx(edgeMat, edgeMat, Imgproc.MORPH_CLOSE, morphKernel)
+            morphKernel.release()
+
+            if (isDestroyed || isFinishing) return null
+
+            Imgproc.HoughLinesP(edgeMat, lines, 1.0, Math.PI / 180, 30, expandedRect.width * 0.10, 10.0)
+
+            val rawTopLines = mutableListOf<Line>()
+            val rawBottomLines = mutableListOf<Line>()
+            val rawLeftLines = mutableListOf<Line>()
+            val rawRightLines = mutableListOf<Line>()
+            val roiCenterY = expandedRect.height / 2.0
+            val roiCenterX = expandedRect.width / 2.0
+
+            for (i in 0 until lines.rows()) {
+                val vec = lines.get(i, 0) ?: continue
+                val dx = vec[2] - vec[0]
+                val dy = vec[3] - vec[1]
+
+                val length = sqrt(dx * dx + dy * dy)
+                var angle = Math.atan2(dy, dx) * 180.0 / Math.PI
+                if (angle < 0) angle += 180.0
+
+                val midX = (vec[0] + vec[2]) / 2.0
+                val midY = (vec[1] + vec[3]) / 2.0
+                val lineObj = Line(vec[0], vec[1], vec[2], vec[3], length, angle)
+
+                if (abs(dx) > abs(dy)) {
+                    if (midY < roiCenterY) rawTopLines.add(lineObj) else rawBottomLines.add(lineObj)
+                } else {
+                    if (midX < roiCenterX) rawLeftLines.add(lineObj) else rawRightLines.add(lineObj)
+                }
+            }
+
+            val tEdge = mergeLinesLinearRegression(filterByDominantAngle(rawTopLines), true, expandedRect.width, expandedRect.height)
+            val bEdge = mergeLinesLinearRegression(filterByDominantAngle(rawBottomLines), true, expandedRect.width, expandedRect.height)
+            val lEdge = mergeLinesLinearRegression(filterByDominantAngle(rawLeftLines), false, expandedRect.width, expandedRect.height)
+            val rEdge = mergeLinesLinearRegression(filterByDominantAngle(rawRightLines), false, expandedRect.width, expandedRect.height)
+
+            if (tEdge != null && bEdge != null && lEdge != null && rEdge != null) {
+                val tl = getIntersection(tEdge, lEdge)
+                val tr = getIntersection(tEdge, rEdge)
+                val br = getIntersection(bEdge, rEdge)
+                val bl = getIntersection(bEdge, lEdge)
+
+                if (tl != null && tr != null && br != null && bl != null) {
+                    val candidateQuad = listOf(tl, tr, br, bl)
+                    if (validateQuadrilateral(candidateQuad, expandedRect.width, expandedRect.height)) {
+                        return applySubPixelRefinement(gray, expandedRect, candidateQuad)
+                    }
+                }
+            }
+
+            val hierarchy = org.opencv.core.Mat()
+            Imgproc.findContours(edgeMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+
+            var bestContourPoints: List<PointF>? = null
+            var maxArea = 0.0
+
+            if (isDestroyed || isFinishing) return null
+
+            for (contour in contours) {
+                val m2f = MatOfPoint2f()
+                val approx = MatOfPoint2f()
+                try {
+                    m2f.fromArray(*contour.toArray())
+                    val peri = Imgproc.arcLength(m2f, true)
+                    Imgproc.approxPolyDP(m2f, approx, 0.02 * peri, true)
+
+                    val approxArray = approx.toArray()
+                    val rawPoints = approxArray.map { PointF(it.x.toFloat(), it.y.toFloat()) }
+                    val quadPoints = extractFourCorners(rawPoints)
+
+                    if (quadPoints != null && validateQuadrilateral(quadPoints, expandedRect.width, expandedRect.height)) {
+                        val contourMat = MatOfPoint(*approxArray)
+                        val area = abs(Imgproc.contourArea(contourMat))
+                        if (area > maxArea) {
+                            maxArea = area
+                            bestContourPoints = sortCornersStandard(quadPoints)
+                        }
+                        contourMat.release()
+                    }
+                } finally {
+                    approx.release()
+                    m2f.release()
+                }
+            }
+            hierarchy.release()
+
+            if (bestContourPoints != null) {
+                return applySubPixelRefinement(gray, expandedRect, bestContourPoints)
+            }
+
+            return null
+        } finally {
+            mat.release()
+            gray.release()
+            roiMat.release()
+            edgeMat.release()
+            lines.release()
+            contours.forEach { it.release() }
+            contours.clear()
+        }
+    }
+
+    private fun validateQuadrilateral(pts: List<PointF>, imageW: Int, imageH: Int): Boolean {
+        if (pts.size != 4) return false
+        val ordered = sortCornersStandard(pts)
+        val contour = MatOfPoint(*ordered.map { org.opencv.core.Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
+        
+        return try {
+            if (!Imgproc.isContourConvex(contour)) return false
+            val area = abs(Imgproc.contourArea(contour))
+            val totalArea = imageW * imageH.toDouble()
+            if (area < totalArea * 0.1) return false
+            true
+        } finally {
+            contour.release()
+        }
     }
 
     private fun circularAngleDiff(a: Double, b: Double): Double {
