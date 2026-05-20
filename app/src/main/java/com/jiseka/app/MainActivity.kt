@@ -180,7 +180,6 @@ class MainActivity : AppCompatActivity() {
             webChromeClient = WebChromeClient()
             addJavascriptInterface(AndroidBridge(), "AndroidBridge")
             
-            // 💡 [수정] 앱 실행 시 웹뷰 캐시 무력화 (항상 최신 Vercel 배포본 로드)
             loadUrl("https://ziseka-app.vercel.app/?v=" + System.currentTimeMillis())
         }
     }
@@ -216,7 +215,6 @@ class MainActivity : AppCompatActivity() {
                         lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) 
                     } ?: return@execute
 
-                    // 분석용 맵
                     val processingBitmap = scaleBitmapDownToLimit(rawBitmap, 1920, 1080)
                     if (processingBitmap !== rawBitmap) rawBitmap.recycle()
 
@@ -226,8 +224,6 @@ class MainActivity : AppCompatActivity() {
                     val inputCorners = JSONObject(cornersJsonStr).getJSONArray("corners")
                     val mappedPoints = mutableListOf<PointF>()
 
-                    // 💡 [핵심 수정] JS가 완벽하게 정제된 이미지 기준 정규화 좌표(0.0~1.0)를 보내주므로, 
-                    // 복잡한 오프셋 역산 로직을 폐기하고 현재 비트맵 크기에 단순 곱셈만 수행합니다. (True SSOT)
                     for (i in 0 until 4) {
                         val p = inputCorners.getJSONObject(i)
                         val normX = p.getDouble("x").toFloat()
@@ -287,7 +283,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
-        
+       
         @JavascriptInterface
         fun showToast(msg: String) {
             runOnUiThread { 
@@ -318,11 +314,16 @@ class MainActivity : AppCompatActivity() {
                     return@addOnCompleteListener
                 }
                 try {
-                    val finalPoints = if (task.isSuccessful && isValidLicensePlatePattern(task.result.text)) {
-                        targetPoints
+                    // 💡 개선 1. OCR은 부가 정보 획득 용도로만 제한
+                    val hasText = task.isSuccessful && isValidLicensePlatePattern(task.result.text)
+                    if (hasText) {
+                        Log.d("JiSeKa Engine", "OCR: 텍스트 감지됨 -> ${task.result.text.replace('\n', ' ')}")
                     } else {
-                        fallbackPoints
+                        Log.w("JiSeKa Engine", "OCR: 텍스트 미감지. 기하학 필터(OpenCV) 결과를 유지합니다.")
                     }
+
+                    // 💡 개선 2. OCR 통과 여부와 상관없이 무조건 OpenCV가 실제 찾은 targetPoints 사용
+                    val finalPoints = targetPoints
                     val previewBitmap = processPerspectiveOverlay(sourceBitmap, finalPoints)
                     val fileUriStr = saveBitmapToCacheFile(previewBitmap)
                     sendCachedPreviewToJs(finalPoints, fileUriStr, bmpW, bmpH)
@@ -379,7 +380,7 @@ class MainActivity : AppCompatActivity() {
     private fun sendCachedPreviewToJs(points: List<PointF>, fileUriStr: String?, bmpW: Float, bmpH: Float) {
         val outputArray = JSONArray()
         for (pt in points) { outputArray.put(JSONObject().put("x", (pt.x / bmpW).toDouble()).put("y", (pt.y / bmpH).toDouble())) }
-        
+         
         val resultJson = JSONObject().apply { 
             put("corners", outputArray)
             put("preview", fileUriStr ?: JSONObject.NULL) 
@@ -391,7 +392,10 @@ class MainActivity : AppCompatActivity() {
         isProcessing = false 
     }
 
-    private fun isValidLicensePlatePattern(text: String): Boolean = text.replace(Regex("\\s+"), "").count { it.isDigit() } >= 3
+    private fun isValidLicensePlatePattern(text: String): Boolean {
+        // 💡 개선 3. 공백/기호 제외 의미 있는 문자가 하나라도 있으면 OCR 통과 처리
+        return text.replace(Regex("[^a-zA-Z0-9가-힣]"), "").isNotEmpty()
+    }
 
     private fun extractPlateCornersViaLineFitting(bitmap: Bitmap, pts: List<PointF>): List<PointF> {
         val mat = org.opencv.core.Mat()
@@ -413,7 +417,7 @@ class MainActivity : AppCompatActivity() {
             val baseMinY = max(0, ys.minOrNull()?.toInt() ?: 0)
             val baseMaxX = min(mat.cols() - 1, xs.maxOrNull()?.toInt() ?: (mat.cols() - 1))
             val baseMaxY = min(mat.rows() - 1, ys.maxOrNull()?.toInt() ?: (mat.rows() - 1))
-            
+         
             val baseWidth = baseMaxX - baseMinX
             val baseHeight = baseMaxY - baseMinY
             if (baseWidth <= 20 || baseHeight <= 20) return pts
@@ -439,7 +443,8 @@ class MainActivity : AppCompatActivity() {
             
             if (isDestroyed || isFinishing) return pts
 
-            Imgproc.HoughLinesP(edgeMat, lines, 1.0, Math.PI / 180, 30, paddedRoi.width * 0.3, 10.0)
+            // 💡 개선 4. 박스를 여유 있게 잡아도 짧은 번호판 선을 놓치지 않도록 최소 길이 완화 (0.3 -> 0.15)
+            Imgproc.HoughLinesP(edgeMat, lines, 1.0, Math.PI / 180, 30, paddedRoi.width * 0.15, 10.0)
             
             val rawTopLines = mutableListOf<Line>()
             val rawBottomLines = mutableListOf<Line>()
@@ -452,6 +457,7 @@ class MainActivity : AppCompatActivity() {
                 val vec = lines.get(i, 0) ?: continue
                 val dx = vec[2] - vec[0]
                 val dy = vec[3] - vec[1]
+                 
                 val length = sqrt(dx * dx + dy * dy)
                 var angle = Math.atan2(dy, dx) * 180.0 / Math.PI
                 if (angle < 0) angle += 180.0
@@ -475,11 +481,12 @@ class MainActivity : AppCompatActivity() {
             if (tEdge != null && bEdge != null && lEdge != null && rEdge != null) {
                 val tl = getIntersection(tEdge, lEdge)
                 val tr = getIntersection(tEdge, rEdge)
+                 
                 val br = getIntersection(bEdge, rEdge)
                 val bl = getIntersection(bEdge, lEdge)
                 if (tl != null && tr != null && br != null && bl != null) {
                     val candidateQuad = listOf(tl, tr, br, bl)
-                    
+                       
                     if (validateQuadrilateral(candidateQuad, paddedRoi.width, paddedRoi.height)) {
                         return applySubPixelRefinement(gray, paddedRoi, candidateQuad)
                     } else {
@@ -491,7 +498,7 @@ class MainActivity : AppCompatActivity() {
             val contours = mutableListOf<MatOfPoint>()
             val hierarchy = org.opencv.core.Mat()
             Imgproc.findContours(edgeMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
-            
+             
             var bestContourPoints: List<PointF>? = null
             var maxArea = 0.0
 
@@ -572,13 +579,16 @@ class MainActivity : AppCompatActivity() {
             if (avgH <= 0f) return false
 
             val ratio = avgW / avgH
-            if (ratio < 2.0f || ratio > 6.5f) return false
+            // 💡 개선 5. 측면/원근 촬영 종횡비 필터 완화 (2.0~6.5 -> 1.5~8.5)
+            if (ratio < 1.5f || ratio > 8.5f) return false
 
             val minW = min(topW, bottomW)
             val maxW = max(topW, bottomW)
             val minH = min(leftH, rightH)
             val maxH = max(leftH, rightH)
-            if (minW < 10f || minH < 5f || maxW / minW > 4.0f || maxH / minH > 4.0f) return false
+            
+            // 💡 개선 6. 대칭 차이 왜곡률 완화 (4.0 -> 8.0)
+            if (minW < 10f || minH < 5f || maxW / minW > 8.0f || maxH / minH > 8.0f) return false
 
             return true
         } finally {
@@ -600,7 +610,7 @@ class MainActivity : AppCompatActivity() {
             val bucket = ((normalizedAngle + 2.5) / 5.0).toInt() * 5
             angleBuckets[bucket] = (angleBuckets[bucket] ?: 0.0) + line.length
         }
-        
+         
         val dominantBucket = angleBuckets.maxByOrNull { it.value }?.key?.toDouble() ?: return lines
         val dominantAngle = if (dominantBucket < 0) dominantBucket + 180.0 else dominantBucket
 
@@ -706,6 +716,7 @@ class MainActivity : AppCompatActivity() {
         val a2 = line2.y2 - line2.y1
         val b2 = line2.x1 - line2.x2
         val c2 = a2 * line2.x1 + b2 * line2.y1
+        
         val det = a1 * b2 - a2 * b1
         if (abs(det) < 1e-6) return null
         return PointF(((b2 * c1 - b1 * c2) / det).toFloat(), ((a1 * c2 - a2 * c1) / det).toFloat())
@@ -854,8 +865,6 @@ class MainActivity : AppCompatActivity() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             val cameraProvider = cameraProviderFuture.get()
-            
-            // 💡 [핵심 해결] 비율 일치
             val targetRatio = AspectRatio.RATIO_16_9 
 
             val preview = Preview.Builder()
@@ -916,16 +925,13 @@ class MainActivity : AppCompatActivity() {
                         if (isDestroyed || isFinishing) return@runOnUiThread
 
                         nativeBackgroundView?.setImageDrawable(null)
-                        
                         val safeEscapedUri = JSONObject.quote(previewUri)
-                        
                         viewFinder?.visibility = View.GONE
                         
                         previewBitmapRef?.let {
                             if (!it.isRecycled) it.recycle()
                         }
 
-                        // UI 렌더링용 크기 최적화 방어
                         val previewW = max(1, safeBitmap.width / 2)
                         val previewH = max(1, safeBitmap.height / 2)
                         
@@ -938,7 +944,6 @@ class MainActivity : AppCompatActivity() {
                         nativeBackgroundView?.setImageBitmap(previewBitmapRef)
                         nativeBackgroundView?.visibility = View.VISIBLE
                         
-                        // 💡 [핵심 수정] JS로 URI와 함께 EXIF 처리가 완료된 "실제 원본 비트맵의 폭/높이"를 함께 넘겨줍니다.
                         val bmpW = safeBitmap.width
                         val bmpH = safeBitmap.height
                         safeEvaluate("window.onNativePhotoCaptured($safeEscapedUri, $bmpW, $bmpH)")
@@ -947,7 +952,7 @@ class MainActivity : AppCompatActivity() {
                     Log.e("JiSeKa Engine", "비트맵 적재 중 크래시 발생", t)
                     runOnUiThread {
                         if (!isDestroyed && !isFinishing) {
-                            isProcessing = false // 💡 에러 발생 시 확실히 락 해제
+                            isProcessing = false 
                             viewFinder?.visibility = View.VISIBLE
                             nativeBackgroundView?.visibility = View.GONE
                             Toast.makeText(this@MainActivity, "사진 처리 중 문제가 발생했습니다.", Toast.LENGTH_SHORT).show()
@@ -959,7 +964,7 @@ class MainActivity : AppCompatActivity() {
             override fun onError(e: ImageCaptureException) { 
                 runOnUiThread {
                     if (!isDestroyed && !isFinishing) {
-                        isProcessing = false // 💡 에러 발생 시 확실히 락 해제
+                        isProcessing = false 
                         Toast.makeText(this@MainActivity, "캡처 실패: ${e.message}", Toast.LENGTH_SHORT).show()
                     }
                 }
