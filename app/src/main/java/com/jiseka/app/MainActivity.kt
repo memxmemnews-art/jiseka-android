@@ -476,7 +476,6 @@ class MainActivity : AppCompatActivity() {
     private fun processPerspectiveOverlay(source: Bitmap, targetCorners: List<PointF>): Bitmap {
         val result = source.copy(Bitmap.Config.ARGB_8888, true)
         val targetMat = Mat()
-    
         val maskMat = Mat(); val warpedMask = Mat(); val alphaMask = Mat()
         val finalBlended = Mat()
         try {
@@ -502,26 +501,26 @@ class MainActivity : AppCompatActivity() {
             Core.split(warpedMask, warpedChannels)
             Core.split(targetMat, targetChannels)
 
+            // 💡 1. 32FC1 Float 정밀도 행렬에 맞는 올바른 빼기 기반 행렬 반전 (1.0 - alpha)
             val inverseMask = Mat()
-            Core.bitwise_not(alphaMask, inverseMask)
+            val ones = Mat(alphaMask.size(), CvType.CV_32FC1, org.opencv.core.Scalar(1.0))
+            Core.subtract(ones, alphaMask, inverseMask)
 
-            for (i in 0 until 3) {
+            // 💡 2. RGB 뿐만 아니라 알파 채널(Index 3)까지 완벽히 동일 연산하여 ARGB 일관성 100% 확보
+            val numChannels = min(warpedChannels.size, targetChannels.size)
+            for (i in 0 until numChannels) {
                 Core.multiply(warpedChannels[i], alphaMask, warpedChannels[i])
-                Core.multiply(targetChannels[i], inverseMask, targetChannels[i], 1.0 / 255.0) 
+                // 💡 3. 배경 픽셀 파괴 주범이었던 1.0/255.0 스케일 배율 인자 완벽 제거
+                Core.multiply(targetChannels[i], inverseMask, targetChannels[i]) 
                 Core.add(warpedChannels[i], targetChannels[i], warpedChannels[i])
             }
-            
-            if (warpedChannels.size > 3 && targetChannels.size > 3) {
-                val alphaClone = targetChannels[3].clone()
-                warpedChannels[3].release()
-                warpedChannels[3] = alphaClone
-            }
+
             Core.merge(warpedChannels, finalBlended)
             finalBlended.convertTo(finalBlended, CvType.CV_8UC4)
             Utils.matToBitmap(finalBlended, result)
      
             srcPts.release()
-            dstPts.release(); transform.release(); inverseMask.release()
+            dstPts.release(); transform.release(); inverseMask.release(); ones.release()
             warpedChannels.forEach { it.release() }
             targetChannels.forEach { it.release() }
             return result
@@ -564,7 +563,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun takePhoto() {
-        // 1. 중복 촬영 방지 Lock 추가
         if (isProcessing) return
         isProcessing = true
 
@@ -573,7 +571,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
         
-        // 2. 저장 경로를 웹뷰가 읽을 수 있는 previewDir로 수정
         val photoFile = File(previewDir, "capture_${System.currentTimeMillis()}.jpg")
         val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
         
@@ -591,7 +588,6 @@ class MainActivity : AppCompatActivity() {
                         val previewW = max(1, bitmap.width / 2)
                         val previewH = max(1, bitmap.height / 2)
                         
-                        // 3. 메모리 누수 방지: 기존 비트맵 확실히 제거
                         previewBitmapRef?.recycle()
                         previewBitmapRef = Bitmap.createScaledBitmap(bitmap, previewW, previewH, true)
                         
@@ -602,7 +598,6 @@ class MainActivity : AppCompatActivity() {
                             
                             val safeEscapedUri = JSONObject.quote("https://appassets.androidplatform.net/preview/${photoFile.name}") 
                             
-                            // 4. JS 콜백 실행 (에러 발생 시에도 finally에서 Lock 해제되도록 위임)
                             safeEvaluate("window.onNativePhotoCaptured($safeEscapedUri, ${bitmap.width}, ${bitmap.height})") 
                         }
                     } catch (e: Exception) {
