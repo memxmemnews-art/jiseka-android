@@ -37,7 +37,7 @@ import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewClientCompat
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions // 💡 ML Kit 숫자/영어 기본 모델로 변경
 import org.json.JSONArray
 import org.json.JSONObject
 import org.opencv.android.OpenCVLoader
@@ -57,7 +57,9 @@ import java.util.UUID
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.abs
+import kotlin.math.acos
 import kotlin.math.atan2
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
@@ -85,7 +87,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var previewDir: File
     private lateinit var assetLoader: WebViewAssetLoader
 
-    private val recognizer by lazy { TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build()) }
+    // 💡 [개선] 한국어 모델 대신 숫자 추출이 빠르고 가벼운 기본 모델 사용
+    private val recognizer by lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
+
+    // 💡 [개선] Temporal Tracking (시계열 추적) 상태 변수
+    private var previousCorners: List<PointF>? = null
+    private var trackingMissCount = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -222,32 +229,46 @@ class MainActivity : AppCompatActivity() {
                                 return@execute 
                             }
                             
-                            var finalPoints: List<PointF> = mappedPoints 
+                            var finalPoints: List<PointF>? = null
         
                             try {
-                                if (task.isSuccessful && task.result.text.trim().isNotEmpty()) {
-                                    val ePadX = (proposedBlobRect.width * 0.30f).toInt()
-                                    val ePadY = (proposedBlobRect.height * 0.30f).toInt()
+                                if (task.isSuccessful) {
+                                    val rawText = task.result.text
+                                    // 💡 [개선] 정규식으로 숫자만 추출 후 개수 검사 (3개 이상일 때만 진행)
+                                    val numbersOnly = rawText.replace(Regex("[^0-9]"), "")
                                     
-                                    val startX = max(0, proposedBlobRect.x - ePadX)
-                                    val startY = max(0, proposedBlobRect.y - ePadY)
-                                    val endX = min(guideBitmap!!.width, proposedBlobRect.x + proposedBlobRect.width + ePadX)
-                                    val endY = min(guideBitmap!!.height, proposedBlobRect.y + proposedBlobRect.height + ePadY)
-                                    
-                                    val expandedRect = Rect(startX, startY, endX - startX, endY - startY)
-                   
-                                    val refined = performTextAnchoredEdgeDetection(guideBitmap!!, expandedRect)
-                                    if (refined != null) {
-                                        finalPoints = refined.map { PointF(it.x + guideRect.left, it.y + guideRect.top) }
+                                    if (numbersOnly.length >= 3) {
+                                        Log.d("JiSeKa", "ML Kit 인식 성공: $numbersOnly")
+                                        val ePadX = (proposedBlobRect.width * 0.30f).toInt()
+                                        val ePadY = (proposedBlobRect.height * 0.30f).toInt()
+                                        
+                                        val startX = max(0, proposedBlobRect.x - ePadX)
+                                        val startY = max(0, proposedBlobRect.y - ePadY)
+                                        val endX = min(guideBitmap!!.width, proposedBlobRect.x + proposedBlobRect.width + ePadX)
+                                        val endY = min(guideBitmap!!.height, proposedBlobRect.y + proposedBlobRect.height + ePadY)
+                                        
+                                        val expandedRect = Rect(startX, startY, endX - startX, endY - startY)
+                                        
+                                        val refined = performTextAnchoredEdgeDetection(guideBitmap!!, expandedRect)
+                                        if (refined != null) {
+                                            finalPoints = refined.map { PointF(it.x + guideRect.left, it.y + guideRect.top) }
+                                        }
+                                    } else {
+                                        Log.w("JiSeKa", "숫자 개수 부족 (포착: $numbersOnly)")
                                     }
-                                } else {
-                                    Log.w("JiSeKa", "ML Kit verification failed: No text found in blob")
                                 }
-                                
-                                val previewBitmap = processPerspectiveOverlay(processingBitmap!!, finalPoints)
-                                val fileUriStr = saveBitmapToCacheFile(previewBitmap)
-                                sendCachedPreviewToJs(finalPoints, fileUriStr, bmpW, bmpH)
-                                previewBitmap.recycle()
+
+                                // 💡 [개선] EMA 시계열 스무딩을 거쳐 최종 좌표 획득
+                                val smoothedPoints = applyTemporalSmoothing(finalPoints)
+
+                                if (smoothedPoints != null) {
+                                    val previewBitmap = processPerspectiveOverlay(processingBitmap!!, smoothedPoints)
+                                    val fileUriStr = saveBitmapToCacheFile(previewBitmap)
+                                    sendCachedPreviewToJs(smoothedPoints, fileUriStr, bmpW, bmpH)
+                                    previewBitmap.recycle()
+                                } else {
+                                    sendCachedPreviewToJs(mappedPoints, saveBitmapToCacheFile(processingBitmap!!), bmpW, bmpH)
+                                }
                
                             } catch (e: Exception) { 
                                 Log.e("JiSeKa", "Async Crash", e)
@@ -269,7 +290,8 @@ class MainActivity : AppCompatActivity() {
 
         @JavascriptInterface fun saveImageWithNativeOverlay(cornersJsonStr: String) {
             analysisExecutor.execute {
-                var base: Bitmap? = null; var res: Bitmap? = null
+                var base: Bitmap? = null
+                var res: Bitmap? = null
                 try {
                     base = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) } ?: return@execute
                     val pts = mutableListOf<PointF>()
@@ -290,6 +312,44 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface fun showToast(msg: String) { runOnUiThread { if (!isDestroyed && !isFinishing) Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show() } }
     }
 
+    // 💡 [개선] EMA Temporal Smoothing (흔들림 방지 트래커)
+    private fun applyTemporalSmoothing(currentCorners: List<PointF>?): List<PointF>? {
+        val prev = previousCorners
+        if (currentCorners == null) {
+            trackingMissCount++
+            return if (prev != null && trackingMissCount <= MAX_MISS_TOLERANCE) {
+                prev
+            } else {
+                previousCorners = null
+                null
+            }
+        }
+        if (prev == null || prev.size != 4) {
+            previousCorners = currentCorners
+            trackingMissCount = 0
+            return currentCorners
+        }
+        var maxDist = 0.0
+        for (i in 0 until 4) {
+            val dist = hypot((currentCorners[i].x - prev[i].x).toDouble(), (currentCorners[i].y - prev[i].y).toDouble())
+            if (dist > maxDist) maxDist = dist
+        }
+        if (maxDist > RESET_THRESHOLD) {
+            previousCorners = currentCorners
+            trackingMissCount = 0
+            return currentCorners
+        }
+        val smoothedCorners = mutableListOf<PointF>()
+        for (i in 0 until 4) {
+            val smoothedX = (EMA_ALPHA * currentCorners[i].x) + ((1.0f - EMA_ALPHA) * prev[i].x)
+            val smoothedY = (EMA_ALPHA * currentCorners[i].y) + ((1.0f - EMA_ALPHA) * prev[i].y)
+            smoothedCorners.add(PointF(smoothedX, smoothedY))
+        }
+        previousCorners = smoothedCorners
+        trackingMissCount = 0
+        return smoothedCorners
+    }
+
     private fun findTextBlobs(bitmap: Bitmap): org.opencv.core.Rect? {
         val mat = Mat(); val gray = Mat(); val edge = Mat(); val morphed = Mat()
         val contours = mutableListOf<MatOfPoint>()
@@ -297,7 +357,6 @@ class MainActivity : AppCompatActivity() {
         try {
             Utils.bitmapToMat(bitmap, mat)
             Imgproc.cvtColor(mat, gray, Imgproc.COLOR_RGBA2GRAY)
-            
             Imgproc.Canny(gray, edge, 50.0, 150.0)
             
             val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(30.0, 5.0))
@@ -324,92 +383,269 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             return bestRect
-            
         } finally {
             mat.release(); gray.release(); edge.release(); morphed.release()
             contours.forEach { it.release() }
         }
     }
 
+    // 💡 [개선] 적응형 이진화를 통한 앵커 기반 검은 테두리 추출
+    private fun findBlackBorderInROI(roiMat: Mat, textCenter: org.opencv.core.Point): Rect? {
+        val gray = Mat(); val binary = Mat(); val hierarchy = Mat()
+        val contours = mutableListOf<MatOfPoint>()
+
+        try {
+            Imgproc.cvtColor(roiMat, gray, Imgproc.COLOR_RGBA2GRAY)
+            Imgproc.GaussianBlur(gray, gray, Size(3.0, 3.0), 0.0)
+            Imgproc.adaptiveThreshold(gray, binary, 255.0, Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, Imgproc.THRESH_BINARY_INV, 15, 5.0)
+            Imgproc.findContours(binary, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+
+            var bestRect: Rect? = null
+            var maxArea = 0.0
+
+            for (contour in contours) {
+                val rect = Imgproc.boundingRect(contour)
+                val area = rect.area()
+                if (rect.contains(textCenter)) {
+                    if (area > maxArea) {
+                        maxArea = area
+                        bestRect = rect
+                    }
+                }
+            }
+            return bestRect
+        } finally {
+            gray.release(); binary.release(); hierarchy.release()
+            contours.forEach { it.release() }
+        }
+    }
+
     private fun performTextAnchoredEdgeDetection(bitmap: Bitmap, expandedRect: Rect): List<PointF>? {
-        val mat = Mat(); val gray = Mat(); val roiMat = Mat(); val edgeMat = Mat(); val lines = Mat(); val contours = mutableListOf<MatOfPoint>()
+        val mat = Mat(); val gray = Mat(); val roiMat = Mat(); val targetRoiMat = Mat()
+        val edgeMat = Mat(); val lines = Mat(); val contours = mutableListOf<MatOfPoint>()
+        
         try {
             Utils.bitmapToMat(bitmap, mat)
             Imgproc.cvtColor(mat, gray, Imgproc.COLOR_RGBA2GRAY)
-            val clahe = Imgproc.createCLAHE(4.0, Size(8.0, 8.0))
-            try { clahe.apply(gray, gray) } finally { clahe.collectGarbage() }
             gray.submat(expandedRect).copyTo(roiMat)
-            Imgproc.GaussianBlur(roiMat, roiMat, Size(3.0, 3.0), 0.0)
-            val median = computeMedian(roiMat)
+
+            // 1. 하이브리드: 앵커 기반 테두리 추출로 영역 극단적 축소
+            val textCenter = org.opencv.core.Point(expandedRect.width / 2.0, expandedRect.height / 2.0)
+            val borderRect = findBlackBorderInROI(roiMat, textCenter)
+
+            val targetRect: Rect
+            if (borderRect != null) {
+                roiMat.submat(borderRect).copyTo(targetRoiMat)
+                targetRect = Rect(expandedRect.x + borderRect.x, expandedRect.y + borderRect.y, borderRect.width, borderRect.height)
+            } else {
+                roiMat.copyTo(targetRoiMat)
+                targetRect = expandedRect
+            }
+
+            // 2. 광원 대응 전처리 (CLAHE + Bilateral)
+            val clahe = Imgproc.createCLAHE(2.0, Size(8.0, 8.0))
+            try { clahe.apply(targetRoiMat, targetRoiMat) } finally { clahe.collectGarbage() }
+            
+            val filteredMat = Mat()
+            Imgproc.bilateralFilter(targetRoiMat, filteredMat, 5, 50.0, 50.0)
+
+            val median = computeMedian(filteredMat)
             val lower = max(0.0, 0.66 * median)
             val upper = min(255.0, 1.33 * median)
-            Imgproc.Canny(roiMat, edgeMat, lower, upper)
+            Imgproc.Canny(filteredMat, edgeMat, lower, upper)
+            
             val morph = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 5.0))
             Imgproc.morphologyEx(edgeMat, edgeMat, Imgproc.MORPH_CLOSE, morph)
             morph.release()
-            Imgproc.HoughLinesP(edgeMat, lines, 1.0, Math.PI / 180, 30, expandedRect.width * 0.10, 10.0)
+            filteredMat.release()
             
-            val rawTop = mutableListOf<Line>()
-            val rawBottom = mutableListOf<Line>(); val rawLeft = mutableListOf<Line>(); val rawRight = mutableListOf<Line>()
-            val roiCenterY = expandedRect.height / 2.0
-            val roiCenterX = expandedRect.width / 2.0
+            Imgproc.HoughLinesP(edgeMat, lines, 1.0, Math.PI / 180, 30, targetRect.width * 0.10, 10.0)
+            
+            val rawTop = mutableListOf<Line>(); val rawBottom = mutableListOf<Line>()
+            val rawLeft = mutableListOf<Line>(); val rawRight = mutableListOf<Line>()
+            val roiCenterY = targetRect.height / 2.0
+            val roiCenterX = targetRect.width / 2.0
+            
             for (i in 0 until lines.rows()) {
                 val v = lines.get(i, 0) ?: continue
                 val l = sqrt((v[2]-v[0]).pow(2) + (v[3]-v[1]).pow(2))
                 var a = atan2(v[3]-v[1], v[2]-v[0]) * 180/Math.PI
-                if(a<0) a+=180.0
+                if(a < 0) a += 180.0
                 val line = Line(v[0], v[1], v[2], v[3], l, a)
                 if (abs(v[2]-v[0]) > abs(v[3]-v[1])) { if ((v[1]+v[3])/2 < roiCenterY) rawTop.add(line) else rawBottom.add(line) }
                 else { if ((v[0]+v[2])/2 < roiCenterX) rawLeft.add(line) else rawRight.add(line) }
             }
           
-            val t = mergeLinesLinearRegression(filterByDominantAngle(rawTop), true, expandedRect.width, expandedRect.height)
-            val b = mergeLinesLinearRegression(filterByDominantAngle(rawBottom), true, expandedRect.width, expandedRect.height)
-            val l = mergeLinesLinearRegression(filterByDominantAngle(rawLeft), false, expandedRect.width, expandedRect.height)
-            val r = mergeLinesLinearRegression(filterByDominantAngle(rawRight), false, expandedRect.width, expandedRect.height)
+            // 3. RANSAC 기반 강건한 회귀 적용
+            val t = fitRobustLineWithDensity(filterByDominantAngle(rawTop), true, targetRect.width, targetRect.height)
+            val b = fitRobustLineWithDensity(filterByDominantAngle(rawBottom), true, targetRect.width, targetRect.height)
+            val l = fitRobustLineWithDensity(filterByDominantAngle(rawLeft), false, targetRect.width, targetRect.height)
+            val r = fitRobustLineWithDensity(filterByDominantAngle(rawRight), false, targetRect.width, targetRect.height)
 
             if (t != null && b != null && l != null && r != null) {
-                val tl = getIntersection(t, l); val tr = getIntersection(t, r)
-                val br = getIntersection(b, r); val bl = getIntersection(b, l)
-                if (tl != null && tr != null && br != null && bl != null) {
-                    val quad = listOf(tl, tr, br, bl)
-                    if (validateQuadrilateral(quad, expandedRect.width, expandedRect.height)) return applySubPixelRefinement(gray, expandedRect, quad)
+                val w = targetRect.width.toFloat()
+                val h = targetRect.height.toFloat()
+                val tl = getIntersectionSafe(t, l, 0f, 0f)
+                val tr = getIntersectionSafe(t, r, w, 0f)
+                val br = getIntersectionSafe(b, r, w, h)
+                val bl = getIntersectionSafe(b, l, 0f, h)
+                
+                val quad = listOf(tl, tr, br, bl)
+                val score = evaluateQuadrilateral(quad, targetRect.width, targetRect.height, 0f)
+                
+                if (score > 0.6f) {
+                    return applySubPixelRefinement(gray, targetRect, quad)
                 }
             }
+            
+            // 4. 폴백: 다각형 근사 + 종합 점수 획득
             val hierarchy = Mat()
             Imgproc.findContours(edgeMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
-            var best: List<PointF>? = null; var maxArea = 0.0
+            var best: List<PointF>? = null
+            var highestScore = 0.0f
+            
             for (c in contours) {
-                val m2f = MatOfPoint2f()
-                val approx = MatOfPoint2f(); m2f.fromArray(*c.toArray())
+                val m2f = MatOfPoint2f(); val approx = MatOfPoint2f()
+                m2f.fromArray(*c.toArray())
                 Imgproc.approxPolyDP(m2f, approx, 0.02 * Imgproc.arcLength(m2f, true), true)
                 val quad = extractFourCorners(approx.toArray().map { PointF(it.x.toFloat(), it.y.toFloat()) })
-                if (quad != null && validateQuadrilateral(quad, expandedRect.width, expandedRect.height)) {
-                    val area = abs(Imgproc.contourArea(MatOfPoint(*approx.toArray())))
-                    if (area > maxArea) { maxArea = area; best = sortCornersStandard(quad) }
+                
+                if (quad != null) {
+                    val currentScore = evaluateQuadrilateral(quad, targetRect.width, targetRect.height, 0f)
+                    if (currentScore > highestScore && currentScore > 0.5f) { 
+                        highestScore = currentScore
+                        best = sortCornersStandard(quad) 
+                    }
                 }
-                m2f.release()
-                approx.release()
+                m2f.release(); approx.release()
             }
             hierarchy.release()
-            return best?.let { applySubPixelRefinement(gray, expandedRect, it) }
-        } finally { mat.release(); gray.release(); roiMat.release(); edgeMat.release(); lines.release(); contours.forEach { it.release() } }
+            return best?.let { applySubPixelRefinement(gray, targetRect, it) }
+       
+        } finally { 
+            mat.release(); gray.release(); roiMat.release(); targetRoiMat.release()
+            edgeMat.release(); lines.release(); contours.forEach { it.release() } 
+        }
     }
 
-    private fun validateQuadrilateral(pts: List<PointF>, imageW: Int, imageH: Int): Boolean {
-        if (pts.size != 4) return false
-        val ordered = sortCornersStandard(pts)
-        val contour = MatOfPoint(*ordered.map { org.opencv.core.Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
-        return try { Imgproc.isContourConvex(contour) && abs(Imgproc.contourArea(contour)) > (imageW * imageH * 0.1) } finally { contour.release() }
+    // 💡 [개선] RANSAC(DIST_HUBER) 기반 점 클라우드 선형 회귀
+    private fun fitRobustLineWithDensity(lines: List<Line>, isH: Boolean, w: Int, h: Int): Line? {
+        if (lines.isEmpty()) return null
+        val pointsList = mutableListOf<org.opencv.core.Point>()
+        
+        for (l in lines) {
+            val length = l.length
+            val step = max(5.0, length / 10.0) 
+            var t = 0.0
+            while (t <= 1.0) {
+                pointsList.add(org.opencv.core.Point(l.x1 + t * (l.x2 - l.x1), l.y1 + t * (l.y2 - l.y1)))
+                t += step / length
+            }
+        }
+        if (pointsList.size < 2) return null
+
+        val pointsMat = MatOfPoint2f().apply { fromList(pointsList) }
+        val lineParams = Mat()
+        try {
+            Imgproc.fitLine(pointsMat, lineParams, Imgproc.DIST_HUBER, 0.0, 0.01, 0.01)
+            val vx = lineParams.get(0, 0)[0]
+            val vy = lineParams.get(1, 0)[0]
+            val x0 = lineParams.get(2, 0)[0]
+            val y0 = lineParams.get(3, 0)[0]
+            var angle = Math.toDegrees(atan2(vy, vx))
+            if (angle < 0) angle += 180.0
+
+            return if (isH) {
+                if (abs(vx) < 1e-6) return Line(x0, 0.0, x0, h.toDouble(), 0.0, angle)
+                val y1 = y0 + (vy / vx) * (0.0 - x0)
+                val y2 = y0 + (vy / vx) * (w.toDouble() - x0)
+                Line(0.0, y1, w.toDouble(), y2, 0.0, angle)
+            } else {
+                if (abs(vy) < 1e-6) return Line(0.0, y0, w.toDouble(), y0, 0.0, angle)
+                val x1 = x0 + (vx / vy) * (0.0 - y0)
+                val x2 = x0 + (vx / vy) * (h.toDouble() - y0)
+                Line(x1, 0.0, x2, h.toDouble(), 0.0, angle)
+            }
+        } finally {
+            pointsMat.release(); lineParams.release()
+        }
     }
 
+    // 💡 [개선] 교차점 폭발 방지 검사 포함
+    private fun getIntersectionSafe(l1: Line, l2: Line, fallbackX: Float, fallbackY: Float): PointF {
+        val angleDiff = min(abs(l1.angle - l2.angle), 180.0 - abs(l1.angle - l2.angle))
+        if (angleDiff < 25.0) return PointF(fallbackX, fallbackY)
+
+        val det = (l1.x1 - l1.x2) * (l2.y1 - l2.y2) - (l1.y1 - l1.y2) * (l2.x1 - l2.x2)
+        if (abs(det) < 1e-6) return PointF(fallbackX, fallbackY)
+
+        val d1 = l1.x1 * l1.y2 - l1.y1 * l1.x2
+        val d2 = l2.x1 * l2.y2 - l2.y1 * l2.x2
+        val px = (d1 * (l2.x1 - l2.x2) - (l1.x1 - l1.x2) * d2) / det
+        val py = (d1 * (l2.y1 - l2.y2) - (l1.y1 - l1.y2) * d2) / det
+        return PointF(px.toFloat(), py.toFloat())
+    }
+
+    // 💡 [개선] Prior 통합 기하학적 소프트 점수화 평가 모델
+    private fun evaluateQuadrilateral(pts: List<PointF>, roiW: Int, roiH: Int, textAngle: Float): Float {
+        if (pts.size != 4) return 0f
+        val tl = pts[0]; val tr = pts[1]; val br = pts[2]; val bl = pts[3]
+
+        val contour = MatOfPoint(*pts.map { org.opencv.core.Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
+        val isConvex = try { Imgproc.isContourConvex(contour) } finally { contour.release() }
+        if (!isConvex) return 0f
+
+        val widthTop = hypot(tr.x - tl.x, tr.y - tl.y)
+        val widthBottom = hypot(br.x - bl.x, br.y - bl.y)
+        val heightLeft = hypot(tl.x - bl.x, tl.y - bl.y)
+        val heightRight = hypot(tr.x - br.x, tr.y - br.y)
+        
+        val avgWidth = (widthTop + widthBottom) / 2.0f
+        val avgHeight = (heightLeft + heightRight) / 2.0f
+        if (avgHeight >= avgWidth) return 0f // 가로 우선 필터
+
+        val ratio = avgWidth / avgHeight
+        val aspectScore = (1.0f - (abs(ratio - 2.0f) / 0.5f)).coerceIn(0f, 1f)
+        
+        val areaRatio = (avgWidth * avgHeight) / (roiW * roiH.toFloat())
+        val areaScore = when {
+            areaRatio in 0.08f..0.55f -> 1.0f
+            areaRatio < 0.08f -> (areaRatio / 0.08f).coerceIn(0f, 1f)
+            else -> (1.0f - ((areaRatio - 0.55f) / 0.45f)).coerceIn(0f, 1f)
+        }
+        
+        val angleScore = evaluateOrthogonality(tl, tr, br, bl)
+
+        val topAngle = Math.toDegrees(atan2((tr.y - tl.y).toDouble(), (tr.x - tl.x).toDouble())).toFloat()
+        val bottomAngle = Math.toDegrees(atan2((br.y - bl.y).toDouble(), (br.x - bl.x).toDouble())).toFloat()
+        val avgQuadAngle = (topAngle + bottomAngle) / 2f
+        val baselineScore = (1.0f - (abs(avgQuadAngle - textAngle) / 15.0f)).coerceIn(0f, 1f) 
+
+        return (aspectScore * 0.35f) + (areaScore * 0.25f) + (angleScore * 0.20f) + (baselineScore * 0.20f)
+    }
+
+    private fun evaluateOrthogonality(p1: PointF, p2: PointF, p3: PointF, p4: PointF): Float {
+        fun angleBetweenLines(v1x: Float, v1y: Float, v2x: Float, v2y: Float): Float {
+            val dot = v1x * v2x + v1y * v2y
+            val cosTheta = (dot / (hypot(v1x, v1y) * hypot(v2x, v2y))).coerceIn(-1f, 1f)
+            return Math.toDegrees(abs(acos(cosTheta.toDouble()))).toFloat()
+        }
+        val a1 = angleBetweenLines(p2.x - p1.x, p2.y - p1.y, p4.x - p1.x, p4.y - p1.y)
+        val a2 = angleBetweenLines(p1.x - p2.x, p1.y - p2.y, p3.x - p2.x, p3.y - p2.y)
+        val a3 = angleBetweenLines(p2.x - p3.x, p2.y - p3.y, p4.x - p3.x, p4.y - p3.y)
+        val a4 = angleBetweenLines(p3.x - p4.x, p3.y - p4.y, p1.x - p4.x, p1.y - p4.y)
+        val avgDeviation = (abs(90f - a1) + abs(90f - a2) + abs(90f - a3) + abs(90f - a4)) / 4f
+        return (1.0f - (avgDeviation / 45f)).coerceIn(0f, 1f)
+    }
+
+    // 💡 [개선] 서브픽셀 보정 윈도우 크기 튜닝
     private fun applySubPixelRefinement(gray: Mat, roi: Rect, points: List<PointF>): List<PointF> {
         val global = points.map { PointF(it.x + roi.x, it.y + roi.y) }
         val sorted = sortCornersStandard(global)
         if (gray.empty()) return sorted
         val subPixMat = MatOfPoint2f().apply { fromArray(*sorted.map { org.opencv.core.Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray()) }
         try {
-            Imgproc.cornerSubPix(gray, subPixMat, Size(5.0, 5.0), Size(-1.0, -1.0), TermCriteria(TermCriteria.EPS + TermCriteria.MAX_ITER, 40, 0.01))
+            Imgproc.cornerSubPix(gray, subPixMat, Size(7.0, 7.0), Size(-1.0, -1.0), TermCriteria(TermCriteria.EPS + TermCriteria.MAX_ITER, 40, 0.001))
             return subPixMat.toArray().map { PointF(it.x.toFloat(), it.y.toFloat()) }
         } finally { subPixMat.release() }
     }
@@ -417,9 +653,10 @@ class MainActivity : AppCompatActivity() {
     private fun computeMedian(mat: Mat): Double {
         val hist = Mat()
         val ranges = org.opencv.core.MatOfFloat(0f, 256f); val histSize = org.opencv.core.MatOfInt(256)
-        return try { Imgproc.calcHist(listOf(mat), org.opencv.core.MatOfInt(0), Mat(), hist, histSize, ranges); var sum = 0.0; for (i in 0 until 256) { sum += hist.get(i, 0)[0]
-                if (sum >= mat.total() / 2.0) return i.toDouble() }; 127.0 } finally { hist.release(); ranges.release();
-            histSize.release() }
+        return try { Imgproc.calcHist(listOf(mat), org.opencv.core.MatOfInt(0), Mat(), hist, histSize, ranges)
+            var sum = 0.0; for (i in 0 until 256) { sum += hist.get(i, 0)[0]
+                if (sum >= mat.total() / 2.0) return i.toDouble() }
+            127.0 } finally { hist.release(); ranges.release(); histSize.release() }
     }
     
     private fun extractFourCorners(pts: List<PointF>): List<PointF>? {
@@ -441,50 +678,6 @@ class MainActivity : AppCompatActivity() {
         for (i in 0 until 4) { if (sorted[i].x + sorted[i].y < minSum) { minSum = sorted[i].x + sorted[i].y; start = i } }
         return listOf(sorted[start], sorted[(start+1)%4], sorted[(start+2)%4], sorted[(start+3)%4])
     }
-    
-    // 💡 [핵심 수정 2] 가중 평균(Centroid)과 각도(Angle)를 결합하여 실제 원근을 유지하는 회귀식으로 복구
-    private fun mergeLinesLinearRegression(lines: List<Line>, isH: Boolean, w: Int, h: Int): Line? {
-        if (lines.isEmpty()) return null
-        var sW = 0.0; var sCx = 0.0; var sCy = 0.0; var sAngle = 0.0
-        
-        for (l in lines) {
-            val weight = l.length
-            sW += weight
-            sCx += weight * (l.x1 + l.x2) / 2.0
-            sCy += weight * (l.y1 + l.y2) / 2.0
-            sAngle += weight * l.angle
-        }
-        val cx = sCx / sW
-        val cy = sCy / sW
-        val avgAngle = sAngle / sW
-        val rad = avgAngle * Math.PI / 180.0
-
-        return if (isH) {
-            val tanA = Math.tan(rad)
-            val y1 = cy + tanA * (0.0 - cx)
-            val y2 = cy + tanA * (w.toDouble() - cx)
-            Line(0.0, y1, w.toDouble(), y2, sW, avgAngle)
-        } else {
-            val dxdy = Math.cos(rad) / Math.sin(rad)
-            val x1 = cx + dxdy * (0.0 - cy)
-            val x2 = cx + dxdy * (h.toDouble() - cy)
-            Line(x1, 0.0, x2, h.toDouble(), sW, avgAngle)
-        }
-    }
-
-    // 💡 [핵심 수정 1] 행렬식(Determinant) 공식을 완벽하게 수정하여 좌표 이탈(버그) 차단
-    private fun getIntersection(l1: Line, l2: Line): PointF? {
-        val det = (l1.x1 - l1.x2) * (l2.y1 - l2.y2) - (l1.y1 - l1.y2) * (l2.x1 - l2.x2)
-        if (abs(det) < 1e-6) return null
-
-        val d1 = l1.x1 * l1.y2 - l1.y1 * l1.x2
-        val d2 = l2.x1 * l2.y2 - l2.y1 * l2.x2
-
-        val px = (d1 * (l2.x1 - l2.x2) - (l1.x1 - l1.x2) * d2) / det
-        val py = (d1 * (l2.y1 - l2.y2) - (l1.y1 - l1.y2) * d2) / det
-
-        return PointF(px.toFloat(), py.toFloat())
-    }
 
     private fun filterByDominantAngle(lines: List<Line>): List<Line> {
         if (lines.size <= 1) return lines
@@ -496,116 +689,74 @@ class MainActivity : AppCompatActivity() {
 
     private fun processPerspectiveOverlay(source: Bitmap, targetCorners: List<PointF>): Bitmap {
         val result = source.copy(Bitmap.Config.ARGB_8888, true)
-        
-        // 💡 [핵심 수정 4] 화면 밖으로 크게 이탈한 모서리를 검증하여 크래시 및 증발 방어 (-100px 여유 버퍼)
-        val safeCorners = targetCorners.all {
-            it.x >= -100f && it.x <= result.width + 100f &&
-            it.y >= -100f && it.y <= result.height + 100f
-        }
-        if (!safeCorners) {
-            Log.e("MASK_DEBUG", "INVALID CORNERS OUT OF BOUNDS = $targetCorners")
-            return result
-        }
+        val safeCorners = targetCorners.all { it.x >= -100f && it.x <= result.width + 100f && it.y >= -100f && it.y <= result.height + 100f }
+        if (!safeCorners) return result
 
-        val targetMat = Mat()
-        val maskMat = Mat(); val warpedMask = Mat(); val alphaMask = Mat()
-        val inverseMask = Mat()
-        val finalBlended = Mat()
+        val targetMat = Mat(); val maskMat = Mat(); val warpedMask = Mat(); val alphaMask = Mat(); val inverseMask = Mat(); val finalBlended = Mat()
         
         try {
             Utils.bitmapToMat(result, targetMat)
-            
             val resId = resources.getIdentifier("plate_mask", "drawable", packageName)
             val rawMask = if (resId != 0) BitmapFactory.decodeResource(resources, resId) else Bitmap.createBitmap(600, 150, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.LTGRAY) }
-            
-            // 💡 [핵심 수정 6] 원본 rawMask가 널이 되더라도 기존 객체를 유지하도록 안전성 확보
             val maskBmp = rawMask.copy(Bitmap.Config.ARGB_8888, true) ?: rawMask
             if (rawMask !== maskBmp) rawMask.recycle()
             
             Utils.bitmapToMat(maskBmp, maskMat)
             if (maskBmp !== rawMask) maskBmp.recycle()
             
-            Log.d("MASK_DEBUG", "targetCorners = $targetCorners")
-            
             val srcPts = MatOfPoint2f(org.opencv.core.Point(0.0, 0.0), org.opencv.core.Point(maskMat.cols().toDouble(), 0.0), org.opencv.core.Point(maskMat.cols().toDouble(), maskMat.rows().toDouble()), org.opencv.core.Point(0.0, maskMat.rows().toDouble()))
             val dstPts = MatOfPoint2f(*sortCornersStandard(targetCorners).map { org.opencv.core.Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
             val transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
             
             Imgproc.warpPerspective(maskMat, warpedMask, transform, targetMat.size(), Imgproc.INTER_LINEAR)
-            
-            Log.d("MASK_DEBUG", "warped size=${warpedMask.cols()}x${warpedMask.rows()}, channels=${warpedMask.channels()}")
-   
             val tempChannels = mutableListOf<Mat>()
             Core.split(warpedMask, tempChannels)
             
-            // 💡 [핵심 수정 3] 채널 개수에 맞춘 안전한 투명도(Alpha) 추출 및 흑백 처리 병합 방어
             when (tempChannels.size) {
                 4 -> tempChannels[3].copyTo(alphaMask)
                 3 -> Imgproc.cvtColor(warpedMask, alphaMask, Imgproc.COLOR_RGB2GRAY)
                 1 -> warpedMask.copyTo(alphaMask)
-                else -> {
-                    alphaMask.create(warpedMask.rows(), warpedMask.cols(), CvType.CV_8UC1)
-                    alphaMask.setTo(org.opencv.core.Scalar(255.0))
-                }
+                else -> { alphaMask.create(warpedMask.rows(), warpedMask.cols(), CvType.CV_8UC1); alphaMask.setTo(org.opencv.core.Scalar(255.0)) }
             }
             tempChannels.forEach { it.release() }
 
             Imgproc.threshold(alphaMask, alphaMask, 1.0, 255.0, Imgproc.THRESH_BINARY)
             Imgproc.GaussianBlur(alphaMask, alphaMask, Size(7.0, 7.0), 0.0)
             
-            // 💡 [핵심 수정 5] 원근 변환(Warp) 직후 마스크가 텅 비었는지(날아갔는지) 최종 점검
-            if (Core.countNonZero(alphaMask) < 100) {
-                Log.e("MASK_DEBUG", "MASK EMPTY AFTER WARP")
-                return result
-            }
+            if (Core.countNonZero(alphaMask) < 100) return result
 
             Core.bitwise_not(alphaMask, inverseMask)
 
-            val warpedChannels = mutableListOf<Mat>()
-            val targetChannels = mutableListOf<Mat>()
-            
+            val warpedChannels = mutableListOf<Mat>(); val targetChannels = mutableListOf<Mat>()
             warpedMask.convertTo(warpedMask, CvType.CV_32FC4)
             targetMat.convertTo(targetMat, CvType.CV_32FC4)
-            
             alphaMask.convertTo(alphaMask, CvType.CV_32FC1, 1.0 / 255.0)
             inverseMask.convertTo(inverseMask, CvType.CV_32FC1, 1.0 / 255.0)
 
             Core.split(warpedMask, warpedChannels)
             Core.split(targetMat, targetChannels)
 
-            // 💡 [핵심 수정 8] Split 후 각 행렬의 채널 크기가 3 미만일 경우 발생하는 Index 크래시 방지
-            if (warpedChannels.size < 3 || targetChannels.size < 3) {
-                Log.e("MASK_DEBUG", "CHANNEL ERROR: warped=${warpedChannels.size}, target=${targetChannels.size}")
-                return result
-            }
+            if (warpedChannels.size < 3 || targetChannels.size < 3) return result
 
             for (i in 0 until 3) {
                 Core.multiply(warpedChannels[i], alphaMask, warpedChannels[i])
                 Core.multiply(targetChannels[i], inverseMask, targetChannels[i]) 
                 Core.add(warpedChannels[i], targetChannels[i], warpedChannels[i])
             }
-
-            if (warpedChannels.size > 3 && targetChannels.size > 3) {
-                targetChannels[3].copyTo(warpedChannels[3])
-            }
+            if (warpedChannels.size > 3 && targetChannels.size > 3) targetChannels[3].copyTo(warpedChannels[3])
 
             Core.merge(warpedChannels, finalBlended)
             finalBlended.convertTo(finalBlended, CvType.CV_8UC4)
             Utils.matToBitmap(finalBlended, result)
      
-            srcPts.release()
-            dstPts.release(); transform.release()
-            warpedChannels.forEach { it.release() }
-            targetChannels.forEach { it.release() }
-            
+            srcPts.release(); dstPts.release(); transform.release()
+            warpedChannels.forEach { it.release() }; targetChannels.forEach { it.release() }
             return result
         } finally { 
-            targetMat.release()
-            maskMat.release(); warpedMask.release(); alphaMask.release(); inverseMask.release(); finalBlended.release() 
+            targetMat.release(); maskMat.release(); warpedMask.release(); alphaMask.release(); inverseMask.release(); finalBlended.release() 
         }
     }
 
-    // 💡 [핵심 수정 7] 배율 오차 방지를 위해 toInt() 대신 roundToInt() 적용
     private fun scaleBitmapDownToLimit(b: Bitmap, mW: Int, mH: Int): Bitmap {
         val sc = min(mW.toFloat()/b.width, mH.toFloat()/b.height)
         return if (sc >= 1) b else Bitmap.createScaledBitmap(b, (b.width * sc).roundToInt(), (b.height * sc).roundToInt(), true)
@@ -614,14 +765,10 @@ class MainActivity : AppCompatActivity() {
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all { ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED }
 
     override fun onDestroy() {
-        synchronized(bitmapLock) { lastCapturedBitmap?.recycle()
-            lastCapturedBitmap = null 
-        }
-        previewBitmapRef?.recycle(); recognizer.close(); cameraExecutor.shutdownNow()
-        analysisExecutor.shutdownNow()
+        synchronized(bitmapLock) { lastCapturedBitmap?.recycle(); lastCapturedBitmap = null }
+        previewBitmapRef?.recycle(); recognizer.close(); cameraExecutor.shutdownNow(); analysisExecutor.shutdownNow()
         previewDir.listFiles()?.forEach { it.delete() }
-        webView?.apply { stopLoading()
-            clearHistory(); removeAllViews(); destroy() }
+        webView?.apply { stopLoading(); clearHistory(); removeAllViews(); destroy() }
         webView = null
         super.onDestroy()
     }
@@ -632,7 +779,6 @@ class MainActivity : AppCompatActivity() {
             val cameraProvider = cameraProviderFuture.get()
             val preview = Preview.Builder().setTargetAspectRatio(AspectRatio.RATIO_16_9).build().also { it.setSurfaceProvider(viewFinder?.surfaceProvider) }
             imageCapture = ImageCapture.Builder().setTargetAspectRatio(AspectRatio.RATIO_16_9).build()
-   
             try {
                 cameraProvider.unbindAll()
                 cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageCapture)
@@ -643,12 +789,7 @@ class MainActivity : AppCompatActivity() {
     private fun takePhoto() {
         if (isProcessing) return
         isProcessing = true
-
-        val imageCapture = imageCapture ?: run {
-            isProcessing = false
-            return
-        }
-        
+        val imageCapture = imageCapture ?: run { isProcessing = false; return }
         val photoFile = File(previewDir, "capture_${System.currentTimeMillis()}.jpg")
         val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
         
@@ -658,14 +799,8 @@ class MainActivity : AppCompatActivity() {
                 override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
                     try {
                         val bitmap = loadSafeBitmap(photoFile.absolutePath, viewFinder?.width ?: 1080, viewFinder?.height ?: 1920)
-                        synchronized(bitmapLock) {
-                            lastCapturedBitmap?.recycle()
-                            lastCapturedBitmap = bitmap
-                        }
-                        
-                        val previewW = max(1, bitmap.width / 2)
-                        val previewH = max(1, bitmap.height / 2)
-                        
+                        synchronized(bitmapLock) { lastCapturedBitmap?.recycle(); lastCapturedBitmap = bitmap }
+                        val previewW = max(1, bitmap.width / 2); val previewH = max(1, bitmap.height / 2)
                         previewBitmapRef?.recycle()
                         previewBitmapRef = Bitmap.createScaledBitmap(bitmap, previewW, previewH, true)
                         
@@ -673,26 +808,15 @@ class MainActivity : AppCompatActivity() {
                             nativeBackgroundView?.setImageBitmap(previewBitmapRef)
                             nativeBackgroundView?.visibility = View.VISIBLE
                             viewFinder?.visibility = View.GONE
-                            
                             val safeEscapedUri = JSONObject.quote("https://appassets.androidplatform.net/preview/${photoFile.name}") 
-                            
                             safeEvaluate("window.onNativePhotoCaptured($safeEscapedUri, ${bitmap.width}, ${bitmap.height})") 
                         }
                     } catch (e: Exception) {
-                        Log.e("JiSeKa Engine", "이미지 처리 실패", e)
-                        runOnUiThread {
-                            isProcessing = false
-                            Toast.makeText(this@MainActivity, "이미지 처리 중 오류가 발생했습니다.", Toast.LENGTH_SHORT).show()
-                        }
+                        runOnUiThread { isProcessing = false; Toast.makeText(this@MainActivity, "이미지 처리 오류", Toast.LENGTH_SHORT).show() }
                     }
                 }
-                
                 override fun onError(exception: ImageCaptureException) {
-                    Log.e("JiSeKa Engine", "촬영 실패", exception)
-                    runOnUiThread { 
-                        isProcessing = false
-                        Toast.makeText(this@MainActivity, "캡처 실패", Toast.LENGTH_SHORT).show() 
-                    }
+                    runOnUiThread { isProcessing = false; Toast.makeText(this@MainActivity, "캡처 실패", Toast.LENGTH_SHORT).show() }
                 }
             }
         )
@@ -721,8 +845,7 @@ class MainActivity : AppCompatActivity() {
         val (height: Int, width: Int) = options.outHeight to options.outWidth
         var inSampleSize = 1
         if (height > reqHeight || width > reqWidth) {
-            val halfHeight: Int = height / 2
-            val halfWidth: Int = width / 2
+            val halfHeight: Int = height / 2; val halfWidth: Int = width / 2
             while (halfHeight / inSampleSize >= reqHeight && halfWidth / inSampleSize >= reqWidth) { inSampleSize *= 2 }
         }
         return inSampleSize
@@ -736,10 +859,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun sendCachedPreviewToJs(points: List<PointF>, uri: String?, bmpW: Float, bmpH: Float) {
         val arr = JSONArray()
-        for (p in points) { val obj = JSONObject()
-            obj.put("x", p.x / bmpW); obj.put("y", p.y / bmpH); arr.put(obj) }
-        val result = JSONObject()
-        result.put("corners", arr); result.put("preview", uri ?: JSONObject.NULL)
+        for (p in points) { val obj = JSONObject(); obj.put("x", p.x / bmpW); obj.put("y", p.y / bmpH); arr.put(obj) }
+        val result = JSONObject(); result.put("corners", arr); result.put("preview", uri ?: JSONObject.NULL)
         safeEvaluate("window.onNativeSuccess(${JSONObject.quote(result.toString())})")
         isProcessing = false
     }
@@ -750,7 +871,6 @@ class MainActivity : AppCompatActivity() {
             put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/JiSeKa")
         }
-    
         val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return
         contentResolver.openOutputStream(uri)?.use { bitmap.compress(Bitmap.CompressFormat.JPEG, 95, it) }
         runOnUiThread { Toast.makeText(this, "갤러리에 저장되었습니다.", Toast.LENGTH_SHORT).show() }
@@ -759,17 +879,15 @@ class MainActivity : AppCompatActivity() {
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQUEST_CODE_PERMISSIONS) {
-            if (allPermissionsGranted()) {
-                startCamera()
-            } else {
-                Toast.makeText(this, "카메라 권한이 필요합니다.", Toast.LENGTH_SHORT).show()
-                finish()
-            }
+            if (allPermissionsGranted()) startCamera() else { Toast.makeText(this, "카메라 권한 필요", Toast.LENGTH_SHORT).show(); finish() }
         }
     }
 
     companion object {
         private const val REQUEST_CODE_PERMISSIONS = 1001
         private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
+        private const val EMA_ALPHA = 0.3f
+        private const val MAX_MISS_TOLERANCE = 3
+        private const val RESET_THRESHOLD = 150.0
     }
 }
