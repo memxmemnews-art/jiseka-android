@@ -37,7 +37,7 @@ import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewClientCompat
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.latin.TextRecognizerOptions // 💡 ML Kit 숫자/영어 기본 모델로 변경
+import com.google.mlkit.vision.text.TextRecognizerOptions // 💡 [수정] latin 경로 제거, 기본 모델 옵션 적용
 import org.json.JSONArray
 import org.json.JSONObject
 import org.opencv.android.OpenCVLoader
@@ -234,7 +234,6 @@ class MainActivity : AppCompatActivity() {
                             try {
                                 if (task.isSuccessful) {
                                     val rawText = task.result.text
-                                    // 💡 [개선] 정규식으로 숫자만 추출 후 개수 검사 (3개 이상일 때만 진행)
                                     val numbersOnly = rawText.replace(Regex("[^0-9]"), "")
                                     
                                     if (numbersOnly.length >= 3) {
@@ -258,7 +257,6 @@ class MainActivity : AppCompatActivity() {
                                     }
                                 }
 
-                                // 💡 [개선] EMA 시계열 스무딩을 거쳐 최종 좌표 획득
                                 val smoothedPoints = applyTemporalSmoothing(finalPoints)
 
                                 if (smoothedPoints != null) {
@@ -312,7 +310,6 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface fun showToast(msg: String) { runOnUiThread { if (!isDestroyed && !isFinishing) Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show() } }
     }
 
-    // 💡 [개선] EMA Temporal Smoothing (흔들림 방지 트래커)
     private fun applyTemporalSmoothing(currentCorners: List<PointF>?): List<PointF>? {
         val prev = previousCorners
         if (currentCorners == null) {
@@ -389,7 +386,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 💡 [개선] 적응형 이진화를 통한 앵커 기반 검은 테두리 추출
     private fun findBlackBorderInROI(roiMat: Mat, textCenter: org.opencv.core.Point): Rect? {
         val gray = Mat(); val binary = Mat(); val hierarchy = Mat()
         val contours = mutableListOf<MatOfPoint>()
@@ -429,7 +425,6 @@ class MainActivity : AppCompatActivity() {
             Imgproc.cvtColor(mat, gray, Imgproc.COLOR_RGBA2GRAY)
             gray.submat(expandedRect).copyTo(roiMat)
 
-            // 1. 하이브리드: 앵커 기반 테두리 추출로 영역 극단적 축소
             val textCenter = org.opencv.core.Point(expandedRect.width / 2.0, expandedRect.height / 2.0)
             val borderRect = findBlackBorderInROI(roiMat, textCenter)
 
@@ -442,7 +437,6 @@ class MainActivity : AppCompatActivity() {
                 targetRect = expandedRect
             }
 
-            // 2. 광원 대응 전처리 (CLAHE + Bilateral)
             val clahe = Imgproc.createCLAHE(2.0, Size(8.0, 8.0))
             try { clahe.apply(targetRoiMat, targetRoiMat) } finally { clahe.collectGarbage() }
             
@@ -476,7 +470,6 @@ class MainActivity : AppCompatActivity() {
                 else { if ((v[0]+v[2])/2 < roiCenterX) rawLeft.add(line) else rawRight.add(line) }
             }
           
-            // 3. RANSAC 기반 강건한 회귀 적용
             val t = fitRobustLineWithDensity(filterByDominantAngle(rawTop), true, targetRect.width, targetRect.height)
             val b = fitRobustLineWithDensity(filterByDominantAngle(rawBottom), true, targetRect.width, targetRect.height)
             val l = fitRobustLineWithDensity(filterByDominantAngle(rawLeft), false, targetRect.width, targetRect.height)
@@ -498,7 +491,6 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             
-            // 4. 폴백: 다각형 근사 + 종합 점수 획득
             val hierarchy = Mat()
             Imgproc.findContours(edgeMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
             var best: List<PointF>? = null
@@ -528,7 +520,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 💡 [개선] RANSAC(DIST_HUBER) 기반 점 클라우드 선형 회귀
     private fun fitRobustLineWithDensity(lines: List<Line>, isH: Boolean, w: Int, h: Int): Line? {
         if (lines.isEmpty()) return null
         val pointsList = mutableListOf<org.opencv.core.Point>()
@@ -571,7 +562,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 💡 [개선] 교차점 폭발 방지 검사 포함
     private fun getIntersectionSafe(l1: Line, l2: Line, fallbackX: Float, fallbackY: Float): PointF {
         val angleDiff = min(abs(l1.angle - l2.angle), 180.0 - abs(l1.angle - l2.angle))
         if (angleDiff < 25.0) return PointF(fallbackX, fallbackY)
@@ -586,7 +576,6 @@ class MainActivity : AppCompatActivity() {
         return PointF(px.toFloat(), py.toFloat())
     }
 
-    // 💡 [개선] Prior 통합 기하학적 소프트 점수화 평가 모델
     private fun evaluateQuadrilateral(pts: List<PointF>, roiW: Int, roiH: Int, textAngle: Float): Float {
         if (pts.size != 4) return 0f
         val tl = pts[0]; val tr = pts[1]; val br = pts[2]; val bl = pts[3]
@@ -602,7 +591,7 @@ class MainActivity : AppCompatActivity() {
         
         val avgWidth = (widthTop + widthBottom) / 2.0f
         val avgHeight = (heightLeft + heightRight) / 2.0f
-        if (avgHeight >= avgWidth) return 0f // 가로 우선 필터
+        if (avgHeight >= avgWidth) return 0f
 
         val ratio = avgWidth / avgHeight
         val aspectScore = (1.0f - (abs(ratio - 2.0f) / 0.5f)).coerceIn(0f, 1f)
@@ -638,7 +627,6 @@ class MainActivity : AppCompatActivity() {
         return (1.0f - (avgDeviation / 45f)).coerceIn(0f, 1f)
     }
 
-    // 💡 [개선] 서브픽셀 보정 윈도우 크기 튜닝
     private fun applySubPixelRefinement(gray: Mat, roi: Rect, points: List<PointF>): List<PointF> {
         val global = points.map { PointF(it.x + roi.x, it.y + roi.y) }
         val sorted = sortCornersStandard(global)
