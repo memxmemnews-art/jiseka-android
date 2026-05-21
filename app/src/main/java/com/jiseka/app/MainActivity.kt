@@ -208,7 +208,8 @@ class MainActivity : AppCompatActivity() {
                         Log.w("JiSeKa", "No valid text blob found by OpenCV")
                         val fallbackUri = saveBitmapToCacheFile(processingBitmap)
                         sendCachedPreviewToJs(mappedPoints, fallbackUri, bmpW, bmpH)
-                        guideBitmap.recycle(); processingBitmap.recycle()
+                        guideBitmap.recycle()
+                        processingBitmap.recycle()
                         return@execute
                     }
 
@@ -219,13 +220,16 @@ class MainActivity : AppCompatActivity() {
                     recognizer.process(InputImage.fromBitmap(blobBitmap!!, 0)).addOnCompleteListener { task ->
                         analysisExecutor.execute {
                             if (isDestroyed || isFinishing) { 
-                                guideBitmap?.recycle(); processingBitmap?.recycle(); blobBitmap?.recycle(); return@execute 
+                                guideBitmap?.recycle()
+                                processingBitmap?.recycle()
+                                blobBitmap?.recycle()
+                                return@execute 
                             }
                             
                             var finalPoints: List<PointF> = mappedPoints 
+        
                             try {
                                 if (task.isSuccessful && task.result.text.trim().isNotEmpty()) {
-                                    
                                     // 5단계: 제안된 덩어리를 상하좌우 30% 확장
                                     val ePadX = (proposedBlobRect.width * 0.30f).toInt()
                                     val ePadY = (proposedBlobRect.height * 0.30f).toInt()
@@ -336,8 +340,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun performTextAnchoredEdgeDetection(bitmap: Bitmap, expandedRect: Rect): List<PointF>? {
-        val mat = Mat(); val gray = Mat(); val roiMat = Mat();
-        val edgeMat = Mat(); val lines = Mat(); val contours = mutableListOf<MatOfPoint>()
+        val mat = Mat(); val gray = Mat(); val roiMat = Mat(); val edgeMat = Mat(); val lines = Mat(); val contours = mutableListOf<MatOfPoint>()
         try {
             Utils.bitmapToMat(bitmap, mat)
             Imgproc.cvtColor(mat, gray, Imgproc.COLOR_RGBA2GRAY)
@@ -422,8 +425,7 @@ class MainActivity : AppCompatActivity() {
     private fun computeMedian(mat: Mat): Double {
         val hist = Mat()
         val ranges = org.opencv.core.MatOfFloat(0f, 256f); val histSize = org.opencv.core.MatOfInt(256)
-        return try { Imgproc.calcHist(listOf(mat), org.opencv.core.MatOfInt(0), Mat(), hist, histSize, ranges);
-            var sum = 0.0; for (i in 0 until 256) { sum += hist.get(i, 0)[0]
+        return try { Imgproc.calcHist(listOf(mat), org.opencv.core.MatOfInt(0), Mat(), hist, histSize, ranges); var sum = 0.0; for (i in 0 until 256) { sum += hist.get(i, 0)[0]
                 if (sum >= mat.total() / 2.0) return i.toDouble() }; 127.0 } finally { hist.release(); ranges.release();
             histSize.release() }
     }
@@ -452,8 +454,7 @@ class MainActivity : AppCompatActivity() {
         if (lines.isEmpty()) return null
         var sW=0.0
         var sX=0.0; var sY=0.0; var sXY=0.0; var sX2=0.0
-        for (l in lines) { val wL = l.length;
-            sW+=wL; sX+=wL*l.x1; sY+=wL*l.y1; sXY+=wL*l.x1*l.y1; sX2+=wL*l.x1*l.x1 }
+        for (l in lines) { val wL = l.length; sW+=wL; sX+=wL*l.x1; sY+=wL*l.y1; sXY+=wL*l.x1*l.y1; sX2+=wL*l.x1*l.x1 }
         val mX = sX/sW
         val mY = sY/sW
         return if (isH) Line(0.0, mY, w.toDouble(), mY, sW, 0.0) else Line(mX, 0.0, mX, h.toDouble(), sW, 90.0)
@@ -467,8 +468,7 @@ class MainActivity : AppCompatActivity() {
     private fun filterByDominantAngle(lines: List<Line>): List<Line> {
         if (lines.size <= 1) return lines
         val buckets = HashMap<Int, Double>()
-        for (l in lines) { val b = (((atan2(l.y2-l.y1, l.x2-l.x1)*180/Math.PI + 90) % 180 - 90 + 2.5) / 5).toInt() * 5;
-            buckets[b] = (buckets[b] ?: 0.0) + l.length }
+        for (l in lines) { val b = (((atan2(l.y2-l.y1, l.x2-l.x1)*180/Math.PI + 90) % 180 - 90 + 2.5) / 5).toInt() * 5; buckets[b] = (buckets[b] ?: 0.0) + l.length }
         val dom = buckets.maxByOrNull { it.value }?.key?.toDouble() ?: 0.0
         return lines.filter { abs(min(((atan2(it.y2-it.y1, it.x2-it.x1)*180/Math.PI + 90) % 180 - 90) - dom, 180.0 - abs(((atan2(it.y2-it.y1, it.x2-it.x1)*180/Math.PI + 90) % 180 - 90) - dom))) <= 15.0 }
     }
@@ -476,20 +476,21 @@ class MainActivity : AppCompatActivity() {
     private fun processPerspectiveOverlay(source: Bitmap, targetCorners: List<PointF>): Bitmap {
         val result = source.copy(Bitmap.Config.ARGB_8888, true)
         val targetMat = Mat()
+    
         val maskMat = Mat(); val warpedMask = Mat(); val alphaMask = Mat()
         val finalBlended = Mat()
         try {
             Utils.bitmapToMat(result, targetMat)
             val resId = resources.getIdentifier("plate_mask", "drawable", packageName)
             val maskBmp = if (resId != 0) BitmapFactory.decodeResource(resources, resId) else Bitmap.createBitmap(600, 150, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.LTGRAY) }
-            Utils.bitmapToMat(maskBmp, maskMat);
-            maskBmp.recycle()
+            Utils.bitmapToMat(maskBmp, maskMat); maskBmp.recycle()
             
             val srcPts = MatOfPoint2f(org.opencv.core.Point(0.0, 0.0), org.opencv.core.Point(maskMat.cols().toDouble(), 0.0), org.opencv.core.Point(maskMat.cols().toDouble(), maskMat.rows().toDouble()), org.opencv.core.Point(0.0, maskMat.rows().toDouble()))
             val dstPts = MatOfPoint2f(*sortCornersStandard(targetCorners).map { org.opencv.core.Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
             val transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
             
             Imgproc.warpPerspective(maskMat, warpedMask, transform, targetMat.size(), Imgproc.INTER_LINEAR)
+   
             Imgproc.cvtColor(warpedMask, alphaMask, Imgproc.COLOR_RGBA2GRAY)
             Imgproc.threshold(alphaMask, alphaMask, 1.0, 255.0, Imgproc.THRESH_BINARY)
             Imgproc.GaussianBlur(alphaMask, alphaMask, Size(7.0, 7.0), 0.0)
@@ -518,7 +519,7 @@ class MainActivity : AppCompatActivity() {
             Core.merge(warpedChannels, finalBlended)
             finalBlended.convertTo(finalBlended, CvType.CV_8UC4)
             Utils.matToBitmap(finalBlended, result)
-            
+     
             srcPts.release()
             dstPts.release(); transform.release(); inverseMask.release()
             warpedChannels.forEach { it.release() }
@@ -537,7 +538,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         synchronized(bitmapLock) { lastCapturedBitmap?.recycle()
-            lastCapturedBitmap = null }
+            lastCapturedBitmap = null 
+        }
         previewBitmapRef?.recycle(); recognizer.close(); cameraExecutor.shutdownNow()
         analysisExecutor.shutdownNow()
         previewDir.listFiles()?.forEach { it.delete() }
@@ -553,6 +555,7 @@ class MainActivity : AppCompatActivity() {
             val cameraProvider = cameraProviderFuture.get()
             val preview = Preview.Builder().setTargetAspectRatio(AspectRatio.RATIO_16_9).build().also { it.setSurfaceProvider(viewFinder?.surfaceProvider) }
             imageCapture = ImageCapture.Builder().setTargetAspectRatio(AspectRatio.RATIO_16_9).build()
+   
             try {
                 cameraProvider.unbindAll()
                 cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageCapture)
@@ -561,34 +564,62 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun takePhoto() {
-        val imageCapture = imageCapture ?: return
-        val photoFile = File(cacheDir, "capture_${System.currentTimeMillis()}.jpg")
+        // 1. 중복 촬영 방지 Lock 추가
+        if (isProcessing) return
+        isProcessing = true
+
+        val imageCapture = imageCapture ?: run {
+            isProcessing = false
+            return
+        }
+        
+        // 2. 저장 경로를 웹뷰가 읽을 수 있는 previewDir로 수정
+        val photoFile = File(previewDir, "capture_${System.currentTimeMillis()}.jpg")
         val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
+        
         imageCapture.takePicture(
             outputOptions, cameraExecutor,
             object : ImageCapture.OnImageSavedCallback {
                 override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
-                    val bitmap = loadSafeBitmap(photoFile.absolutePath, viewFinder?.width ?: 1080, viewFinder?.height ?: 1920)
-                    synchronized(bitmapLock) {
-                        lastCapturedBitmap?.recycle()
-                        lastCapturedBitmap = bitmap
-                    }
-                    
-                    val previewW = max(1, bitmap.width / 2); val previewH = max(1, bitmap.height / 2)
-                    previewBitmapRef = Bitmap.createScaledBitmap(bitmap, previewW, previewH, true)
-                    
-                    runOnUiThread { 
-                        nativeBackgroundView?.setImageBitmap(previewBitmapRef)
-                        nativeBackgroundView?.visibility = View.VISIBLE
-                        viewFinder?.visibility = View.GONE
-                        val safeEscapedUri = JSONObject.quote("https://appassets.androidplatform.net/preview/${photoFile.name}") 
-                        safeEvaluate("window.onNativePhotoCaptured($safeEscapedUri, ${bitmap.width}, ${bitmap.height})") 
+                    try {
+                        val bitmap = loadSafeBitmap(photoFile.absolutePath, viewFinder?.width ?: 1080, viewFinder?.height ?: 1920)
+                        synchronized(bitmapLock) {
+                            lastCapturedBitmap?.recycle()
+                            lastCapturedBitmap = bitmap
+                        }
+                        
+                        val previewW = max(1, bitmap.width / 2)
+                        val previewH = max(1, bitmap.height / 2)
+                        
+                        // 3. 메모리 누수 방지: 기존 비트맵 확실히 제거
+                        previewBitmapRef?.recycle()
+                        previewBitmapRef = Bitmap.createScaledBitmap(bitmap, previewW, previewH, true)
+                        
+                        runOnUiThread { 
+                            nativeBackgroundView?.setImageBitmap(previewBitmapRef)
+                            nativeBackgroundView?.visibility = View.VISIBLE
+                            viewFinder?.visibility = View.GONE
+                            
+                            val safeEscapedUri = JSONObject.quote("https://appassets.androidplatform.net/preview/${photoFile.name}") 
+                            
+                            // 4. JS 콜백 실행 (에러 발생 시에도 finally에서 Lock 해제되도록 위임)
+                            safeEvaluate("window.onNativePhotoCaptured($safeEscapedUri, ${bitmap.width}, ${bitmap.height})") 
+                        }
+                    } catch (e: Exception) {
+                        Log.e("JiSeKa Engine", "이미지 처리 실패", e)
+                        runOnUiThread {
+                            isProcessing = false
+                            Toast.makeText(this@MainActivity, "이미지 처리 중 오류가 발생했습니다.", Toast.LENGTH_SHORT).show()
+                        }
                     }
                 }
+                
                 override fun onError(exception: ImageCaptureException) {
                     Log.e("JiSeKa Engine", "촬영 실패", exception)
-                    runOnUiThread { isProcessing = false
-                        Toast.makeText(this@MainActivity, "캡처 실패", Toast.LENGTH_SHORT).show() }
+                    runOnUiThread { 
+                        isProcessing = false
+                        Toast.makeText(this@MainActivity, "캡처 실패", Toast.LENGTH_SHORT).show() 
+                    }
                 }
             }
         )
@@ -646,6 +677,7 @@ class MainActivity : AppCompatActivity() {
             put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/JiSeKa")
         }
+    
         val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return
         contentResolver.openOutputStream(uri)?.use { bitmap.compress(Bitmap.CompressFormat.JPEG, 95, it) }
         runOnUiThread { Toast.makeText(this, "갤러리에 저장되었습니다.", Toast.LENGTH_SHORT).show() }
