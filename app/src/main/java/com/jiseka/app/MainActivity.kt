@@ -61,6 +61,7 @@ import kotlin.math.atan2
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 class MainActivity : AppCompatActivity() {
@@ -441,19 +442,48 @@ class MainActivity : AppCompatActivity() {
         return listOf(sorted[start], sorted[(start+1)%4], sorted[(start+2)%4], sorted[(start+3)%4])
     }
     
+    // 💡 [핵심 수정 2] 가중 평균(Centroid)과 각도(Angle)를 결합하여 실제 원근을 유지하는 회귀식으로 복구
     private fun mergeLinesLinearRegression(lines: List<Line>, isH: Boolean, w: Int, h: Int): Line? {
         if (lines.isEmpty()) return null
-        var sW=0.0
-        var sX=0.0; var sY=0.0; var sXY=0.0; var sX2=0.0
-        for (l in lines) { val wL = l.length; sW+=wL; sX+=wL*l.x1; sY+=wL*l.y1; sXY+=wL*l.x1*l.y1; sX2+=wL*l.x1*l.x1 }
-        val mX = sX/sW
-        val mY = sY/sW
-        return if (isH) Line(0.0, mY, w.toDouble(), mY, sW, 0.0) else Line(mX, 0.0, mX, h.toDouble(), sW, 90.0)
+        var sW = 0.0; var sCx = 0.0; var sCy = 0.0; var sAngle = 0.0
+        
+        for (l in lines) {
+            val weight = l.length
+            sW += weight
+            sCx += weight * (l.x1 + l.x2) / 2.0
+            sCy += weight * (l.y1 + l.y2) / 2.0
+            sAngle += weight * l.angle
+        }
+        val cx = sCx / sW
+        val cy = sCy / sW
+        val avgAngle = sAngle / sW
+        val rad = avgAngle * Math.PI / 180.0
+
+        return if (isH) {
+            val tanA = Math.tan(rad)
+            val y1 = cy + tanA * (0.0 - cx)
+            val y2 = cy + tanA * (w.toDouble() - cx)
+            Line(0.0, y1, w.toDouble(), y2, sW, avgAngle)
+        } else {
+            val dxdy = Math.cos(rad) / Math.sin(rad)
+            val x1 = cx + dxdy * (0.0 - cy)
+            val x2 = cx + dxdy * (h.toDouble() - cy)
+            Line(x1, 0.0, x2, h.toDouble(), sW, avgAngle)
+        }
     }
 
+    // 💡 [핵심 수정 1] 행렬식(Determinant) 공식을 완벽하게 수정하여 좌표 이탈(버그) 차단
     private fun getIntersection(l1: Line, l2: Line): PointF? {
-        val det = (l1.x1-l1.x2)*(l2.y1-l2.y2) - (l1.y1-l1.y2)*(l2.x1-l2.x2)
-        return if (abs(det)<1e-6) null else PointF(((l1.x1*l1.y2-l1.y1*l1.x2)*(l2.x1-l2.x2)-(l1.x1-l1.x2)*(l2.x1*l2.y2-l2.y1*l2.x2)/det).toFloat(), ((l1.x1*l1.y2-l1.y1*l1.x2)*(l2.y1-l2.y2)-(l1.y1-l1.y2)*(l2.x1*l2.y2-l2.y1*l2.x2)/det).toFloat())
+        val det = (l1.x1 - l1.x2) * (l2.y1 - l2.y2) - (l1.y1 - l1.y2) * (l2.x1 - l2.x2)
+        if (abs(det) < 1e-6) return null
+
+        val d1 = l1.x1 * l1.y2 - l1.y1 * l1.x2
+        val d2 = l2.x1 * l2.y2 - l2.y1 * l2.x2
+
+        val px = (d1 * (l2.x1 - l2.x2) - (l1.x1 - l1.x2) * d2) / det
+        val py = (d1 * (l2.y1 - l2.y2) - (l1.y1 - l1.y2) * d2) / det
+
+        return PointF(px.toFloat(), py.toFloat())
     }
 
     private fun filterByDominantAngle(lines: List<Line>): List<Line> {
@@ -466,6 +496,17 @@ class MainActivity : AppCompatActivity() {
 
     private fun processPerspectiveOverlay(source: Bitmap, targetCorners: List<PointF>): Bitmap {
         val result = source.copy(Bitmap.Config.ARGB_8888, true)
+        
+        // 💡 [핵심 수정 4] 화면 밖으로 크게 이탈한 모서리를 검증하여 크래시 및 증발 방어 (-100px 여유 버퍼)
+        val safeCorners = targetCorners.all {
+            it.x >= -100f && it.x <= result.width + 100f &&
+            it.y >= -100f && it.y <= result.height + 100f
+        }
+        if (!safeCorners) {
+            Log.e("MASK_DEBUG", "INVALID CORNERS OUT OF BOUNDS = $targetCorners")
+            return result
+        }
+
         val targetMat = Mat()
         val maskMat = Mat(); val warpedMask = Mat(); val alphaMask = Mat()
         val inverseMask = Mat()
@@ -473,21 +514,51 @@ class MainActivity : AppCompatActivity() {
         
         try {
             Utils.bitmapToMat(result, targetMat)
+            
             val resId = resources.getIdentifier("plate_mask", "drawable", packageName)
-            val maskBmp = if (resId != 0) BitmapFactory.decodeResource(resources, resId) else Bitmap.createBitmap(600, 150, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.LTGRAY) }
-            Utils.bitmapToMat(maskBmp, maskMat); maskBmp.recycle()
+            val rawMask = if (resId != 0) BitmapFactory.decodeResource(resources, resId) else Bitmap.createBitmap(600, 150, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.LTGRAY) }
+            
+            // 💡 [핵심 수정 6] 원본 rawMask가 널이 되더라도 기존 객체를 유지하도록 안전성 확보
+            val maskBmp = rawMask.copy(Bitmap.Config.ARGB_8888, true) ?: rawMask
+            if (rawMask !== maskBmp) rawMask.recycle()
+            
+            Utils.bitmapToMat(maskBmp, maskMat)
+            if (maskBmp !== rawMask) maskBmp.recycle()
+            
+            Log.d("MASK_DEBUG", "targetCorners = $targetCorners")
             
             val srcPts = MatOfPoint2f(org.opencv.core.Point(0.0, 0.0), org.opencv.core.Point(maskMat.cols().toDouble(), 0.0), org.opencv.core.Point(maskMat.cols().toDouble(), maskMat.rows().toDouble()), org.opencv.core.Point(0.0, maskMat.rows().toDouble()))
             val dstPts = MatOfPoint2f(*sortCornersStandard(targetCorners).map { org.opencv.core.Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
             val transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
             
             Imgproc.warpPerspective(maskMat, warpedMask, transform, targetMat.size(), Imgproc.INTER_LINEAR)
+            
+            Log.d("MASK_DEBUG", "warped size=${warpedMask.cols()}x${warpedMask.rows()}, channels=${warpedMask.channels()}")
    
-            Imgproc.cvtColor(warpedMask, alphaMask, Imgproc.COLOR_RGBA2GRAY)
+            val tempChannels = mutableListOf<Mat>()
+            Core.split(warpedMask, tempChannels)
+            
+            // 💡 [핵심 수정 3] 채널 개수에 맞춘 안전한 투명도(Alpha) 추출 및 흑백 처리 병합 방어
+            when (tempChannels.size) {
+                4 -> tempChannels[3].copyTo(alphaMask)
+                3 -> Imgproc.cvtColor(warpedMask, alphaMask, Imgproc.COLOR_RGB2GRAY)
+                1 -> warpedMask.copyTo(alphaMask)
+                else -> {
+                    alphaMask.create(warpedMask.rows(), warpedMask.cols(), CvType.CV_8UC1)
+                    alphaMask.setTo(org.opencv.core.Scalar(255.0))
+                }
+            }
+            tempChannels.forEach { it.release() }
+
             Imgproc.threshold(alphaMask, alphaMask, 1.0, 255.0, Imgproc.THRESH_BINARY)
             Imgproc.GaussianBlur(alphaMask, alphaMask, Size(7.0, 7.0), 0.0)
             
-            // 💡 1. 가장 안전한 8비트(CV_8UC1) 상태에서 배경 마스크(반전) 생성
+            // 💡 [핵심 수정 5] 원근 변환(Warp) 직후 마스크가 텅 비었는지(날아갔는지) 최종 점검
+            if (Core.countNonZero(alphaMask) < 100) {
+                Log.e("MASK_DEBUG", "MASK EMPTY AFTER WARP")
+                return result
+            }
+
             Core.bitwise_not(alphaMask, inverseMask)
 
             val warpedChannels = mutableListOf<Mat>()
@@ -499,24 +570,21 @@ class MainActivity : AppCompatActivity() {
             alphaMask.convertTo(alphaMask, CvType.CV_32FC1, 1.0 / 255.0)
             inverseMask.convertTo(inverseMask, CvType.CV_32FC1, 1.0 / 255.0)
 
-            // 💡 디버깅 로깅: 마스크 값 확인
-            Log.d("MASK_DEBUG", "alpha min=${Core.minMaxLoc(alphaMask).minVal} max=${Core.minMaxLoc(alphaMask).maxVal}")
-            Log.d("MASK_DEBUG", "inverse min=${Core.minMaxLoc(inverseMask).minVal} max=${Core.minMaxLoc(inverseMask).maxVal}")
-
             Core.split(warpedMask, warpedChannels)
             Core.split(targetMat, targetChannels)
 
-            // 💡 디버깅 로깅: 채널 사이즈 확인
-            Log.d("MASK_DEBUG", "target channels=${targetChannels.size} warped channels=${warpedChannels.size}")
+            // 💡 [핵심 수정 8] Split 후 각 행렬의 채널 크기가 3 미만일 경우 발생하는 Index 크래시 방지
+            if (warpedChannels.size < 3 || targetChannels.size < 3) {
+                Log.e("MASK_DEBUG", "CHANNEL ERROR: warped=${warpedChannels.size}, target=${targetChannels.size}")
+                return result
+            }
 
-            // 💡 2. RGB(0, 1, 2) 채널만 마스크 연산 수행
             for (i in 0 until 3) {
                 Core.multiply(warpedChannels[i], alphaMask, warpedChannels[i])
                 Core.multiply(targetChannels[i], inverseMask, targetChannels[i]) 
                 Core.add(warpedChannels[i], targetChannels[i], warpedChannels[i])
             }
 
-            // 💡 3. Alpha(3) 채널은 원본 데이터 완벽 보존 (투명도 증발 방지)
             if (warpedChannels.size > 3 && targetChannels.size > 3) {
                 targetChannels[3].copyTo(warpedChannels[3])
             }
@@ -537,9 +605,10 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // 💡 [핵심 수정 7] 배율 오차 방지를 위해 toInt() 대신 roundToInt() 적용
     private fun scaleBitmapDownToLimit(b: Bitmap, mW: Int, mH: Int): Bitmap {
         val sc = min(mW.toFloat()/b.width, mH.toFloat()/b.height)
-        return if (sc >= 1) b else Bitmap.createScaledBitmap(b, (b.width*sc).toInt(), (b.height*sc).toInt(), true)
+        return if (sc >= 1) b else Bitmap.createScaledBitmap(b, (b.width * sc).roundToInt(), (b.height * sc).roundToInt(), true)
     }
 
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all { ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED }
