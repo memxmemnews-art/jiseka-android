@@ -198,10 +198,7 @@ class MainActivity : AppCompatActivity() {
                         return@execute
                     }
 
-                    // 1단계: 가이드 영역 자르기
                     guideBitmap = Bitmap.createBitmap(processingBitmap, guideRect.left, guideRect.top, guideRect.width(), guideRect.height())
-
-                    // 2단계: OpenCV 모폴로지 연산으로 글자 덩어리(Blob) 찾기 (Region Proposal)
                     val proposedBlobRect = findTextBlobs(guideBitmap)
 
                     if (proposedBlobRect == null) {
@@ -213,10 +210,8 @@ class MainActivity : AppCompatActivity() {
                         return@execute
                     }
 
-                    // 3단계: 제안된 덩어리 영역만 잘라내기 (ML Kit 검증용)
                     blobBitmap = Bitmap.createBitmap(guideBitmap, proposedBlobRect.x, proposedBlobRect.y, proposedBlobRect.width, proposedBlobRect.height)
 
-                    // 4단계: ML Kit로 텍스트(1글자 이상) 유무 검증
                     recognizer.process(InputImage.fromBitmap(blobBitmap!!, 0)).addOnCompleteListener { task ->
                         analysisExecutor.execute {
                             if (isDestroyed || isFinishing) { 
@@ -230,7 +225,6 @@ class MainActivity : AppCompatActivity() {
         
                             try {
                                 if (task.isSuccessful && task.result.text.trim().isNotEmpty()) {
-                                    // 5단계: 제안된 덩어리를 상하좌우 30% 확장
                                     val ePadX = (proposedBlobRect.width * 0.30f).toInt()
                                     val ePadY = (proposedBlobRect.height * 0.30f).toInt()
                                     
@@ -241,7 +235,6 @@ class MainActivity : AppCompatActivity() {
                                     
                                     val expandedRect = Rect(startX, startY, endX - startX, endY - startY)
                    
-                                    // 6단계: 확장된 영역 안에서 기존 OpenCV 꼭짓점(Edge) 정밀 탐지 로직 실행
                                     val refined = performTextAnchoredEdgeDetection(guideBitmap!!, expandedRect)
                                     if (refined != null) {
                                         finalPoints = refined.map { PointF(it.x + guideRect.left, it.y + guideRect.top) }
@@ -306,7 +299,6 @@ class MainActivity : AppCompatActivity() {
             
             Imgproc.Canny(gray, edge, 50.0, 150.0)
             
-            // 💡 가로로 매우 긴 커널을 생성하여 띄어쓰기된 글자들을 한 덩어리로 뭉개기
             val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(30.0, 5.0))
             Imgproc.morphologyEx(edge, morphed, Imgproc.MORPH_CLOSE, kernel)
             kernel.release()
@@ -323,7 +315,6 @@ class MainActivity : AppCompatActivity() {
                 val area = rect.area()
                 val aspectRatio = rect.width.toDouble() / rect.height.toDouble()
                 
-                // 비율 조건: 가로가 긴 직사각형 (번호판 형태)
                 if (aspectRatio in 1.5..6.0 && area > bitmap.width * bitmap.height * 0.02) {
                     if (area > maxArea) {
                         maxArea = area
@@ -477,7 +468,9 @@ class MainActivity : AppCompatActivity() {
         val result = source.copy(Bitmap.Config.ARGB_8888, true)
         val targetMat = Mat()
         val maskMat = Mat(); val warpedMask = Mat(); val alphaMask = Mat()
+        val inverseMask = Mat()
         val finalBlended = Mat()
+        
         try {
             Utils.bitmapToMat(result, targetMat)
             val resId = resources.getIdentifier("plate_mask", "drawable", packageName)
@@ -494,25 +487,38 @@ class MainActivity : AppCompatActivity() {
             Imgproc.threshold(alphaMask, alphaMask, 1.0, 255.0, Imgproc.THRESH_BINARY)
             Imgproc.GaussianBlur(alphaMask, alphaMask, Size(7.0, 7.0), 0.0)
             
+            // 💡 1. 가장 안전한 8비트(CV_8UC1) 상태에서 배경 마스크(반전) 생성
+            Core.bitwise_not(alphaMask, inverseMask)
+
             val warpedChannels = mutableListOf<Mat>()
             val targetChannels = mutableListOf<Mat>()
-            warpedMask.convertTo(warpedMask, CvType.CV_32FC4); targetMat.convertTo(targetMat, CvType.CV_32FC4)
+            
+            warpedMask.convertTo(warpedMask, CvType.CV_32FC4)
+            targetMat.convertTo(targetMat, CvType.CV_32FC4)
+            
             alphaMask.convertTo(alphaMask, CvType.CV_32FC1, 1.0 / 255.0)
+            inverseMask.convertTo(inverseMask, CvType.CV_32FC1, 1.0 / 255.0)
+
+            // 💡 디버깅 로깅: 마스크 값 확인
+            Log.d("MASK_DEBUG", "alpha min=${Core.minMaxLoc(alphaMask).minVal} max=${Core.minMaxLoc(alphaMask).maxVal}")
+            Log.d("MASK_DEBUG", "inverse min=${Core.minMaxLoc(inverseMask).minVal} max=${Core.minMaxLoc(inverseMask).maxVal}")
+
             Core.split(warpedMask, warpedChannels)
             Core.split(targetMat, targetChannels)
 
-            // 💡 1. 32FC1 Float 정밀도 행렬에 맞는 올바른 빼기 기반 행렬 반전 (1.0 - alpha)
-            val inverseMask = Mat()
-            val ones = Mat(alphaMask.size(), CvType.CV_32FC1, org.opencv.core.Scalar(1.0))
-            Core.subtract(ones, alphaMask, inverseMask)
+            // 💡 디버깅 로깅: 채널 사이즈 확인
+            Log.d("MASK_DEBUG", "target channels=${targetChannels.size} warped channels=${warpedChannels.size}")
 
-            // 💡 2. RGB 뿐만 아니라 알파 채널(Index 3)까지 완벽히 동일 연산하여 ARGB 일관성 100% 확보
-            val numChannels = min(warpedChannels.size, targetChannels.size)
-            for (i in 0 until numChannels) {
+            // 💡 2. RGB(0, 1, 2) 채널만 마스크 연산 수행
+            for (i in 0 until 3) {
                 Core.multiply(warpedChannels[i], alphaMask, warpedChannels[i])
-                // 💡 3. 배경 픽셀 파괴 주범이었던 1.0/255.0 스케일 배율 인자 완벽 제거
                 Core.multiply(targetChannels[i], inverseMask, targetChannels[i]) 
                 Core.add(warpedChannels[i], targetChannels[i], warpedChannels[i])
+            }
+
+            // 💡 3. Alpha(3) 채널은 원본 데이터 완벽 보존 (투명도 증발 방지)
+            if (warpedChannels.size > 3 && targetChannels.size > 3) {
+                targetChannels[3].copyTo(warpedChannels[3])
             }
 
             Core.merge(warpedChannels, finalBlended)
@@ -520,12 +526,15 @@ class MainActivity : AppCompatActivity() {
             Utils.matToBitmap(finalBlended, result)
      
             srcPts.release()
-            dstPts.release(); transform.release(); inverseMask.release(); ones.release()
+            dstPts.release(); transform.release()
             warpedChannels.forEach { it.release() }
             targetChannels.forEach { it.release() }
+            
             return result
-        } finally { targetMat.release()
-            maskMat.release(); warpedMask.release(); alphaMask.release(); finalBlended.release() }
+        } finally { 
+            targetMat.release()
+            maskMat.release(); warpedMask.release(); alphaMask.release(); inverseMask.release(); finalBlended.release() 
+        }
     }
 
     private fun scaleBitmapDownToLimit(b: Bitmap, mW: Int, mH: Int): Bitmap {
