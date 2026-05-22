@@ -37,7 +37,7 @@ import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewClientCompat
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.latin.TextRecognizerOptions // 💡 [핵심 수정] 올바른 경로 복구
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import org.json.JSONArray
 import org.json.JSONObject
 import org.opencv.android.OpenCVLoader
@@ -87,10 +87,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var previewDir: File
     private lateinit var assetLoader: WebViewAssetLoader
 
-    // 💡 [개선] 숫자/영문 인식에 최적화된 기본 모델 사용
     private val recognizer by lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
 
-    // 💡 [개선] Temporal Tracking 상태 변수
     private var previousCorners: List<PointF>? = null
     private var trackingMissCount = 0
 
@@ -466,21 +464,171 @@ class MainActivity : AppCompatActivity() {
             val dstPts = MatOfPoint2f(*sortCorners(targetCorners).map { org.opencv.core.Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
             val transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
             Imgproc.warpPerspective(maskMat, warpedMask, transform, mat.size(), Imgproc.INTER_LINEAR)
-            Core.split(warpedMask, mutableListOf<Mat>().apply { add(alphaMask) }) // Simplified for brevity
+            Core.split(warpedMask, mutableListOf<Mat>().apply { add(alphaMask) }) 
             Imgproc.threshold(alphaMask, alphaMask, 1.0, 255.0, Imgproc.THRESH_BINARY)
             Core.bitwise_not(alphaMask, inv)
-            // ... (Blending Logic) ...
-            Utils.matToBitmap(mat, result)
+            
+            // Blending Logic
+            val warpedChannels = mutableListOf<Mat>()
+            val targetChannels = mutableListOf<Mat>()
+            warpedMask.convertTo(warpedMask, CvType.CV_32FC4)
+            mat.convertTo(mat, CvType.CV_32FC4)
+            alphaMask.convertTo(alphaMask, CvType.CV_32FC1, 1.0 / 255.0)
+            inv.convertTo(inv, CvType.CV_32FC1, 1.0 / 255.0)
+            Core.split(warpedMask, warpedChannels)
+            Core.split(mat, targetChannels)
+            
+            if (warpedChannels.size >= 3 && targetChannels.size >= 3) {
+                for (i in 0 until 3) {
+                    Core.multiply(warpedChannels[i], alphaMask, warpedChannels[i])
+                    Core.multiply(targetChannels[i], inv, targetChannels[i])
+                    Core.add(warpedChannels[i], targetChannels[i], warpedChannels[i])
+                }
+                if (warpedChannels.size > 3 && targetChannels.size > 3) targetChannels[3].copyTo(warpedChannels[3])
+                Core.merge(warpedChannels, final)
+                final.convertTo(final, CvType.CV_8UC4)
+                Utils.matToBitmap(final, result)
+            }
+            warpedChannels.forEach { it.release() }
+            targetChannels.forEach { it.release() }
+            
         } finally { mat.release(); maskMat.release(); warpedMask.release(); alphaMask.release(); inv.release(); final.release() }
         return result
     }
 
+    // 💡 [핵심 복구] 유실되었던 파일 저장 및 카메라 촬영 유틸리티 함수들 원복 완료!
+    
     private fun scaleBitmapDownToLimit(b: Bitmap, mW: Int, mH: Int): Bitmap {
         val sc = min(mW.toFloat()/b.width, mH.toFloat()/b.height)
         return if (sc >= 1) b else Bitmap.createScaledBitmap(b, (b.width * sc).roundToInt(), (b.height * sc).roundToInt(), true)
     }
 
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all { ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED }
+
+    override fun onDestroy() {
+        synchronized(bitmapLock) { lastCapturedBitmap?.recycle(); lastCapturedBitmap = null }
+        previewBitmapRef?.recycle(); recognizer.close(); cameraExecutor.shutdownNow(); analysisExecutor.shutdownNow()
+        previewDir.listFiles()?.forEach { it.delete() }
+        webView?.apply { stopLoading(); clearHistory(); removeAllViews(); destroy() }
+        webView = null
+        super.onDestroy()
+    }
+
+    // 💡 복구: 카메라 시작 함수
+    private fun startCamera() {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+        cameraProviderFuture.addListener({
+            val cameraProvider = cameraProviderFuture.get()
+            val preview = Preview.Builder().setTargetAspectRatio(AspectRatio.RATIO_16_9).build().also { it.setSurfaceProvider(viewFinder?.surfaceProvider) }
+            imageCapture = ImageCapture.Builder().setTargetAspectRatio(AspectRatio.RATIO_16_9).build()
+            try {
+                cameraProvider.unbindAll()
+                cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageCapture)
+            } catch (e: Exception) { Log.e("JiSeKa Engine", "카메라 바인딩 실패", e) }
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    // 💡 복구: 사진 촬영 및 콜백 처리 함수
+    private fun takePhoto() {
+        if (isProcessing) return
+        isProcessing = true
+        val imageCapture = imageCapture ?: run { isProcessing = false; return }
+        val photoFile = File(previewDir, "capture_${System.currentTimeMillis()}.jpg")
+        val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
+        
+        imageCapture.takePicture(
+            outputOptions, cameraExecutor,
+            object : ImageCapture.OnImageSavedCallback {
+                override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                    try {
+                        val bitmap = loadSafeBitmap(photoFile.absolutePath, viewFinder?.width ?: 1080, viewFinder?.height ?: 1920)
+                        synchronized(bitmapLock) { lastCapturedBitmap?.recycle(); lastCapturedBitmap = bitmap }
+                        val previewW = max(1, bitmap.width / 2); val previewH = max(1, bitmap.height / 2)
+                        previewBitmapRef?.recycle()
+                        previewBitmapRef = Bitmap.createScaledBitmap(bitmap, previewW, previewH, true)
+                        
+                        runOnUiThread { 
+                            nativeBackgroundView?.setImageBitmap(previewBitmapRef)
+                            nativeBackgroundView?.visibility = View.VISIBLE
+                            viewFinder?.visibility = View.GONE
+                            val safeEscapedUri = JSONObject.quote("https://appassets.androidplatform.net/preview/${photoFile.name}") 
+                            safeEvaluate("window.onNativePhotoCaptured($safeEscapedUri, ${bitmap.width}, ${bitmap.height})") 
+                        }
+                    } catch (e: Exception) {
+                        runOnUiThread { isProcessing = false; Toast.makeText(this@MainActivity, "이미지 처리 오류", Toast.LENGTH_SHORT).show() }
+                    }
+                }
+                override fun onError(exception: ImageCaptureException) {
+                    runOnUiThread { isProcessing = false; Toast.makeText(this@MainActivity, "캡처 실패", Toast.LENGTH_SHORT).show() }
+                }
+            }
+        )
+    }
+
+    // 💡 복구: 비트맵 안전 로드 및 회전 방지 함수
+    private fun loadSafeBitmap(path: String, maxW: Int, maxH: Int): Bitmap {
+        val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(path, options)
+        options.inSampleSize = calculateInSampleSize(options, maxW, maxH)
+        options.inJustDecodeBounds = false
+        val bitmap = BitmapFactory.decodeFile(path, options) ?: throw RuntimeException("Bitmap load failed")
+        val orientation = ExifInterface(path).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+        val matrix = Matrix()
+        when (orientation) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+            ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+            ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+        }
+        if (matrix.isIdentity) return bitmap
+        val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+        if (rotated !== bitmap) bitmap.recycle()
+        return rotated
+    }
+
+    private fun calculateInSampleSize(options: BitmapFactory.Options, reqWidth: Int, reqHeight: Int): Int {
+        val (height: Int, width: Int) = options.outHeight to options.outWidth
+        var inSampleSize = 1
+        if (height > reqHeight || width > reqWidth) {
+            val halfHeight: Int = height / 2; val halfWidth: Int = width / 2
+            while (halfHeight / inSampleSize >= reqHeight && halfWidth / inSampleSize >= reqWidth) { inSampleSize *= 2 }
+        }
+        return inSampleSize
+    }
+
+    // 💡 복구: 분석용 캐시 이미지 저장 함수
+    private fun saveBitmapToCacheFile(bitmap: Bitmap): String? {
+        val file = File(previewDir, "preview_${UUID.randomUUID()}.jpg")
+        FileOutputStream(file).use { bitmap.compress(Bitmap.CompressFormat.JPEG, 85, it) }
+        return "https://appassets.androidplatform.net/preview/${file.name}"
+    }
+
+    // 💡 복구: JS로 분석 완료 신호 및 좌표 전달 함수
+    private fun sendCachedPreviewToJs(points: List<PointF>, uri: String?, bmpW: Float, bmpH: Float) {
+        val arr = JSONArray()
+        for (p in points) { val obj = JSONObject(); obj.put("x", p.x / bmpW); obj.put("y", p.y / bmpH); arr.put(obj) }
+        val result = JSONObject(); result.put("corners", arr); result.put("previewUrl", uri ?: JSONObject.NULL)
+        safeEvaluate("window.onNativeSuccess(${JSONObject.quote(result.toString())})")
+        isProcessing = false
+    }
+
+    // 💡 복구: 갤러리 앨범에 최종 결과 저장 함수
+    private fun saveBitmapToGallery(bitmap: Bitmap) {
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, "JiSeKa_${System.currentTimeMillis()}.jpg")
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/JiSeKa")
+        }
+        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return
+        contentResolver.openOutputStream(uri)?.use { bitmap.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+        runOnUiThread { Toast.makeText(this, "갤러리에 저장되었습니다.", Toast.LENGTH_SHORT).show() }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_CODE_PERMISSIONS) {
+            if (allPermissionsGranted()) startCamera() else { Toast.makeText(this, "카메라 권한 필요", Toast.LENGTH_SHORT).show(); finish() }
+        }
+    }
 
     companion object {
         private const val REQUEST_CODE_PERMISSIONS = 1001
