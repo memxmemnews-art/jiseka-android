@@ -20,6 +20,7 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.widget.ImageView
 import android.widget.Toast
+import androidx.annotation.OptIn
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.AspectRatio
 import androidx.camera.core.CameraSelector
@@ -115,13 +116,12 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     private fun setupWebView() {
         webView?.apply {
-            setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+            setLayerType(View.LAYER_TYPE_HARDWARE, null)
             setBackgroundColor(Color.TRANSPARENT)
+            
             settings.apply {
                 javaScriptEnabled = true
                 domStorageEnabled = true
-                allowFileAccess = true
-                allowContentAccess = true
                 cacheMode = WebSettings.LOAD_NO_CACHE
             }
             webViewClient = object : WebViewClientCompat() {
@@ -134,8 +134,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 💡 안전한 렌더링을 위한 메모리 교체기
-    private fun updateNativeBackgroundSafe(newBitmap: Bitmap) {
+    private fun updateNativeBackgroundSafe(newBitmap: Bitmap?) {
         val oldBitmap = displayedBitmap
         displayedBitmap = newBitmap
         nativeBackgroundView?.setImageBitmap(newBitmap)
@@ -149,6 +148,11 @@ class MainActivity : AppCompatActivity() {
     inner class AndroidBridge {
         @JavascriptInterface fun takePhoto() { this@MainActivity.takePhoto() }
         
+        // 💡 웹 UI의 라디오 버튼/탭 조작과 네이티브 실시간 다각형을 연동하는 핵심 브릿지 함수
+        @JavascriptInterface fun changeGuideMode(mode: String) {
+            runOnUiThread { nativeGuideView?.setMode(mode) }
+        }
+        
         @JavascriptInterface fun setCameraVisibility(isVisible: Boolean) {
             runOnUiThread {
                 if (isVisible) {
@@ -160,41 +164,47 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        @JavascriptInterface fun clearResultBitmap() {
+            runOnUiThread {
+                viewFinder?.visibility = View.VISIBLE
+                nativeBackgroundView?.visibility = View.GONE
+                nativeGuideView?.visibility = View.GONE
+                updateNativeBackgroundSafe(null)
+                synchronized(bitmapLock) {
+                    lastCapturedBitmap?.recycle()
+                    lastCapturedBitmap = null
+                }
+                isProcessing = false
+            }
+        }
+
         @JavascriptInterface fun analyzePlateWithMode(mode: String) {
             analysisExecutor.execute {
                 if (isDestroyed || isFinishing) return@execute
-                
                 var processingBitmap: Bitmap? = null
                 try {
                     processingBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) } 
                         ?: return@execute
-                        
                     val transformData = synchronized(transformLock) { lastTransformData } 
                         ?: throw IllegalStateException("메타데이터 누락")
 
                     val view = viewFinder ?: return@execute
                     val uiCorners = nativeGuideView?.getCorners() ?: return@execute
-                    val bmpW = processingBitmap.width
-                    val bmpH = processingBitmap.height
-
-                    // 💡 진정한 의미의 좌표 역변환
+                    
                     val exactBitmapPoints = CameraCoordinateConverter.mapUiToExactBitmap(
-                        previewView = view,
-                        transformData = transformData,
-                        uiPoints = uiCorners,
-                        uprightBitmapWidth = bmpW,
-                        uprightBitmapHeight = bmpH
+                        previewView = view, transformData = transformData, uiPoints = uiCorners,
+                        uprightBitmapWidth = processingBitmap.width, uprightBitmapHeight = processingBitmap.height
                     )
 
-                    val previewBitmap = processPerspectiveOverlay(processingBitmap, exactBitmapPoints)
-                    val fileUriStr = saveBitmapToCacheFile(previewBitmap)
+                    val resultBitmap = processPerspectiveOverlay(processingBitmap, exactBitmapPoints)
                     
-                    sendCachedPreviewToJs(exactBitmapPoints, fileUriStr, bmpW.toFloat(), bmpH.toFloat())
-                    previewBitmap.recycle()
-
+                    runOnUiThread {
+                        updateNativeBackgroundSafe(resultBitmap)
+                        nativeGuideView?.visibility = View.GONE
+                        safeEvaluate("window.onNativeSuccess()")
+                    }
                 } catch (e: Exception) { 
-                    Log.e("JiSeKa Engine", "분석 에러", e)
-                    safeEvaluate("window.onNativeSuccess(null)")
+                    safeEvaluate("window.onNativeError('분석 중 오류가 발생했습니다.')")
                     isProcessing = false 
                 } finally {
                     processingBitmap?.recycle()
@@ -202,28 +212,16 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        @JavascriptInterface fun saveImageWithNativeOverlay() {
+        @JavascriptInterface fun saveFinalImage() {
             analysisExecutor.execute {
-                var base: Bitmap? = null
-                var res: Bitmap? = null
                 try {
-                    base = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) } ?: return@execute
-                    val transformData = synchronized(transformLock) { lastTransformData } ?: return@execute
-                    val uiCorners = nativeGuideView?.getCorners() ?: return@execute
-
-                    val exactBitmapPoints = CameraCoordinateConverter.mapUiToExactBitmap(
-                        previewView = viewFinder!!, transformData = transformData, uiPoints = uiCorners, 
-                        uprightBitmapWidth = base.width, uprightBitmapHeight = base.height
-                    )
-
-                    res = processPerspectiveOverlay(base, exactBitmapPoints)
-                    saveBitmapToGallery(res!!)
+                    val finalBitmapToSave = displayedBitmap?.copy(Bitmap.Config.ARGB_8888, true) 
+                        ?: throw IllegalStateException("저장할 비트맵이 없습니다.")
+                        
+                    saveBitmapToGallery(finalBitmapToSave)
                     safeEvaluate("window.onNativeSaveComplete()")
                 } catch (e: Exception) {
-                    safeEvaluate("window.onNativeError('네이티브 합성 저장 프로세스 실패')")
-                } finally { 
-                    base?.recycle()
-                    res?.let { if (it !== base) it.recycle() } 
+                    safeEvaluate("window.onNativeError('저장 실패')")
                 }
             }
         }
@@ -295,12 +293,10 @@ class MainActivity : AppCompatActivity() {
                         }
                         synchronized(transformLock) { lastTransformData = transformData }
 
-                        runOnUiThread {
-                            safeEvaluate("window.onNativePhotoCaptured('ready', ${uprightBitmap.width}, ${uprightBitmap.height})")
-                        }
+                        runOnUiThread { safeEvaluate("window.onNativePhotoCaptured()") }
                     } catch (e: Exception) {
                         imageProxy.close()
-                        runOnUiThread { isProcessing = false; Toast.makeText(this@MainActivity, "이미지 처리 오류", Toast.LENGTH_SHORT).show() }
+                        runOnUiThread { isProcessing = false; Toast.makeText(this@MainActivity, "이미지 오류", Toast.LENGTH_SHORT).show() }
                     }
                 }
                 override fun onError(exception: ImageCaptureException) {
@@ -310,7 +306,6 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    // 💡 정렬, 볼록(Convex), 크기 무결성 검사를 모두 포함한 OpenCV 프로세서
     private fun processPerspectiveOverlay(source: Bitmap, targetCorners: List<PointF>): Bitmap {
         val orderedCorners = orderCorners(targetCorners)
 
@@ -419,14 +414,6 @@ class MainActivity : AppCompatActivity() {
         try { FileOutputStream(file).use { out -> bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out); out.flush() } } 
         catch (e: Exception) { return null }
         return if (file.exists() && file.length() > 0) "https://appassets.androidplatform.net/preview/${file.name}" else null
-    }
-
-    private fun sendCachedPreviewToJs(points: List<PointF>, uri: String?, bmpW: Float, bmpH: Float) {
-        val arr = JSONArray()
-        for (p in points) { val obj = JSONObject(); obj.put("x", p.x / bmpW); obj.put("y", p.y / bmpH); arr.put(obj) }
-        val result = JSONObject(); result.put("corners", arr); result.put("previewUrl", uri ?: JSONObject.NULL)
-        safeEvaluate("window.onNativeSuccess(${JSONObject.quote(result.toString())})")
-        isProcessing = false
     }
 
     private fun saveBitmapToGallery(bitmap: Bitmap) {
