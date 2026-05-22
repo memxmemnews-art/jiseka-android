@@ -79,15 +79,16 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-        if (!OpenCVLoader.initDebug()) Log.e("JiSeKa Engine", "OpenCV 초기화 실패")
+        if (!OpenCVLoader.initDebug()) Log.e("CAMERA_DEBUG", "OpenCV 초기화 실패")
 
         viewFinder = findViewById(R.id.viewFinder)
         nativeBackgroundView = findViewById(R.id.nativeBackgroundView)
         nativeGuideView = findViewById(R.id.nativeGuideView)
         webView = findViewById(R.id.webView)
         
+        // 💡 문제 4 해결: Executor 분리 및 스레드 풀 확장 (Starvation 방지)
         cameraExecutor = Executors.newSingleThreadExecutor()
-        analysisExecutor = Executors.newSingleThreadExecutor()
+        analysisExecutor = Executors.newFixedThreadPool(2)
 
         previewDir = File(filesDir, "preview")
         if (!previewDir.exists()) previewDir.mkdirs()
@@ -99,7 +100,8 @@ class MainActivity : AppCompatActivity() {
         setupWebView()
 
         if (allPermissionsGranted()) {
-            startCamera()
+            // 💡 생명주기 지연 (Layout 확정 후 바인딩)
+            viewFinder?.post { startCamera() }
         } else {
             ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
         }
@@ -108,7 +110,9 @@ class MainActivity : AppCompatActivity() {
     private fun safeEvaluate(js: String) {
         runOnUiThread {
             if (!isDestroyed && !isFinishing && webView != null) {
-                try { webView?.evaluateJavascript(js, null) } catch (e: Exception) {}
+                try { webView?.evaluateJavascript(js, null) } catch (e: Exception) {
+                    Log.e("CAMERA_DEBUG", "JS Evaluate Error", e)
+                }
             }
         }
     }
@@ -118,6 +122,9 @@ class MainActivity : AppCompatActivity() {
         webView?.apply {
             setLayerType(View.LAYER_TYPE_HARDWARE, null)
             setBackgroundColor(Color.TRANSPARENT)
+            
+            // 💡 문제 3 해결: 이전 버전 JS 실행 원천 차단 (하드 캐시 클리어)
+            clearCache(true)
             
             settings.apply {
                 javaScriptEnabled = true
@@ -130,6 +137,8 @@ class MainActivity : AppCompatActivity() {
             }
             webChromeClient = WebChromeClient()
             addJavascriptInterface(AndroidBridge(), "AndroidBridge")
+            
+            // 캐시 버스팅 파라미터 적용
             loadUrl("https://ziseka-app.vercel.app/?v=" + System.currentTimeMillis())
         }
     }
@@ -148,7 +157,6 @@ class MainActivity : AppCompatActivity() {
     inner class AndroidBridge {
         @JavascriptInterface fun takePhoto() { this@MainActivity.takePhoto() }
         
-        // 💡 웹 UI의 라디오 버튼/탭 조작과 네이티브 실시간 다각형을 연동하는 핵심 브릿지 함수
         @JavascriptInterface fun changeGuideMode(mode: String) {
             runOnUiThread { nativeGuideView?.setMode(mode) }
         }
@@ -184,12 +192,12 @@ class MainActivity : AppCompatActivity() {
                 var processingBitmap: Bitmap? = null
                 try {
                     processingBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) } 
-                        ?: return@execute
+                        ?: throw IllegalStateException("캡처된 원본 비트맵이 없습니다.")
                     val transformData = synchronized(transformLock) { lastTransformData } 
                         ?: throw IllegalStateException("메타데이터 누락")
 
-                    val view = viewFinder ?: return@execute
-                    val uiCorners = nativeGuideView?.getCorners() ?: return@execute
+                    val view = viewFinder ?: throw IllegalStateException("ViewFinder가 초기화되지 않았습니다.")
+                    val uiCorners = nativeGuideView?.getCorners() ?: throw IllegalStateException("가이드 박스 좌표가 없습니다.")
                     
                     val exactBitmapPoints = CameraCoordinateConverter.mapUiToExactBitmap(
                         previewView = view, transformData = transformData, uiPoints = uiCorners,
@@ -204,10 +212,11 @@ class MainActivity : AppCompatActivity() {
                         safeEvaluate("window.onNativeSuccess()")
                     }
                 } catch (e: Exception) { 
+                    Log.e("CAMERA_DEBUG", "분석 실패", e)
                     safeEvaluate("window.onNativeError('분석 중 오류가 발생했습니다.')")
-                    isProcessing = false 
                 } finally {
                     processingBitmap?.recycle()
+                    isProcessing = false 
                 }
             }
         }
@@ -221,6 +230,7 @@ class MainActivity : AppCompatActivity() {
                     saveBitmapToGallery(finalBitmapToSave)
                     safeEvaluate("window.onNativeSaveComplete()")
                 } catch (e: Exception) {
+                    Log.e("CAMERA_DEBUG", "저장 실패", e)
                     safeEvaluate("window.onNativeError('저장 실패')")
                 }
             }
@@ -229,6 +239,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startCamera() {
+        Log.d("CAMERA_DEBUG", "startCamera entered")
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             val cameraProvider = cameraProviderFuture.get()
@@ -237,6 +248,7 @@ class MainActivity : AppCompatActivity() {
             val preview = Preview.Builder().setTargetAspectRatio(AspectRatio.RATIO_16_9).build()
                 .also { it.setSurfaceProvider(viewFinder?.surfaceProvider) }
 
+            // 변수 쉐도잉 방지: 클래스 멤버 변수 imageCapture에 명시적 할당
             imageCapture = ImageCapture.Builder()
                 .setTargetAspectRatio(AspectRatio.RATIO_16_9)
                 .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
@@ -244,7 +256,11 @@ class MainActivity : AppCompatActivity() {
 
             try {
                 cameraProvider.unbindAll()
-                val viewPort = viewFinder?.viewPort ?: return@addListener
+                val viewPort = viewFinder?.viewPort ?: run {
+                    Log.e("CAMERA_DEBUG", "ViewPort is null! 레이아웃이 아직 준비되지 않음.")
+                    return@addListener
+                }
+                
                 val useCaseGroup = androidx.camera.core.UseCaseGroup.Builder()
                     .setViewPort(viewPort)
                     .addUseCase(preview)
@@ -252,13 +268,29 @@ class MainActivity : AppCompatActivity() {
                     .build()
 
                 cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, useCaseGroup)
-            } catch (e: Exception) { Log.e("JiSeKa Engine", "카메라 바인딩 실패", e) }
+                Log.d("CAMERA_DEBUG", "bindToLifecycle success")
+            } catch (e: Exception) { 
+                Log.e("CAMERA_DEBUG", "카메라 바인딩 실패", e) 
+            }
         }, ContextCompat.getMainExecutor(this))
     }
 
     private fun takePhoto() {
-        if (isProcessing) return
+        Log.d("CAMERA_DEBUG", "takePhoto called")
+        if (isProcessing) {
+            Log.d("CAMERA_DEBUG", "Already processing, rejected")
+            return
+        }
         isProcessing = true
+        
+        val currentCapture = imageCapture
+        if (currentCapture == null) {
+            // 💡 문제 1 해결: imageCapture가 null일 때 예외 삼킴 방지 및 JS 복구 트리거
+            Log.e("CAMERA_DEBUG", "imageCapture is null! Camera not bound properly.")
+            isProcessing = false
+            safeEvaluate("window.onNativeError('카메라가 초기화되지 않았습니다.')")
+            return
+        }
         
         val freezeBitmap = viewFinder?.bitmap
         if (freezeBitmap != null) {
@@ -269,12 +301,12 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        val imageCapture = imageCapture ?: run { isProcessing = false; return }
-
-        imageCapture.takePicture(
+        Log.d("CAMERA_DEBUG", "takePicture entered")
+        currentCapture.takePicture(
             cameraExecutor,
             object : ImageCapture.OnImageCapturedCallback() {
                 override fun onCaptureSuccess(imageProxy: ImageProxy) {
+                    Log.d("CAMERA_DEBUG", "capture success (buffer received)")
                     try {
                         val uprightBitmap = imageProxy.toUprightBitmap()
                         val transformData = CaptureTransformData(
@@ -294,13 +326,24 @@ class MainActivity : AppCompatActivity() {
                         synchronized(transformLock) { lastTransformData = transformData }
 
                         runOnUiThread { safeEvaluate("window.onNativePhotoCaptured()") }
+                        Log.d("CAMERA_DEBUG", "onCaptureSuccess fully completed")
                     } catch (e: Exception) {
+                        // 💡 문제 5 해결: 내부 처리 중 에러 시 JS로 실패 통보
+                        Log.e("CAMERA_DEBUG", "onCaptureSuccess internal error", e)
                         imageProxy.close()
-                        runOnUiThread { isProcessing = false; Toast.makeText(this@MainActivity, "이미지 오류", Toast.LENGTH_SHORT).show() }
+                        runOnUiThread { 
+                            isProcessing = false
+                            safeEvaluate("window.onNativeError('이미지 처리 중 오류가 발생했습니다.')")
+                        }
                     }
                 }
                 override fun onError(exception: ImageCaptureException) {
-                    runOnUiThread { isProcessing = false; Toast.makeText(this@MainActivity, "📸 캡처 실패", Toast.LENGTH_SHORT).show() }
+                    // 💡 카메라 하드웨어 레벨 캡처 실패 시 JS로 통보
+                    Log.e("CAMERA_DEBUG", "capture error", exception)
+                    runOnUiThread { 
+                        isProcessing = false
+                        safeEvaluate("window.onNativeError('카메라 캡처에 실패했습니다.')")
+                    }
                 }
             }
         )
@@ -310,7 +353,7 @@ class MainActivity : AppCompatActivity() {
         val orderedCorners = orderCorners(targetCorners)
 
         if (!isConvexQuad(orderedCorners) || getPolygonArea(orderedCorners) < 2000f) {
-            Log.e("JiSeKa Engine", "Warp 무결성 거부: 오목/면적 미달")
+            Log.e("CAMERA_DEBUG", "Warp 무결성 거부: 오목/면적 미달")
             return source.copy(Bitmap.Config.ARGB_8888, true)
         }
 
@@ -368,7 +411,7 @@ class MainActivity : AppCompatActivity() {
                 Utils.matToBitmap(final, result)
             }
         } catch (e: CvException) {
-            Log.e("JiSeKa Engine", "OpenCV Warp 실패", e)
+            Log.e("CAMERA_DEBUG", "OpenCV Warp 실패", e)
         } finally { 
             mat.release(); maskMat.release(); warpedMask.release(); alphaMask.release()
             inv.release(); final.release()
@@ -409,13 +452,6 @@ class MainActivity : AppCompatActivity() {
         return abs(area) / 2f
     }
 
-    private fun saveBitmapToCacheFile(bitmap: Bitmap): String? {
-        val file = File(previewDir, "preview_${UUID.randomUUID()}.jpg")
-        try { FileOutputStream(file).use { out -> bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out); out.flush() } } 
-        catch (e: Exception) { return null }
-        return if (file.exists() && file.length() > 0) "https://appassets.androidplatform.net/preview/${file.name}" else null
-    }
-
     private fun saveBitmapToGallery(bitmap: Bitmap) {
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, "JiSeKa_${System.currentTimeMillis()}.jpg")
@@ -430,7 +466,8 @@ class MainActivity : AppCompatActivity() {
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQUEST_CODE_PERMISSIONS) {
-            if (allPermissionsGranted()) startCamera() else finish()
+            // 💡 퍼미션 획득 직후에도 post를 통해 안전하게 바인딩
+            if (allPermissionsGranted()) viewFinder?.post { startCamera() } else finish()
         }
     }
 
