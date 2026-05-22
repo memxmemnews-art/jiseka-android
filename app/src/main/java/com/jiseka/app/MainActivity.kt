@@ -57,7 +57,6 @@ import java.util.UUID
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.abs
-import kotlin.math.acos
 import kotlin.math.atan2
 import kotlin.math.hypot
 import kotlin.math.max
@@ -145,9 +144,13 @@ class MainActivity : AppCompatActivity() {
                 allowFileAccessFromFileURLs = true
                 allowUniversalAccessFromFileURLs = true
                 mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                
+                // 💡 웹 캐시 꼬임 방지를 위해 항시 새 코드 로드 설정 추가
+                cacheMode = WebSettings.LOAD_NO_CACHE
             }
             webViewClient = object : WebViewClientCompat() {
-                override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? = assetLoader.shouldInterceptRequest(request.url)
+                override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse?
+                = assetLoader.shouldInterceptRequest(request.url)
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest) = false
             }
             webChromeClient = WebChromeClient()
@@ -221,8 +224,8 @@ class MainActivity : AppCompatActivity() {
                         analysisExecutor.execute {
                             if (isDestroyed || isFinishing) { 
                                 guideBitmap?.recycle()
+                                if (blobBitmap !== processingBitmap) blobBitmap?.recycle()
                                 processingBitmap?.recycle()
-                                blobBitmap?.recycle()
                                 return@execute 
                             }
                             
@@ -248,11 +251,13 @@ class MainActivity : AppCompatActivity() {
                                 sendCachedPreviewToJs(smoothedPoints ?: finalPoints, fileUriStr, bmpW, bmpH)
                                 previewBitmap.recycle()
                             } catch (e: Exception) { 
+                                Log.e("JiSeKa Engine", "비동기 분석 및 매핑 중 오류", e)
                                 sendCachedPreviewToJs(mappedPoints, saveBitmapToCacheFile(processingBitmap!!), bmpW, bmpH) 
                             } finally { 
+                                // 💡 안전한 릴리즈 시점 구조 조정 완료 (Double Free 현상 방어)
                                 guideBitmap?.recycle()
+                                if (blobBitmap !== processingBitmap) blobBitmap?.recycle()
                                 processingBitmap?.recycle()
-                                blobBitmap?.recycle()
                             }
                         }
                     }
@@ -277,7 +282,13 @@ class MainActivity : AppCompatActivity() {
                     res = processPerspectiveOverlay(base, pts)
                     saveBitmapToGallery(res!!)
                     safeEvaluate("window.onNativeSaveComplete()")
-                } finally { base?.recycle(); res?.let { if (it !== base) it.recycle() } }
+                } catch (e: Exception) {
+                    Log.e("JiSeKa Engine", "최종 갤러리 합성 저장 실패", e)
+                    safeEvaluate("window.onNativeError('네이티브 합성 저장 프로세스 실패')")
+                } finally { 
+                    base?.recycle()
+                    res?.let { if (it !== base) it.recycle() } 
+                }
             }
         }
         @JavascriptInterface fun showToast(msg: String) { runOnUiThread { if (!isDestroyed && !isFinishing) Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show() } }
@@ -468,7 +479,6 @@ class MainActivity : AppCompatActivity() {
             Imgproc.threshold(alphaMask, alphaMask, 1.0, 255.0, Imgproc.THRESH_BINARY)
             Core.bitwise_not(alphaMask, inv)
             
-            // Blending Logic
             val warpedChannels = mutableListOf<Mat>()
             val targetChannels = mutableListOf<Mat>()
             warpedMask.convertTo(warpedMask, CvType.CV_32FC4)
@@ -491,13 +501,10 @@ class MainActivity : AppCompatActivity() {
             }
             warpedChannels.forEach { it.release() }
             targetChannels.forEach { it.release() }
-            
         } finally { mat.release(); maskMat.release(); warpedMask.release(); alphaMask.release(); inv.release(); final.release() }
         return result
     }
 
-    // 💡 [핵심 복구] 유실되었던 파일 저장 및 카메라 촬영 유틸리티 함수들 원복 완료!
-    
     private fun scaleBitmapDownToLimit(b: Bitmap, mW: Int, mH: Int): Bitmap {
         val sc = min(mW.toFloat()/b.width, mH.toFloat()/b.height)
         return if (sc >= 1) b else Bitmap.createScaledBitmap(b, (b.width * sc).roundToInt(), (b.height * sc).roundToInt(), true)
@@ -514,7 +521,6 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
-    // 💡 복구: 카메라 시작 함수
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
@@ -528,7 +534,6 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    // 💡 복구: 사진 촬영 및 콜백 처리 함수
     private fun takePhoto() {
         if (isProcessing) return
         isProcessing = true
@@ -559,13 +564,12 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 override fun onError(exception: ImageCaptureException) {
-                    runOnUiThread { isProcessing = false; Toast.makeText(this@MainActivity, "캡처 실패", Toast.LENGTH_SHORT).show() }
+                    runOnUiThread { isProcessing = false; Toast.makeText(this@MainActivity, "📸 캡처 실패", Toast.LENGTH_SHORT).show() }
                 }
             }
         )
     }
 
-    // 💡 복구: 비트맵 안전 로드 및 회전 방지 함수
     private fun loadSafeBitmap(path: String, maxW: Int, maxH: Int): Bitmap {
         val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(path, options)
@@ -595,14 +599,28 @@ class MainActivity : AppCompatActivity() {
         return inSampleSize
     }
 
-    // 💡 복구: 분석용 캐시 이미지 저장 함수
+    // 💡 해결책 3 반영: 파일 스트림의 강제 플러시 및 0 Byte 파일 체크 무결성 방어 메커니즘
     private fun saveBitmapToCacheFile(bitmap: Bitmap): String? {
         val file = File(previewDir, "preview_${UUID.randomUUID()}.jpg")
-        FileOutputStream(file).use { bitmap.compress(Bitmap.CompressFormat.JPEG, 85, it) }
+        try {
+            FileOutputStream(file).use { out ->
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
+                out.flush() // I/O 지연으로 인한 빈 파일 방지
+            }
+        } catch (e: Exception) {
+            Log.e("JiSeKa Engine", "캐시 이미지 물리 저장소 스트림 에러", e)
+            return null
+        }
+
+        if (!file.exists() || file.length() == 0L) {
+            Log.e("JiSeKa Engine", "파일 생성 무결성 검증 실패 (0바이트 혹은 유실)")
+            return null
+        }
+
+        Log.d("JiSeKa Engine", "무결성 통과 완료 -> 경로: ${file.absolutePath} | 크기: ${file.length()} bytes")
         return "https://appassets.androidplatform.net/preview/${file.name}"
     }
 
-    // 💡 복구: JS로 분석 완료 신호 및 좌표 전달 함수
     private fun sendCachedPreviewToJs(points: List<PointF>, uri: String?, bmpW: Float, bmpH: Float) {
         val arr = JSONArray()
         for (p in points) { val obj = JSONObject(); obj.put("x", p.x / bmpW); obj.put("y", p.y / bmpH); arr.put(obj) }
@@ -611,7 +629,6 @@ class MainActivity : AppCompatActivity() {
         isProcessing = false
     }
 
-    // 💡 복구: 갤러리 앨범에 최종 결과 저장 함수
     private fun saveBitmapToGallery(bitmap: Bitmap) {
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, "JiSeKa_${System.currentTimeMillis()}.jpg")
@@ -620,7 +637,7 @@ class MainActivity : AppCompatActivity() {
         }
         val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return
         contentResolver.openOutputStream(uri)?.use { bitmap.compress(Bitmap.CompressFormat.JPEG, 95, it) }
-        runOnUiThread { Toast.makeText(this, "갤러리에 저장되었습니다.", Toast.LENGTH_SHORT).show() }
+        runOnUiThread { Toast.makeText(this, "💾 갤러리에 저장되었습니다.", Toast.LENGTH_SHORT).show() }
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
