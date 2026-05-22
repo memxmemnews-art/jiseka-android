@@ -463,48 +463,86 @@ class MainActivity : AppCompatActivity() {
         return lines.filter { abs(min(((atan2(it.y2-it.y1, it.x2-it.x1)*180/Math.PI + 90) % 180 - 90) - dom, 180.0 - abs(((atan2(it.y2-it.y1, it.x2-it.x1)*180/Math.PI + 90) % 180 - 90) - dom))) <= 15.0 }
     }
 
-    private fun processPerspectiveOverlay(source: Bitmap, targetCorners: List<PointF>): Bitmap {
+   private fun processPerspectiveOverlay(source: Bitmap, targetCorners: List<PointF>): Bitmap {
         val result = source.copy(Bitmap.Config.ARGB_8888, true)
-        val mat = Mat(); val maskMat = Mat(); val warpedMask = Mat(); val alphaMask = Mat(); val inv = Mat(); val final = Mat()
+        val mat = Mat()
+        val maskMat = Mat()
+        val warpedMask = Mat()
+        val alphaMask = Mat()
+        val inv = Mat()
+        val final = Mat()
+        
+        // 💡 4채널 전체를 담을 안전한 리스트 선언
+        val warpedChannels = mutableListOf<Mat>()
+        val warpedChannels32F = mutableListOf<Mat>()
+        val targetChannels = mutableListOf<Mat>()
+        
         try {
             Utils.bitmapToMat(result, mat)
             val resId = resources.getIdentifier("plate_mask", "drawable", packageName)
             val maskBmp = (if (resId != 0) BitmapFactory.decodeResource(resources, resId) else Bitmap.createBitmap(600, 150, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.LTGRAY) }).copy(Bitmap.Config.ARGB_8888, true)
-            Utils.bitmapToMat(maskBmp, maskMat); maskBmp.recycle()
-            val srcPts = MatOfPoint2f(org.opencv.core.Point(0.0,0.0), org.opencv.core.Point(maskMat.cols().toDouble(),0.0), org.opencv.core.Point(maskMat.cols().toDouble(),maskMat.rows().toDouble()), org.opencv.core.Point(0.0,maskMat.rows().toDouble()))
+            Utils.bitmapToMat(maskBmp, maskMat)
+            maskBmp.recycle()
+            
+            val srcPts = MatOfPoint2f(
+                org.opencv.core.Point(0.0, 0.0), 
+                org.opencv.core.Point(maskMat.cols().toDouble(), 0.0), 
+                org.opencv.core.Point(maskMat.cols().toDouble(), maskMat.rows().toDouble()), 
+                org.opencv.core.Point(0.0, maskMat.rows().toDouble())
+            )
             val dstPts = MatOfPoint2f(*sortCorners(targetCorners).map { org.opencv.core.Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
             val transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
             Imgproc.warpPerspective(maskMat, warpedMask, transform, mat.size(), Imgproc.INTER_LINEAR)
-            Core.split(warpedMask, mutableListOf<Mat>().apply { add(alphaMask) }) 
+            
+            // 💡 치명적 오류 수정: 4채널 전체 분리 후 알파 채널 안전 추출
+            Core.split(warpedMask, warpedChannels)
+            if (warpedChannels.size < 4) {
+                Log.e("JiSeKa Engine", "채널 분리 실패 (4채널 미만)")
+                return result // 크래시 방지 및 원본 반환
+            }
+            warpedChannels[3].copyTo(alphaMask) 
+            
             Imgproc.threshold(alphaMask, alphaMask, 1.0, 255.0, Imgproc.THRESH_BINARY)
             Core.bitwise_not(alphaMask, inv)
             
-            val warpedChannels = mutableListOf<Mat>()
-            val targetChannels = mutableListOf<Mat>()
             warpedMask.convertTo(warpedMask, CvType.CV_32FC4)
             mat.convertTo(mat, CvType.CV_32FC4)
             alphaMask.convertTo(alphaMask, CvType.CV_32FC1, 1.0 / 255.0)
             inv.convertTo(inv, CvType.CV_32FC1, 1.0 / 255.0)
-            Core.split(warpedMask, warpedChannels)
+            
+            // 연산용 32F 채널 분리
+            Core.split(warpedMask, warpedChannels32F)
             Core.split(mat, targetChannels)
             
-            if (warpedChannels.size >= 3 && targetChannels.size >= 3) {
+            if (warpedChannels32F.size >= 3 && targetChannels.size >= 3) {
                 for (i in 0 until 3) {
-                    Core.multiply(warpedChannels[i], alphaMask, warpedChannels[i])
+                    Core.multiply(warpedChannels32F[i], alphaMask, warpedChannels32F[i])
                     Core.multiply(targetChannels[i], inv, targetChannels[i])
-                    Core.add(warpedChannels[i], targetChannels[i], warpedChannels[i])
+                    Core.add(warpedChannels32F[i], targetChannels[i], warpedChannels32F[i])
                 }
-                if (warpedChannels.size > 3 && targetChannels.size > 3) targetChannels[3].copyTo(warpedChannels[3])
-                Core.merge(warpedChannels, final)
+                if (warpedChannels32F.size > 3 && targetChannels.size > 3) {
+                    targetChannels[3].copyTo(warpedChannels32F[3])
+                }
+                Core.merge(warpedChannels32F, final)
                 final.convertTo(final, CvType.CV_8UC4)
                 Utils.matToBitmap(final, result)
             }
+        } catch (e: Exception) {
+            Log.e("JiSeKa Engine", "Perspective Overlay Exception", e)
+        } finally { 
+            mat.release()
+            maskMat.release()
+            warpedMask.release()
+            alphaMask.release()
+            inv.release()
+            final.release()
             warpedChannels.forEach { it.release() }
+            warpedChannels32F.forEach { it.release() }
             targetChannels.forEach { it.release() }
-        } finally { mat.release(); maskMat.release(); warpedMask.release(); alphaMask.release(); inv.release(); final.release() }
+        }
         return result
     }
-
+   
     private fun scaleBitmapDownToLimit(b: Bitmap, mW: Int, mH: Int): Bitmap {
         val sc = min(mW.toFloat()/b.width, mH.toFloat()/b.height)
         return if (sc >= 1) b else Bitmap.createScaledBitmap(b, (b.width * sc).roundToInt(), (b.height * sc).roundToInt(), true)
