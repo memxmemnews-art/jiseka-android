@@ -16,6 +16,8 @@ class NativeGuideView @JvmOverloads constructor(
     defStyleAttr: Int = 0
 ) : View(context, attrs, defStyleAttr) {
 
+    var onGuideDropListener: ((String) -> Unit)? = null
+
     private var isInitialized = false
     var currentMode: String = "FRONT"
         private set
@@ -40,6 +42,7 @@ class NativeGuideView @JvmOverloads constructor(
     }
 
     private var isDragging = false
+    private var isMoved = false
     private var lastTouchX = 0f
     private var lastTouchY = 0f
 
@@ -117,12 +120,14 @@ class NativeGuideView @JvmOverloads constructor(
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
                 isDragging = true
+                isMoved = false
                 lastTouchX = x
                 lastTouchY = y
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
                 if (isDragging) {
+                    isMoved = true
                     val dx = x - lastTouchX
                     val dy = y - lastTouchY
 
@@ -131,11 +136,8 @@ class NativeGuideView @JvmOverloads constructor(
                     val minY = currentCorners.minOf { it.y }
                     val maxY = currentCorners.maxOf { it.y }
                     
-                    val centerX = (minX + maxX) / 2f
-                    val centerY = (minY + maxY) / 2f
-
-                    val allowedDx = if (dx > 0) minOf(dx, width.toFloat() - centerX) else maxOf(dx, -centerX)
-                    val allowedDy = if (dy > 0) minOf(dy, height.toFloat() - centerY) else maxOf(dy, -centerY)
+                    val allowedDx = if (dx > 0) minOf(dx, width.toFloat() - maxX) else maxOf(dx, -minX)
+                    val allowedDy = if (dy > 0) minOf(dy, height.toFloat() - maxY) else maxOf(dy, -minY)
 
                     for (point in currentCorners) {
                         point.x += allowedDx
@@ -149,7 +151,12 @@ class NativeGuideView @JvmOverloads constructor(
                 }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                isDragging = false
+                if (isDragging) {
+                    isDragging = false
+                    if (isMoved) {
+                        onGuideDropListener?.invoke(currentMode)
+                    }
+                }
             }
         }
         return super.onTouchEvent(event)
