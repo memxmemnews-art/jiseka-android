@@ -35,22 +35,16 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewClientCompat
-import org.json.JSONArray
-import org.json.JSONObject
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
 import org.opencv.core.Core
-import org.opencv.core.CvException
 import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.core.MatOfPoint2f
 import org.opencv.imgproc.Imgproc
 import java.io.File
-import java.io.FileOutputStream
-import java.util.UUID
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import kotlin.math.abs
 
 @OptIn(TransformExperimental::class, androidx.camera.core.ExperimentalGetImage::class)
 class MainActivity : AppCompatActivity() {
@@ -65,6 +59,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var analysisExecutor: ExecutorService
 
     @Volatile private var isProcessing = false
+    @Volatile private var isHighResCaptureReady = false
+    private var pendingAnalysisMode: String? = null
 
     private var displayedBitmap: Bitmap? = null
     private var lastCapturedBitmap: Bitmap? = null
@@ -86,7 +82,6 @@ class MainActivity : AppCompatActivity() {
         nativeGuideView = findViewById(R.id.nativeGuideView)
         webView = findViewById(R.id.webView)
         
-        // 💡 문제 4 해결: Executor 분리 및 스레드 풀 확장 (Starvation 방지)
         cameraExecutor = Executors.newSingleThreadExecutor()
         analysisExecutor = Executors.newFixedThreadPool(2)
 
@@ -99,8 +94,13 @@ class MainActivity : AppCompatActivity() {
 
         setupWebView()
 
+        // 가이드 박스 드래그 앤 드롭 완료 시 자동 분석 실행
+        nativeGuideView?.onGuideDropListener = { mode ->
+            runOnUiThread { safeEvaluate("showToast('분석 중입니다...')") }
+            triggerAnalysis(mode)
+        }
+
         if (allPermissionsGranted()) {
-            // 💡 생명주기 지연 (Layout 확정 후 바인딩)
             viewFinder?.post { startCamera() }
         } else {
             ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
@@ -110,9 +110,7 @@ class MainActivity : AppCompatActivity() {
     private fun safeEvaluate(js: String) {
         runOnUiThread {
             if (!isDestroyed && !isFinishing && webView != null) {
-                try { webView?.evaluateJavascript(js, null) } catch (e: Exception) {
-                    Log.e("CAMERA_DEBUG", "JS Evaluate Error", e)
-                }
+                try { webView?.evaluateJavascript(js, null) } catch (e: Exception) {}
             }
         }
     }
@@ -122,8 +120,6 @@ class MainActivity : AppCompatActivity() {
         webView?.apply {
             setLayerType(View.LAYER_TYPE_HARDWARE, null)
             setBackgroundColor(Color.TRANSPARENT)
-            
-            // 💡 문제 3 해결: 이전 버전 JS 실행 원천 차단 (하드 캐시 클리어)
             clearCache(true)
             
             settings.apply {
@@ -137,8 +133,6 @@ class MainActivity : AppCompatActivity() {
             }
             webChromeClient = WebChromeClient()
             addJavascriptInterface(AndroidBridge(), "AndroidBridge")
-            
-            // 캐시 버스팅 파라미터 적용
             loadUrl("https://ziseka-app.vercel.app/?v=" + System.currentTimeMillis())
         }
     }
@@ -187,38 +181,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         @JavascriptInterface fun analyzePlateWithMode(mode: String) {
-            analysisExecutor.execute {
-                if (isDestroyed || isFinishing) return@execute
-                var processingBitmap: Bitmap? = null
-                try {
-                    processingBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) } 
-                        ?: throw IllegalStateException("캡처된 원본 비트맵이 없습니다.")
-                    val transformData = synchronized(transformLock) { lastTransformData } 
-                        ?: throw IllegalStateException("메타데이터 누락")
-
-                    val view = viewFinder ?: throw IllegalStateException("ViewFinder가 초기화되지 않았습니다.")
-                    val uiCorners = nativeGuideView?.getCorners() ?: throw IllegalStateException("가이드 박스 좌표가 없습니다.")
-                    
-                    val exactBitmapPoints = CameraCoordinateConverter.mapUiToExactBitmap(
-                        previewView = view, transformData = transformData, uiPoints = uiCorners,
-                        uprightBitmapWidth = processingBitmap.width, uprightBitmapHeight = processingBitmap.height
-                    )
-
-                    val resultBitmap = processPerspectiveOverlay(processingBitmap, exactBitmapPoints)
-                    
-                    runOnUiThread {
-                        updateNativeBackgroundSafe(resultBitmap)
-                        nativeGuideView?.visibility = View.GONE
-                        safeEvaluate("window.onNativeSuccess()")
-                    }
-                } catch (e: Exception) { 
-                    Log.e("CAMERA_DEBUG", "분석 실패", e)
-                    safeEvaluate("window.onNativeError('분석 중 오류가 발생했습니다.')")
-                } finally {
-                    processingBitmap?.recycle()
-                    isProcessing = false 
-                }
-            }
+            triggerAnalysis(mode)
         }
 
         @JavascriptInterface fun saveFinalImage() {
@@ -230,16 +193,16 @@ class MainActivity : AppCompatActivity() {
                     saveBitmapToGallery(finalBitmapToSave)
                     safeEvaluate("window.onNativeSaveComplete()")
                 } catch (e: Exception) {
-                    Log.e("CAMERA_DEBUG", "저장 실패", e)
                     safeEvaluate("window.onNativeError('저장 실패')")
                 }
             }
         }
-        @JavascriptInterface fun showToast(msg: String) { runOnUiThread { Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show() } }
+        @JavascriptInterface fun showToast(msg: String) { 
+            runOnUiThread { Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show() } 
+        }
     }
 
     private fun startCamera() {
-        Log.d("CAMERA_DEBUG", "startCamera entered")
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             val cameraProvider = cameraProviderFuture.get()
@@ -248,7 +211,6 @@ class MainActivity : AppCompatActivity() {
             val preview = Preview.Builder().setTargetAspectRatio(AspectRatio.RATIO_16_9).build()
                 .also { it.setSurfaceProvider(viewFinder?.surfaceProvider) }
 
-            // 변수 쉐도잉 방지: 클래스 멤버 변수 imageCapture에 명시적 할당
             imageCapture = ImageCapture.Builder()
                 .setTargetAspectRatio(AspectRatio.RATIO_16_9)
                 .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
@@ -256,57 +218,44 @@ class MainActivity : AppCompatActivity() {
 
             try {
                 cameraProvider.unbindAll()
-                val viewPort = viewFinder?.viewPort ?: run {
-                    Log.e("CAMERA_DEBUG", "ViewPort is null! 레이아웃이 아직 준비되지 않음.")
-                    return@addListener
-                }
-                
+                val viewPort = viewFinder?.viewPort ?: return@addListener
                 val useCaseGroup = androidx.camera.core.UseCaseGroup.Builder()
                     .setViewPort(viewPort)
                     .addUseCase(preview)
                     .addUseCase(imageCapture!!)
                     .build()
-
                 cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, useCaseGroup)
-                Log.d("CAMERA_DEBUG", "bindToLifecycle success")
-            } catch (e: Exception) { 
-                Log.e("CAMERA_DEBUG", "카메라 바인딩 실패", e) 
-            }
+            } catch (e: Exception) { }
         }, ContextCompat.getMainExecutor(this))
     }
 
     private fun takePhoto() {
-        Log.d("CAMERA_DEBUG", "takePhoto called")
-        if (isProcessing) {
-            Log.d("CAMERA_DEBUG", "Already processing, rejected")
-            return
-        }
+        if (isProcessing) return
         isProcessing = true
+        isHighResCaptureReady = false
+        pendingAnalysisMode = null
         
-        val currentCapture = imageCapture
-        if (currentCapture == null) {
-            // 💡 문제 1 해결: imageCapture가 null일 때 예외 삼킴 방지 및 JS 복구 트리거
-            Log.e("CAMERA_DEBUG", "imageCapture is null! Camera not bound properly.")
+        val currentCapture = imageCapture ?: run {
             isProcessing = false
             safeEvaluate("window.onNativeError('카메라가 초기화되지 않았습니다.')")
             return
         }
         
+        // 프리뷰 캡처로 화면 즉시 정지
         val freezeBitmap = viewFinder?.bitmap
         if (freezeBitmap != null) {
             runOnUiThread {
                 updateNativeBackgroundSafe(freezeBitmap)
                 nativeBackgroundView?.visibility = View.VISIBLE
                 nativeGuideView?.visibility = View.VISIBLE
+                safeEvaluate("window.onNativeScreenFrozen()")
             }
         }
 
-        Log.d("CAMERA_DEBUG", "takePicture entered")
         currentCapture.takePicture(
             cameraExecutor,
             object : ImageCapture.OnImageCapturedCallback() {
                 override fun onCaptureSuccess(imageProxy: ImageProxy) {
-                    Log.d("CAMERA_DEBUG", "capture success (buffer received)")
                     try {
                         val uprightBitmap = imageProxy.toUprightBitmap()
                         val transformData = CaptureTransformData(
@@ -325,11 +274,16 @@ class MainActivity : AppCompatActivity() {
                         }
                         synchronized(transformLock) { lastTransformData = transformData }
 
-                        runOnUiThread { safeEvaluate("window.onNativePhotoCaptured()") }
-                        Log.d("CAMERA_DEBUG", "onCaptureSuccess fully completed")
+                        isHighResCaptureReady = true 
+
+                        runOnUiThread { 
+                            pendingAnalysisMode?.let { mode ->
+                                pendingAnalysisMode = null
+                                triggerAnalysis(mode)
+                            }
+                            safeEvaluate("window.onNativePhotoCaptured()")
+                        }
                     } catch (e: Exception) {
-                        // 💡 문제 5 해결: 내부 처리 중 에러 시 JS로 실패 통보
-                        Log.e("CAMERA_DEBUG", "onCaptureSuccess internal error", e)
                         imageProxy.close()
                         runOnUiThread { 
                             isProcessing = false
@@ -338,8 +292,6 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 override fun onError(exception: ImageCaptureException) {
-                    // 💡 카메라 하드웨어 레벨 캡처 실패 시 JS로 통보
-                    Log.e("CAMERA_DEBUG", "capture error", exception)
                     runOnUiThread { 
                         isProcessing = false
                         safeEvaluate("window.onNativeError('카메라 캡처에 실패했습니다.')")
@@ -349,14 +301,76 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    private fun processPerspectiveOverlay(source: Bitmap, targetCorners: List<PointF>): Bitmap {
-        val orderedCorners = orderCorners(targetCorners)
-
-        if (!isConvexQuad(orderedCorners) || getPolygonArea(orderedCorners) < 2000f) {
-            Log.e("CAMERA_DEBUG", "Warp 무결성 거부: 오목/면적 미달")
-            return source.copy(Bitmap.Config.ARGB_8888, true)
+    private fun triggerAnalysis(mode: String) {
+        if (!isHighResCaptureReady) {
+            pendingAnalysisMode = mode
+            runOnUiThread { safeEvaluate("showToast('고해상도 원본을 처리 중입니다. 잠시만 대기해주세요 ✨')") }
+            return
         }
 
+        analysisExecutor.execute {
+            if (isDestroyed || isFinishing) return@execute
+            var processingBitmap: Bitmap? = null
+            var roiBitmap: Bitmap? = null
+            
+            try {
+                processingBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) } 
+                    ?: throw IllegalStateException("캡처된 원본 비트맵이 없습니다.")
+                val transformData = synchronized(transformLock) { lastTransformData } 
+                    ?: throw IllegalStateException("메타데이터 누락")
+
+                val view = viewFinder ?: throw IllegalStateException("ViewFinder가 초기화되지 않았습니다.")
+                val uiCorners = nativeGuideView?.getCorners() ?: throw IllegalStateException("가이드 박스 좌표가 없습니다.")
+           
+                val exactBitmapPoints = CameraCoordinateConverter.mapUiToExactBitmap(
+                    previewView = view, transformData = transformData, uiPoints = uiCorners,
+                    uprightBitmapWidth = processingBitmap.width, uprightBitmapHeight = processingBitmap.height
+                )
+
+                // 1. ROI 좌표 크롭 영역 계산
+                val minX = exactBitmapPoints.minOf { it.x }.toInt().coerceAtLeast(0)
+                val minY = exactBitmapPoints.minOf { it.y }.toInt().coerceAtLeast(0)
+                val maxX = exactBitmapPoints.maxOf { it.x }.toInt().coerceAtMost(processingBitmap.width)
+                val maxY = exactBitmapPoints.maxOf { it.y }.toInt().coerceAtMost(processingBitmap.height)
+                val roiWidth = maxX - minX
+                val roiHeight = maxY - minY
+
+                if (roiWidth <= 0 || roiHeight <= 0) throw IllegalStateException("유효하지 않은 가이드 박스 영역입니다.")
+
+                roiBitmap = Bitmap.createBitmap(processingBitmap, minX, minY, roiWidth, roiHeight)
+
+                // 2. 엔진 분석 실행
+                val localCorners = PlateDetectionEngine.findPlateCorners(roiBitmap)
+
+                if (localCorners != null) {
+                    // 로컬 좌표 -> 전체 픽셀 좌표 역산 변환
+                    val globalCorners = localCorners.map { PointF(it.x + minX, it.y + minY) }
+                    
+                    // 가림막 합성
+                    val resultBitmap = applyPrivacyMask(processingBitmap, globalCorners)
+                    
+                    runOnUiThread {
+                        updateNativeBackgroundSafe(resultBitmap)
+                        nativeGuideView?.visibility = View.GONE
+                        safeEvaluate("window.onNativeSuccess()")
+                    }
+                } else {
+                    runOnUiThread { safeEvaluate("window.onNativeError('번호판을 찾지 못했습니다. 가이드 박스를 번호판 크기에 맞게 조절해주세요.')") }
+                }
+
+            } catch (e: Exception) { 
+                Log.e("CAMERA_DEBUG", "분석 실패", e)
+                safeEvaluate("window.onNativeError('분석 중 오류가 발생했습니다.')")
+            } finally {
+                processingBitmap?.recycle()
+                roiBitmap?.recycle()
+                isProcessing = false 
+            }
+        }
+    }
+
+    // OpenCV 기반 가림막 합성 방어 코드 (OOM 방지 완벽 해제)
+    private fun applyPrivacyMask(source: Bitmap, targetCorners: List<PointF>): Bitmap {
         val result = source.copy(Bitmap.Config.ARGB_8888, true)
         val mat = Mat()
         val maskMat = Mat()
@@ -367,89 +381,70 @@ class MainActivity : AppCompatActivity() {
         val warpedChannels32F = mutableListOf<Mat>()
         val targetChannels = mutableListOf<Mat>()
         val warpedChannels = mutableListOf<Mat>()
-        
+        var srcPts: MatOfPoint2f? = null
+        var dstPts: MatOfPoint2f? = null
+        var transform: Mat? = null
+
         try {
             Utils.bitmapToMat(result, mat)
             val maskBmp = Bitmap.createBitmap(600, 150, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.LTGRAY) }
             Utils.bitmapToMat(maskBmp, maskMat)
             maskBmp.recycle()
-            
-            val srcPts = MatOfPoint2f(
-                org.opencv.core.Point(0.0, 0.0), 
-                org.opencv.core.Point(maskMat.cols().toDouble(), 0.0), 
-                org.opencv.core.Point(maskMat.cols().toDouble(), maskMat.rows().toDouble()), 
+
+            srcPts = MatOfPoint2f(
+                org.opencv.core.Point(0.0, 0.0),
+                org.opencv.core.Point(maskMat.cols().toDouble(), 0.0),
+                org.opencv.core.Point(maskMat.cols().toDouble(), maskMat.rows().toDouble()),
                 org.opencv.core.Point(0.0, maskMat.rows().toDouble())
             )
-            val dstPts = MatOfPoint2f(*orderedCorners.map { org.opencv.core.Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
             
-            val transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
+            // 좌표 정렬 보정
+            val sortedByX = targetCorners.sortedBy { it.x }
+            val left = sortedByX.take(2).sortedBy { it.y }
+            val right = sortedByX.takeLast(2).sortedBy { it.y }
+            val orderedCorners = listOf(left[0], right[0], right[1], left[1])
+            
+            dstPts = MatOfPoint2f(*orderedCorners.map { org.opencv.core.Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
+
+            transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
             Imgproc.warpPerspective(maskMat, warpedMask, transform, mat.size(), Imgproc.INTER_LINEAR)
-            
+
             Core.split(warpedMask, warpedChannels)
             if (warpedChannels.size >= 4) {
-                warpedChannels[3].copyTo(alphaMask) 
+                warpedChannels[3].copyTo(alphaMask)
                 Imgproc.threshold(alphaMask, alphaMask, 1.0, 255.0, Imgproc.THRESH_BINARY)
                 Core.bitwise_not(alphaMask, inv)
-                
+
                 warpedMask.convertTo(warpedMask, CvType.CV_32FC4)
                 mat.convertTo(mat, CvType.CV_32FC4)
                 alphaMask.convertTo(alphaMask, CvType.CV_32FC1, 1.0 / 255.0)
                 inv.convertTo(inv, CvType.CV_32FC1, 1.0 / 255.0)
-                
+
                 Core.split(warpedMask, warpedChannels32F)
                 Core.split(mat, targetChannels)
-                
+
                 for (i in 0 until 3) {
                     Core.multiply(warpedChannels32F[i], alphaMask, warpedChannels32F[i])
                     Core.multiply(targetChannels[i], inv, targetChannels[i])
                     Core.add(warpedChannels32F[i], targetChannels[i], warpedChannels32F[i])
                 }
                 if (warpedChannels32F.size > 3 && targetChannels.size > 3) targetChannels[3].copyTo(warpedChannels32F[3])
-                
+
                 Core.merge(warpedChannels32F, final)
                 final.convertTo(final, CvType.CV_8UC4)
                 Utils.matToBitmap(final, result)
             }
-        } catch (e: CvException) {
-            Log.e("CAMERA_DEBUG", "OpenCV Warp 실패", e)
-        } finally { 
+        } catch (e: Exception) {
+            Log.e("CAMERA_DEBUG", "Warp 가림막 합성 실패", e)
+        } finally {
             mat.release(); maskMat.release(); warpedMask.release(); alphaMask.release()
             inv.release(); final.release()
             warpedChannels.forEach { it.release() }
             warpedChannels32F.forEach { it.release() }
             targetChannels.forEach { it.release() }
+            srcPts?.release(); dstPts?.release(); transform?.release()
         }
         return result
-    }
-
-    private fun orderCorners(pts: List<PointF>): List<PointF> {
-        if (pts.size != 4) return pts
-        val tl = pts.minByOrNull { it.x + it.y } ?: pts[0]
-        val br = pts.maxByOrNull { it.x + it.y } ?: pts[0]
-        val tr = pts.maxByOrNull { it.x - it.y } ?: pts[0]
-        val bl = pts.minByOrNull { it.x - it.y } ?: pts[0]
-        return listOf(tl, tr, br, bl)
-    }
-
-    private fun isConvexQuad(points: List<PointF>): Boolean {
-        if (points.size != 4) return false
-        var sign = 0
-        for (i in points.indices) {
-            val cross = (points[(i+1)%4].x - points[i].x) * (points[(i+2)%4].y - points[(i+1)%4].y) - 
-                        (points[(i+1)%4].y - points[i].y) * (points[(i+2)%4].x - points[(i+1)%4].x)
-            if (cross != 0f) {
-                if (sign == 0) sign = if (cross > 0) 1 else -1
-                else if ((if (cross > 0) 1 else -1) != sign) return false
-            }
-        }
-        return true
-    }
-
-    private fun getPolygonArea(points: List<PointF>): Float {
-        if (points.size != 4) return 0f
-        var area = 0f
-        for (i in points.indices) area += points[i].x * points[(i+1)%4].y - points[(i+1)%4].x * points[i].y
-        return abs(area) / 2f
     }
 
     private fun saveBitmapToGallery(bitmap: Bitmap) {
@@ -466,7 +461,6 @@ class MainActivity : AppCompatActivity() {
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQUEST_CODE_PERMISSIONS) {
-            // 💡 퍼미션 획득 직후에도 post를 통해 안전하게 바인딩
             if (allPermissionsGranted()) viewFinder?.post { startCamera() } else finish()
         }
     }
