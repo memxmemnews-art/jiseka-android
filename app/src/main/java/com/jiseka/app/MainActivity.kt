@@ -41,33 +41,36 @@ import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.core.MatOfPoint2f
+import org.opencv.core.Point
+import org.opencv.core.Scalar
+import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
-@OptIn(TransformExperimental::class, androidx.camera.core.ExperimentalGetImage::class)
+@OptIn(TransformExperimental::class)
 class MainActivity : AppCompatActivity() {
 
     private var webView: WebView? = null
     private var viewFinder: PreviewView? = null
     private var nativeBackgroundView: ImageView? = null
     private var nativeGuideView: NativeGuideView? = null
-    
+
     private var imageCapture: ImageCapture? = null
     private lateinit var cameraExecutor: ExecutorService
     private lateinit var analysisExecutor: ExecutorService
 
+    private val bitmapLock = Any()
+    private var lastCapturedBitmap: Bitmap? = null
+    private var displayedBitmap: Bitmap? = null
+
+    private val transformLock = Any()
+    private var lastTransformData: CaptureTransformData? = null
+
     @Volatile private var isProcessing = false
     @Volatile private var isHighResCaptureReady = false
     private var pendingAnalysisMode: String? = null
-
-    private var displayedBitmap: Bitmap? = null
-    private var lastCapturedBitmap: Bitmap? = null
-    private var lastTransformData: CaptureTransformData? = null
-    
-    private val bitmapLock = Any()
-    private val transformLock = Any()
 
     private lateinit var previewDir: File
     private lateinit var assetLoader: WebViewAssetLoader
@@ -75,29 +78,32 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-        if (!OpenCVLoader.initDebug()) Log.e("CAMERA_DEBUG", "OpenCV 초기화 실패")
+
+        if (!OpenCVLoader.initDebug()) {
+            Log.e("MainActivity", "OpenCV initialization failed.")
+        }
 
         viewFinder = findViewById(R.id.viewFinder)
         nativeBackgroundView = findViewById(R.id.nativeBackgroundView)
         nativeGuideView = findViewById(R.id.nativeGuideView)
         webView = findViewById(R.id.webView)
-        
-        cameraExecutor = Executors.newSingleThreadExecutor()
-        analysisExecutor = Executors.newFixedThreadPool(2)
 
-        previewDir = File(filesDir, "preview")
-        if (!previewDir.exists()) previewDir.mkdirs()
+        cameraExecutor = Executors.newSingleThreadExecutor()
+        analysisExecutor = Executors.newSingleThreadExecutor()
+        previewDir = File(cacheDir, "preview_images").apply { if (!exists()) mkdirs() }
 
         assetLoader = WebViewAssetLoader.Builder()
-            .addPathHandler("/preview/", WebViewAssetLoader.InternalStoragePathHandler(this, previewDir))
+            .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(this))
             .build()
 
         setupWebView()
 
-        // 가이드 박스 드래그 앤 드롭 완료 시 자동 분석 실행
         nativeGuideView?.onGuideDropListener = { mode ->
-            runOnUiThread { safeEvaluate("showToast('분석 중입니다...')") }
-            triggerAnalysis(mode)
+            val points = nativeGuideView?.getCorners() ?: emptyList()
+            val jsPointsArray = points.joinToString(prefix = "[", postfix = "]") { p ->
+                "{\"x\":${p.x},\"y\":${p.y}}"
+            }
+            safeEvaluate("window.onNativeGuideMoved('$mode', $jsPointsArray)")
         }
 
         if (allPermissionsGranted()) {
@@ -107,55 +113,73 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun safeEvaluate(js: String) {
-        runOnUiThread {
-            if (!isDestroyed && !isFinishing && webView != null) {
-                try { webView?.evaluateJavascript(js, null) } catch (e: Exception) {}
-            }
-        }
-    }
-
     @SuppressLint("SetJavaScriptEnabled")
     private fun setupWebView() {
         webView?.apply {
-            setLayerType(View.LAYER_TYPE_HARDWARE, null)
             setBackgroundColor(Color.TRANSPARENT)
-            clearCache(true)
+            setLayerType(View.LAYER_TYPE_HARDWARE, null)
             
-            settings.apply {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                cacheMode = WebSettings.LOAD_NO_CACHE
-            }
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            settings.allowFileAccess = false
+            settings.allowContentAccess = false
+            settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+
             webViewClient = object : WebViewClientCompat() {
-                override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? = 
-                    assetLoader.shouldInterceptRequest(request.url)
+                override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                    return assetLoader.shouldInterceptRequest(request.url)
+                }
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    super.onPageFinished(view, url)
+                    safeEvaluate("window.onNativeReady?.()")
+                }
             }
             webChromeClient = WebChromeClient()
             addJavascriptInterface(AndroidBridge(), "AndroidBridge")
-            loadUrl("https://ziseka-app.vercel.app/?v=" + System.currentTimeMillis())
+            loadUrl("https://appassets.androidplatform.net/assets/index.html")
         }
     }
 
-    private fun updateNativeBackgroundSafe(newBitmap: Bitmap?) {
-        val oldBitmap = displayedBitmap
-        displayedBitmap = newBitmap
-        nativeBackgroundView?.setImageBitmap(newBitmap)
-        nativeBackgroundView?.post {
-            if (oldBitmap != null && oldBitmap !== newBitmap && !oldBitmap.isRecycled) {
-                oldBitmap.recycle()
+    private fun startCamera() {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+        cameraProviderFuture.addListener({
+            val cameraProvider = cameraProviderFuture.get()
+            val preview = Preview.Builder()
+                .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                .build()
+                .also { it.setSurfaceProvider(viewFinder?.surfaceProvider) }
+
+            imageCapture = ImageCapture.Builder()
+                .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                .build()
+
+            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+            try {
+                cameraProvider.unbindAll()
+                cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageCapture)
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Camera binding failed", e)
             }
-        }
+        }, ContextCompat.getMainExecutor(this))
     }
 
     inner class AndroidBridge {
-        @JavascriptInterface fun takePhoto() { this@MainActivity.takePhoto() }
-        
-        @JavascriptInterface fun changeGuideMode(mode: String) {
+        @JavascriptInterface
+        fun takePhoto() {
+            // [수정사항 1] 안전하게 메인 스레드로 즉시 전환하여 PreviewView.bitmap 동기화 유도
+            runOnUiThread {
+                this@MainActivity.takePhoto()
+            }
+        }
+
+        @JavascriptInterface
+        fun changeGuideMode(mode: String) {
             runOnUiThread { nativeGuideView?.setMode(mode) }
         }
-        
-        @JavascriptInterface fun setCameraVisibility(isVisible: Boolean) {
+
+        @JavascriptInterface
+        fun setCameraVisibility(isVisible: Boolean) {
             runOnUiThread {
                 if (isVisible) {
                     viewFinder?.visibility = View.VISIBLE
@@ -166,67 +190,39 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        @JavascriptInterface fun clearResultBitmap() {
+        @JavascriptInterface
+        fun requestAnalysis(mode: String) {
             runOnUiThread {
-                viewFinder?.visibility = View.VISIBLE
-                nativeBackgroundView?.visibility = View.GONE
-                nativeGuideView?.visibility = View.GONE
-                updateNativeBackgroundSafe(null)
-                synchronized(bitmapLock) {
-                    lastCapturedBitmap?.recycle()
-                    lastCapturedBitmap = null
+                if (isHighResCaptureReady) {
+                    triggerAnalysis(mode)
+                } else {
+                    pendingAnalysisMode = mode
                 }
-                isProcessing = false
             }
         }
 
-        @JavascriptInterface fun analyzePlateWithMode(mode: String) {
-            triggerAnalysis(mode)
-        }
-
-        @JavascriptInterface fun saveFinalImage() {
-            analysisExecutor.execute {
-                try {
-                    val finalBitmapToSave = displayedBitmap?.copy(Bitmap.Config.ARGB_8888, true) 
-                        ?: throw IllegalStateException("저장할 비트맵이 없습니다.")
-                        
-                    saveBitmapToGallery(finalBitmapToSave)
+        @JavascriptInterface
+        fun saveFinalImage() {
+            runOnUiThread {
+                val bitmapToSave = displayedBitmap
+                if (bitmapToSave != null) {
+                    saveBitmapToGallery(bitmapToSave)
                     safeEvaluate("window.onNativeSaveComplete()")
-                } catch (e: Exception) {
-                    safeEvaluate("window.onNativeError('저장 실패')")
+                } else {
+                    Toast.makeText(this@MainActivity, "저장할 이미지가 없습니다.", Toast.LENGTH_SHORT).show()
+                    safeEvaluate("window.onNativeSaveComplete()")
                 }
             }
         }
-        @JavascriptInterface fun showToast(msg: String) { 
-            runOnUiThread { Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show() } 
+
+        @JavascriptInterface
+        fun clearResultBitmap() {
+            runOnUiThread {
+                nativeBackgroundView?.setImageBitmap(null)
+                displayedBitmap?.recycle()
+                displayedBitmap = null
+            }
         }
-    }
-
-    private fun startCamera() {
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-        cameraProviderFuture.addListener({
-            val cameraProvider = cameraProviderFuture.get()
-            viewFinder?.implementationMode = PreviewView.ImplementationMode.COMPATIBLE
-
-            val preview = Preview.Builder().setTargetAspectRatio(AspectRatio.RATIO_16_9).build()
-                .also { it.setSurfaceProvider(viewFinder?.surfaceProvider) }
-
-            imageCapture = ImageCapture.Builder()
-                .setTargetAspectRatio(AspectRatio.RATIO_16_9)
-                .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-                .build()
-
-            try {
-                cameraProvider.unbindAll()
-                val viewPort = viewFinder?.viewPort ?: return@addListener
-                val useCaseGroup = androidx.camera.core.UseCaseGroup.Builder()
-                    .setViewPort(viewPort)
-                    .addUseCase(preview)
-                    .addUseCase(imageCapture!!)
-                    .build()
-                cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, useCaseGroup)
-            } catch (e: Exception) { }
-        }, ContextCompat.getMainExecutor(this))
     }
 
     private fun takePhoto() {
@@ -234,22 +230,20 @@ class MainActivity : AppCompatActivity() {
         isProcessing = true
         isHighResCaptureReady = false
         pendingAnalysisMode = null
-        
+
         val currentCapture = imageCapture ?: run {
             isProcessing = false
             safeEvaluate("window.onNativeError('카메라가 초기화되지 않았습니다.')")
             return
         }
-        
-        // 프리뷰 캡처로 화면 즉시 정지
+
+        // UI 스레드 보장 하에 안전하게 렌더링 스냅샷 생성
         val freezeBitmap = viewFinder?.bitmap
         if (freezeBitmap != null) {
-            runOnUiThread {
-                updateNativeBackgroundSafe(freezeBitmap)
-                nativeBackgroundView?.visibility = View.VISIBLE
-                nativeGuideView?.visibility = View.VISIBLE
-                safeEvaluate("window.onNativeScreenFrozen()")
-            }
+            updateNativeBackgroundSafe(freezeBitmap)
+            nativeBackgroundView?.visibility = View.VISIBLE
+            nativeGuideView?.visibility = View.VISIBLE
+            safeEvaluate("window.onNativeScreenFrozen()")
         }
 
         currentCapture.takePicture(
@@ -264,35 +258,38 @@ class MainActivity : AppCompatActivity() {
                             bufferWidth = imageProxy.width,
                             bufferHeight = imageProxy.height
                         )
-                        imageProxy.close()
 
-                        synchronized(bitmapLock) { 
+                        synchronized(bitmapLock) {
                             if (lastCapturedBitmap !== uprightBitmap && lastCapturedBitmap?.isRecycled == false) {
                                 lastCapturedBitmap?.recycle()
                             }
-                            lastCapturedBitmap = uprightBitmap 
+                            lastCapturedBitmap = uprightBitmap
                         }
                         synchronized(transformLock) { lastTransformData = transformData }
 
-                        isHighResCaptureReady = true 
+                        isHighResCaptureReady = true
 
-                        runOnUiThread { 
+                        runOnUiThread {
                             pendingAnalysisMode?.let { mode ->
                                 pendingAnalysisMode = null
                                 triggerAnalysis(mode)
                             }
                             safeEvaluate("window.onNativePhotoCaptured()")
                         }
-                    } catch (e: Exception) {
-                        imageProxy.close()
-                        runOnUiThread { 
+                    } catch (t: Throwable) {
+                        // [수정사항 2] Exception 상위인 Throwable(OOM 포함)까지 캐치 처리 보강
+                        runOnUiThread {
                             isProcessing = false
                             safeEvaluate("window.onNativeError('이미지 처리 중 오류가 발생했습니다.')")
                         }
+                    } finally {
+                        // [수정사항 2] 예외 발생 여부와 관계없이 무조건 호출되어 파이프라인 정체를 막음
+                        imageProxy.close()
                     }
                 }
+
                 override fun onError(exception: ImageCaptureException) {
-                    runOnUiThread { 
+                    runOnUiThread {
                         isProcessing = false
                         safeEvaluate("window.onNativeError('카메라 캡처에 실패했습니다.')")
                     }
@@ -302,159 +299,168 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun triggerAnalysis(mode: String) {
-        if (!isHighResCaptureReady) {
-            pendingAnalysisMode = mode
-            runOnUiThread { safeEvaluate("showToast('고해상도 원본을 처리 중입니다. 잠시만 대기해주세요 ✨')") }
+        val targetBitmap = synchronized(bitmapLock) { lastCapturedBitmap }
+        val transformData = synchronized(transformLock) { lastTransformData }
+        val guideView = nativeGuideView
+
+        if (targetBitmap == null || transformData == null || guideView == null) {
+            isProcessing = false
+            safeEvaluate("window.onNativeError('분석 준비가 되지 않았습니다.')")
             return
         }
 
+        val uiCorners = guideView.getCorners()
         analysisExecutor.execute {
-            if (isDestroyed || isFinishing) return@execute
-            var processingBitmap: Bitmap? = null
-            var roiBitmap: Bitmap? = null
-            
             try {
-                processingBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) } 
-                    ?: throw IllegalStateException("캡처된 원본 비트맵이 없습니다.")
-                val transformData = synchronized(transformLock) { lastTransformData } 
-                    ?: throw IllegalStateException("메타데이터 누락")
-
-                val view = viewFinder ?: throw IllegalStateException("ViewFinder가 초기화되지 않았습니다.")
-                val uiCorners = nativeGuideView?.getCorners() ?: throw IllegalStateException("가이드 박스 좌표가 없습니다.")
-           
-                val exactBitmapPoints = CameraCoordinateConverter.mapUiToExactBitmap(
-                    previewView = view, transformData = transformData, uiPoints = uiCorners,
-                    uprightBitmapWidth = processingBitmap.width, uprightBitmapHeight = processingBitmap.height
+                val exactCorners = CameraCoordinateConverter.mapUiToExactBitmap(
+                    viewFinder!!, transformData, uiCorners, targetBitmap.width, targetBitmap.height
                 )
 
-                // 1. ROI 좌표 크롭 영역 계산
-                val minX = exactBitmapPoints.minOf { it.x }.toInt().coerceAtLeast(0)
-                val minY = exactBitmapPoints.minOf { it.y }.toInt().coerceAtLeast(0)
-                val maxX = exactBitmapPoints.maxOf { it.x }.toInt().coerceAtMost(processingBitmap.width)
-                val maxY = exactBitmapPoints.maxOf { it.y }.toInt().coerceAtMost(processingBitmap.height)
-                val roiWidth = maxX - minX
-                val roiHeight = maxY - minY
+                val resultMat = Mat()
+                Utils.bitmapToMat(targetBitmap, resultMat)
 
-                if (roiWidth <= 0 || roiHeight <= 0) throw IllegalStateException("유효하지 않은 가이드 박스 영역입니다.")
+                val workingMat = resultMat.copy(CvType.CV_8UC4, true)
+                val detectedCorners = PlateDetectionEngine.findPlateCorners(workingMat)
+                workingMat.release()
 
-                roiBitmap = Bitmap.createBitmap(processingBitmap, minX, minY, roiWidth, roiHeight)
+                val finalCorners = detectedCorners ?: exactCorners
+                applyMaskToMat(resultMat, finalCorners, mode)
 
-                // 2. 엔진 분석 실행
-                val localCorners = PlateDetectionEngine.findPlateCorners(roiBitmap)
+                val resultBitmap = Bitmap.createBitmap(resultMat.cols(), resultMat.rows(), Bitmap.Config.ARGB_8888)
+                Utils.matToBitmap(resultMat, resultBitmap)
+                resultMat.release()
 
-                if (localCorners != null) {
-                    // 로컬 좌표 -> 전체 픽셀 좌표 역산 변환
-                    val globalCorners = localCorners.map { PointF(it.x + minX, it.y + minY) }
-                    
-                    // 가림막 합성
-                    val resultBitmap = applyPrivacyMask(processingBitmap, globalCorners)
-                    
-                    runOnUiThread {
-                        updateNativeBackgroundSafe(resultBitmap)
-                        nativeGuideView?.visibility = View.GONE
-                        safeEvaluate("window.onNativeSuccess()")
-                    }
-                } else {
-                    runOnUiThread { safeEvaluate("window.onNativeError('번호판을 찾지 못했습니다. 가이드 박스를 번호판 크기에 맞게 조절해주세요.')") }
+                val tempFile = File(previewDir, "temp_result.jpg")
+                tempFile.outputStream().use { out ->
+                    resultBitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
                 }
 
-            } catch (e: Exception) { 
-                Log.e("CAMERA_DEBUG", "분석 실패", e)
-                safeEvaluate("window.onNativeError('분석 중 오류가 발생했습니다.')")
-            } finally {
-                processingBitmap?.recycle()
-                roiBitmap?.recycle()
-                isProcessing = false 
+                runOnUiThread {
+                    displayedBitmap?.recycle()
+                    displayedBitmap = resultBitmap
+
+                    nativeBackgroundView?.visibility = View.VISIBLE
+                    nativeBackgroundView?.setImageBitmap(resultBitmap)
+                    nativeGuideView?.visibility = View.GONE
+
+                    val urlParam = "https://appassets.androidplatform.net/assets/preview_images/temp_result.jpg"
+                    safeEvaluate("window.onNativeAnalysisComplete('$urlParam')")
+                    isProcessing = false
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    isProcessing = false
+                    safeEvaluate("window.onNativeError('분석 과정 중 예외가 발생했습니다.')")
+                }
             }
         }
     }
 
-    // OpenCV 기반 가림막 합성 방어 코드 (OOM 방지 완벽 해제)
-    private fun applyPrivacyMask(source: Bitmap, targetCorners: List<PointF>): Bitmap {
-        val result = source.copy(Bitmap.Config.ARGB_8888, true)
-        val mat = Mat()
-        val maskMat = Mat()
-        val warpedMask = Mat()
-        val alphaMask = Mat()
-        val inv = Mat()
-        val final = Mat()
-        val warpedChannels32F = mutableListOf<Mat>()
-        val targetChannels = mutableListOf<Mat>()
-        val warpedChannels = mutableListOf<Mat>()
-        var srcPts: MatOfPoint2f? = null
-        var dstPts: MatOfPoint2f? = null
-        var transform: Mat? = null
+    private fun applyMaskToMat(mat: Mat, corners: List<PointF>, mode: String) {
+        if (corners.size != 4) return
+        val pts = corners.map { Point(it.x.toDouble(), it.y.toDouble()) }
 
-        try {
-            Utils.bitmapToMat(result, mat)
-            val maskBmp = Bitmap.createBitmap(600, 150, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.LTGRAY) }
-            Utils.bitmapToMat(maskBmp, maskMat)
-            maskBmp.recycle()
-
-            srcPts = MatOfPoint2f(
-                org.opencv.core.Point(0.0, 0.0),
-                org.opencv.core.Point(maskMat.cols().toDouble(), 0.0),
-                org.opencv.core.Point(maskMat.cols().toDouble(), maskMat.rows().toDouble()),
-                org.opencv.core.Point(0.0, maskMat.rows().toDouble())
-            )
-            
-            // 좌표 정렬 보정
-            val sortedByX = targetCorners.sortedBy { it.x }
-            val left = sortedByX.take(2).sortedBy { it.y }
-            val right = sortedByX.takeLast(2).sortedBy { it.y }
-            val orderedCorners = listOf(left[0], right[0], right[1], left[1])
-            
-            dstPts = MatOfPoint2f(*orderedCorners.map { org.opencv.core.Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
-
-            transform = Imgproc.getPerspectiveTransform(srcPts, dstPts)
-            Imgproc.warpPerspective(maskMat, warpedMask, transform, mat.size(), Imgproc.INTER_LINEAR)
-
-            Core.split(warpedMask, warpedChannels)
-            if (warpedChannels.size >= 4) {
-                warpedChannels[3].copyTo(alphaMask)
-                Imgproc.threshold(alphaMask, alphaMask, 1.0, 255.0, Imgproc.THRESH_BINARY)
-                Core.bitwise_not(alphaMask, inv)
-
-                warpedMask.convertTo(warpedMask, CvType.CV_32FC4)
-                mat.convertTo(mat, CvType.CV_32FC4)
-                alphaMask.convertTo(alphaMask, CvType.CV_32FC1, 1.0 / 255.0)
-                inv.convertTo(inv, CvType.CV_32FC1, 1.0 / 255.0)
-
-                Core.split(warpedMask, warpedChannels32F)
-                Core.split(mat, targetChannels)
-
-                for (i in 0 until 3) {
-                    Core.multiply(warpedChannels32F[i], alphaMask, warpedChannels32F[i])
-                    Core.multiply(targetChannels[i], inv, targetChannels[i])
-                    Core.add(warpedChannels32F[i], targetChannels[i], warpedChannels32F[i])
-                }
-                if (warpedChannels32F.size > 3 && targetChannels.size > 3) targetChannels[3].copyTo(warpedChannels32F[3])
-
-                Core.merge(warpedChannels32F, final)
-                final.convertTo(final, CvType.CV_8UC4)
-                Utils.matToBitmap(final, result)
-            }
-        } catch (e: Exception) {
-            Log.e("CAMERA_DEBUG", "Warp 가림막 합성 실패", e)
-        } finally {
-            mat.release(); maskMat.release(); warpedMask.release(); alphaMask.release()
-            inv.release(); final.release()
-            warpedChannels.forEach { it.release() }
-            warpedChannels32F.forEach { it.release() }
-            targetChannels.forEach { it.release() }
-            srcPts?.release(); dstPts?.release(); transform?.release()
+        val maskColor = when (mode) {
+            "WAX" -> Scalar(0.0, 255.0, 0.0, 255.0)
+            "GLOSS" -> Scalar(0.0, 0.0, 255.0, 255.0)
+            "CONTAM" -> Scalar(255.0, 0.0, 0.0, 255.0)
+            else -> Scalar(0.0, 255.0, 0.0, 255.0)
         }
-        return result
+
+        val srcPoints = MatOfPoint2f(*pts.toTypedArray())
+        val minX = pts.minOf { it.x }; val maxX = pts.maxOf { it.x }
+        val minY = pts.minOf { it.y }; val maxY = pts.maxOf { it.y }
+        val w = maxX - minX; val h = maxY - minY
+
+        val targetRatio = 3.0 / 1.0
+        var newW = w; var newH = h
+        if (w / h > targetRatio) { newH = w / targetRatio } else { newW = h * targetRatio }
+
+        val center = Point((minX + maxX) / 2.0, (minY + maxY) / 2.0)
+        val dstPoints = MatOfPoint2f(
+            Point(center.x - newW / 2.0, center.y - newH / 2.0),
+            Point(center.x + newW / 2.0, center.y - newH / 2.0),
+            Point(center.x + newW / 2.0, center.y + newH / 2.0),
+            Point(center.x - newW / 2.0, center.y + newH / 2.0)
+        )
+
+        val transformMatrix = Imgproc.getPerspectiveTransform(srcPoints, dstPoints)
+        val transformedMat = Mat()
+        Imgproc.warpPerspective(mat, transformedMat, transformMatrix, Size(mat.cols().toDouble(), mat.rows().toDouble()))
+
+        val maskMat = Mat.zeros(mat.size(), CvType.CV_8UC1)
+        val contour = org.opencv.core.MatOfPoint(*dstPoints.toArray().map { Point(it.x, it.y) }.toTypedArray())
+        Imgproc.fillPoly(maskMat, listOf(contour), Scalar(255.0))
+
+        val blurredMask = Mat()
+        Imgproc.GaussianBlur(maskMat, blurredMask, Size(15.0, 15.0), 5.0)
+
+        val coloredMask = Mat(mat.size(), mat.type(), maskColor)
+        val alphaMat = Mat()
+        blurredMask.convertTo(alphaMat, CvType.CV_32F, 1.0 / 255.0)
+
+        val matChannels = ArrayList<Mat>()
+        val coloredChannels = ArrayList<Mat>()
+        Core.split(mat, matChannels)
+        Core.split(coloredMask, coloredChannels)
+
+        for (i in 0 until 3) {
+            val mc = matChannels[i]
+            val cc = coloredChannels[i]
+            val mcF = Mat(); val ccF = Mat()
+            mc.convertTo(mcF, CvType.CV_32F)
+            cc.convertTo(ccF, CvType.CV_32F)
+
+            val blendedF = Mat()
+            Core.multiply(ccF, alphaMat, ccF)
+            val invAlpha = Mat()
+            Core.subtract(Scalar(1.0), alphaMat, invAlpha)
+            Core.multiply(mcF, invAlpha, mcF)
+            Core.add(ccF, mcF, blendedF)
+
+            blendedF.convertTo(matChannels[i], CvType.CV_8U)
+            mcF.release(); ccF.release(); blendedF.release(); invAlpha.release()
+        }
+
+        Core.merge(matChannels, mat)
+
+        srcPoints.release(); dstPoints.release(); transformMatrix.release()
+        transformedMat.release(); maskMat.release(); contour.release()
+        blurredMask.release(); coloredMask.release(); alphaMat.release()
+        matChannels.forEach { it.release() }; coloredChannels.forEach { it.release() }
+    }
+
+    private fun updateNativeBackgroundSafe(bitmap: Bitmap) {
+        val copy = bitmap.copy(Bitmap.Config.ARGB_8888, false)
+        runOnUiThread {
+            nativeBackgroundView?.setImageBitmap(copy)
+        }
+    }
+
+    private fun safeEvaluate(script: String) {
+        webView?.post { webView?.evaluateJavascript(script, null) }
     }
 
     private fun saveBitmapToGallery(bitmap: Bitmap) {
+        val filename = "JiSeKa_${System.currentTimeMillis()}.jpg"
         val values = ContentValues().apply {
-            put(MediaStore.Images.Media.DISPLAY_NAME, "JiSeKa_${System.currentTimeMillis()}.jpg")
+            put(MediaStore.Images.Media.DISPLAY_NAME, filename)
             put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/JiSeKa")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/JiSeKa")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
         }
+
         val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return
         contentResolver.openOutputStream(uri)?.use { bitmap.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            values.clear()
+            values.put(MediaStore.Images.Media.IS_PENDING, 0)
+            contentResolver.update(uri, values, null, null)
+        }
+
         runOnUiThread { Toast.makeText(this, "💾 갤러리에 저장되었습니다.", Toast.LENGTH_SHORT).show() }
     }
 
@@ -465,15 +471,18 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all { ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED }
+    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
+        ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
+    }
 
     override fun onDestroy() {
         synchronized(bitmapLock) { lastCapturedBitmap?.recycle(); lastCapturedBitmap = null }
         nativeBackgroundView?.setImageBitmap(null)
         displayedBitmap?.recycle()
         displayedBitmap = null
-        
-        cameraExecutor.shutdownNow(); analysisExecutor.shutdownNow()
+
+        cameraExecutor.shutdownNow()
+        analysisExecutor.shutdownNow()
         previewDir.listFiles()?.forEach { it.delete() }
         webView?.apply { stopLoading(); clearHistory(); removeAllViews(); destroy() }
         webView = null
