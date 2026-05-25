@@ -167,7 +167,7 @@ class MainActivity : AppCompatActivity() {
     inner class AndroidBridge {
         @JavascriptInterface
         fun takePhoto() {
-            // [수정사항 1] 안전하게 메인 스레드로 즉시 전환하여 PreviewView.bitmap 동기화 유도
+            // 메인 스레드 전환을 통해 카메라 Surface 접근 데드락 방지
             runOnUiThread {
                 this@MainActivity.takePhoto()
             }
@@ -237,7 +237,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // UI 스레드 보장 하에 안전하게 렌더링 스냅샷 생성
         val freezeBitmap = viewFinder?.bitmap
         if (freezeBitmap != null) {
             updateNativeBackgroundSafe(freezeBitmap)
@@ -277,13 +276,12 @@ class MainActivity : AppCompatActivity() {
                             safeEvaluate("window.onNativePhotoCaptured()")
                         }
                     } catch (t: Throwable) {
-                        // [수정사항 2] Exception 상위인 Throwable(OOM 포함)까지 캐치 처리 보강
                         runOnUiThread {
                             isProcessing = false
                             safeEvaluate("window.onNativeError('이미지 처리 중 오류가 발생했습니다.')")
                         }
                     } finally {
-                        // [수정사항 2] 예외 발생 여부와 관계없이 무조건 호출되어 파이프라인 정체를 막음
+                        // 성공/실패 무관하게 버퍼를 확실히 닫아주어 타임아웃 방지
                         imageProxy.close()
                     }
                 }
@@ -316,14 +314,13 @@ class MainActivity : AppCompatActivity() {
                     viewFinder!!, transformData, uiCorners, targetBitmap.width, targetBitmap.height
                 )
 
+                // [수정] PlateDetectionEngine.findPlateCorners는 Bitmap 객체를 요구하므로 직접 전달합니다.
+                val detectedCorners = PlateDetectionEngine.findPlateCorners(targetBitmap)
+                val finalCorners = detectedCorners ?: exactCorners
+
                 val resultMat = Mat()
                 Utils.bitmapToMat(targetBitmap, resultMat)
-
-                val workingMat = resultMat.copy(CvType.CV_8UC4, true)
-                val detectedCorners = PlateDetectionEngine.findPlateCorners(workingMat)
-                workingMat.release()
-
-                val finalCorners = detectedCorners ?: exactCorners
+                
                 applyMaskToMat(resultMat, finalCorners, mode)
 
                 val resultBitmap = Bitmap.createBitmap(resultMat.cols(), resultMat.rows(), Bitmap.Config.ARGB_8888)
@@ -413,13 +410,18 @@ class MainActivity : AppCompatActivity() {
 
             val blendedF = Mat()
             Core.multiply(ccF, alphaMat, ccF)
+
             val invAlpha = Mat()
-            Core.subtract(Scalar(1.0), alphaMat, invAlpha)
+            // [수정] OpenCV Java 규격에 맞게 1.0 값으로 채워진 Mat 객체를 활용하여 빼기 연산을 안전하게 수행
+            val scalarMat = Mat(alphaMat.size(), alphaMat.type(), Scalar(1.0))
+            Core.subtract(scalarMat, alphaMat, invAlpha)
+
             Core.multiply(mcF, invAlpha, mcF)
             Core.add(ccF, mcF, blendedF)
 
             blendedF.convertTo(matChannels[i], CvType.CV_8U)
             mcF.release(); ccF.release(); blendedF.release(); invAlpha.release()
+            scalarMat.release() // 메모리 회수 철저
         }
 
         Core.merge(matChannels, mat)
@@ -442,26 +444,34 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun saveBitmapToGallery(bitmap: Bitmap) {
-        val filename = "JiSeKa_${System.currentTimeMillis()}.jpg"
-        val values = ContentValues().apply {
-            put(MediaStore.Images.Media.DISPLAY_NAME, filename)
-            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/JiSeKa")
-                put(MediaStore.Images.Media.IS_PENDING, 1)
+        try {
+            val filename = "JiSeKa_${System.currentTimeMillis()}.jpg"
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, filename)
+                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/JiSeKa")
+                    put(MediaStore.Images.Media.IS_PENDING, 1)
+                }
             }
+
+            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return
+            contentResolver.openOutputStream(uri)?.use { 
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 95, it) 
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                values.clear()
+                values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                contentResolver.update(uri, values, null, null)
+            }
+
+            runOnUiThread { Toast.makeText(this, "💾 갤러리에 저장되었습니다.", Toast.LENGTH_SHORT).show() }
+        } catch (e: Exception) {
+            // [수정] 구버전 안드로이드 기기에서 권한 문제 등으로 크래시 발생 방지
+            Log.e("MainActivity", "Failed to save image to gallery", e)
+            runOnUiThread { Toast.makeText(this, "이미지 저장에 실패했습니다. (저장소 권한 확인 필요)", Toast.LENGTH_SHORT).show() }
         }
-
-        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return
-        contentResolver.openOutputStream(uri)?.use { bitmap.compress(Bitmap.CompressFormat.JPEG, 95, it) }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            values.clear()
-            values.put(MediaStore.Images.Media.IS_PENDING, 0)
-            contentResolver.update(uri, values, null, null)
-        }
-
-        runOnUiThread { Toast.makeText(this, "💾 갤러리에 저장되었습니다.", Toast.LENGTH_SHORT).show() }
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
@@ -483,7 +493,7 @@ class MainActivity : AppCompatActivity() {
 
         cameraExecutor.shutdownNow()
         analysisExecutor.shutdownNow()
-        previewDir.listFiles()?.forEach { it.delete() }
+        try { previewDir.listFiles()?.forEach { it.delete() } } catch (e: Exception) { /* 무시 */ }
         webView?.apply { stopLoading(); clearHistory(); removeAllViews(); destroy() }
         webView = null
         super.onDestroy()
