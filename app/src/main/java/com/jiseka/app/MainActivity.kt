@@ -80,7 +80,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         if (!OpenCVLoader.initDebug()) {
-            Log.e("MainActivity", "OpenCV initialization failed.")
+            Log.e("CAMERA_DEBUG", "OpenCV initialization failed.")
         }
 
         viewFinder = findViewById(R.id.viewFinder)
@@ -90,10 +90,13 @@ class MainActivity : AppCompatActivity() {
 
         cameraExecutor = Executors.newSingleThreadExecutor()
         analysisExecutor = Executors.newSingleThreadExecutor()
+        
         previewDir = File(cacheDir, "preview_images").apply { if (!exists()) mkdirs() }
 
+        // [핵심 변경사항] 내부 저장소 캐시 디렉터리를 라우팅할 수 있도록 InternalStoragePathHandler 핸들러 결합
         assetLoader = WebViewAssetLoader.Builder()
             .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(this))
+            .addPathHandler("/preview_images/", WebViewAssetLoader.InternalStoragePathHandler(this, previewDir))
             .build()
 
         setupWebView()
@@ -159,7 +162,7 @@ class MainActivity : AppCompatActivity() {
                 cameraProvider.unbindAll()
                 cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageCapture)
             } catch (e: Exception) {
-                Log.e("MainActivity", "Camera binding failed", e)
+                Log.e("CAMERA_DEBUG", "Camera binding failed", e)
             }
         }, ContextCompat.getMainExecutor(this))
     }
@@ -167,7 +170,7 @@ class MainActivity : AppCompatActivity() {
     inner class AndroidBridge {
         @JavascriptInterface
         fun takePhoto() {
-            // 메인 스레드 전환을 통해 카메라 Surface 접근 데드락 방지
+            // 자바 브릿지 스레드에서 즉시 메인 UI 스레드로 안전 전환 유도
             runOnUiThread {
                 this@MainActivity.takePhoto()
             }
@@ -238,6 +241,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         val freezeBitmap = viewFinder?.bitmap
+        Log.d("CAMERA_DEBUG", "takePhoto() 시작 - freezeBitmap 존재 여부: ${freezeBitmap != null}, 크기: ${freezeBitmap?.width}x${freezeBitmap?.height}")
+        
         if (freezeBitmap != null) {
             updateNativeBackgroundSafe(freezeBitmap)
             nativeBackgroundView?.visibility = View.VISIBLE
@@ -250,6 +255,7 @@ class MainActivity : AppCompatActivity() {
             object : ImageCapture.OnImageCapturedCallback() {
                 override fun onCaptureSuccess(imageProxy: ImageProxy) {
                     try {
+                        Log.d("CAMERA_DEBUG", "onCaptureSuccess 수신됨. 폭: ${imageProxy.width}, 높이: ${imageProxy.height}")
                         val uprightBitmap = imageProxy.toUprightBitmap()
                         val transformData = CaptureTransformData(
                             sensorToBufferMatrix = imageProxy.imageInfo.sensorToBufferTransformMatrix,
@@ -267,6 +273,7 @@ class MainActivity : AppCompatActivity() {
                         synchronized(transformLock) { lastTransformData = transformData }
 
                         isHighResCaptureReady = true
+                        Log.d("CAMERA_DEBUG", "고해상도 비트맵 전환 완료 및 보관 성공")
 
                         runOnUiThread {
                             pendingAnalysisMode?.let { mode ->
@@ -276,17 +283,18 @@ class MainActivity : AppCompatActivity() {
                             safeEvaluate("window.onNativePhotoCaptured()")
                         }
                     } catch (t: Throwable) {
+                        Log.e("CAMERA_DEBUG", "onCaptureSuccess 내부 비트맵 파싱 예외 발생", t)
                         runOnUiThread {
                             isProcessing = false
                             safeEvaluate("window.onNativeError('이미지 처리 중 오류가 발생했습니다.')")
                         }
                     } finally {
-                        // 성공/실패 무관하게 버퍼를 확실히 닫아주어 타임아웃 방지
                         imageProxy.close()
                     }
                 }
 
                 override fun onError(exception: ImageCaptureException) {
+                    Log.e("CAMERA_DEBUG", "CameraX 하드웨어 캡처 실패 에러코드: ${exception.imageCaptureError}", exception)
                     runOnUiThread {
                         isProcessing = false
                         safeEvaluate("window.onNativeError('카메라 캡처에 실패했습니다.')")
@@ -301,6 +309,7 @@ class MainActivity : AppCompatActivity() {
         val transformData = synchronized(transformLock) { lastTransformData }
         val guideView = nativeGuideView
 
+        Log.d("CAMERA_DEBUG", "triggerAnalysis 시작 - targetBitmap 유효 상태: ${targetBitmap != null}")
         if (targetBitmap == null || transformData == null || guideView == null) {
             isProcessing = false
             safeEvaluate("window.onNativeError('분석 준비가 되지 않았습니다.')")
@@ -314,9 +323,10 @@ class MainActivity : AppCompatActivity() {
                     viewFinder!!, transformData, uiCorners, targetBitmap.width, targetBitmap.height
                 )
 
-                // [수정] PlateDetectionEngine.findPlateCorners는 Bitmap 객체를 요구하므로 직접 전달합니다.
+                // 엔진 파라미터 요구 명세에 맞추어 직접 고해상도 비트맵 개체 가이드 매핑 처리
                 val detectedCorners = PlateDetectionEngine.findPlateCorners(targetBitmap)
                 val finalCorners = detectedCorners ?: exactCorners
+                Log.d("CAMERA_DEBUG", "번호판 검출 시도 완료 - 자동검출 여부: ${detectedCorners != null}")
 
                 val resultMat = Mat()
                 Utils.bitmapToMat(targetBitmap, resultMat)
@@ -327,10 +337,12 @@ class MainActivity : AppCompatActivity() {
                 Utils.matToBitmap(resultMat, resultBitmap)
                 resultMat.release()
 
+                // 내부 물리 디스크 파일 라이팅 검사 강화
                 val tempFile = File(previewDir, "temp_result.jpg")
                 tempFile.outputStream().use { out ->
                     resultBitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
                 }
+                Log.d("CAMERA_DEBUG", "물리 디스크 임시 파일 캐싱 완료. 파일 크기: ${tempFile.length()} bytes")
 
                 runOnUiThread {
                     displayedBitmap?.recycle()
@@ -340,11 +352,13 @@ class MainActivity : AppCompatActivity() {
                     nativeBackgroundView?.setImageBitmap(resultBitmap)
                     nativeGuideView?.visibility = View.GONE
 
-                    val urlParam = "https://appassets.androidplatform.net/assets/preview_images/temp_result.jpg"
+                    // [수정사항] 라우팅이 분리된 새 도메인 물리 리소스 엔드포인트 파라미터 규격 적용
+                    val urlParam = "https://appassets.androidplatform.net/preview_images/temp_result.jpg"
                     safeEvaluate("window.onNativeAnalysisComplete('$urlParam')")
                     isProcessing = false
                 }
             } catch (e: Exception) {
+                Log.e("CAMERA_DEBUG", "OpenCV 또는 디스크 I/O 처리 단계 중 런타임 오류", e)
                 runOnUiThread {
                     isProcessing = false
                     safeEvaluate("window.onNativeError('분석 과정 중 예외가 발생했습니다.')")
@@ -412,7 +426,6 @@ class MainActivity : AppCompatActivity() {
             Core.multiply(ccF, alphaMat, ccF)
 
             val invAlpha = Mat()
-            // [수정] OpenCV Java 규격에 맞게 1.0 값으로 채워진 Mat 객체를 활용하여 빼기 연산을 안전하게 수행
             val scalarMat = Mat(alphaMat.size(), alphaMat.type(), Scalar(1.0))
             Core.subtract(scalarMat, alphaMat, invAlpha)
 
@@ -421,7 +434,7 @@ class MainActivity : AppCompatActivity() {
 
             blendedF.convertTo(matChannels[i], CvType.CV_8U)
             mcF.release(); ccF.release(); blendedF.release(); invAlpha.release()
-            scalarMat.release() // 메모리 회수 철저
+            scalarMat.release()
         }
 
         Core.merge(matChannels, mat)
@@ -468,8 +481,7 @@ class MainActivity : AppCompatActivity() {
 
             runOnUiThread { Toast.makeText(this, "💾 갤러리에 저장되었습니다.", Toast.LENGTH_SHORT).show() }
         } catch (e: Exception) {
-            // [수정] 구버전 안드로이드 기기에서 권한 문제 등으로 크래시 발생 방지
-            Log.e("MainActivity", "Failed to save image to gallery", e)
+            Log.e("CAMERA_DEBUG", "Failed to save image to gallery", e)
             runOnUiThread { Toast.makeText(this, "이미지 저장에 실패했습니다. (저장소 권한 확인 필요)", Toast.LENGTH_SHORT).show() }
         }
     }
