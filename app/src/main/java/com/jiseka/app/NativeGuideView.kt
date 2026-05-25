@@ -64,18 +64,19 @@ class NativeGuideView @JvmOverloads constructor(
         val h = height.toFloat()
         currentCorners.clear()
         
+        // 원근 왜곡 및 OCR 안정성을 고려한 최적의 상하footprint(약 16% 폭) 반영
         when (mode) {
             "FRONT" -> currentCorners.addAll(listOf(
-                PointF(w * 0.1f, h * 0.3f), PointF(w * 0.9f, h * 0.3f),
-                PointF(w * 0.9f, h * 0.7f), PointF(w * 0.1f, h * 0.7f)
+                PointF(w * 0.15f, h * 0.42f), PointF(w * 0.85f, h * 0.42f),
+                PointF(w * 0.85f, h * 0.58f), PointF(w * 0.15f, h * 0.58f)
             ))
             "PASSENGER" -> currentCorners.addAll(listOf(
-                PointF(w * 0.2f, h * 0.4f), PointF(w * 0.8f, h * 0.2f),
-                PointF(w * 0.8f, h * 0.8f), PointF(w * 0.2f, h * 0.9f)
+                PointF(w * 0.15f, h * 0.44f), PointF(w * 0.85f, h * 0.40f),
+                PointF(w * 0.85f, h * 0.56f), PointF(w * 0.15f, h * 0.60f)
             ))
             "DRIVER" -> currentCorners.addAll(listOf(
-                PointF(w * 0.2f, h * 0.2f), PointF(w * 0.8f, h * 0.4f),
-                PointF(w * 0.8f, h * 0.9f), PointF(w * 0.2f, h * 0.8f)
+                PointF(w * 0.15f, h * 0.40f), PointF(w * 0.85f, h * 0.44f),
+                PointF(w * 0.85f, h * 0.60f), PointF(w * 0.15f, h * 0.56f)
             ))
         }
         invalidate()
@@ -119,11 +120,23 @@ class NativeGuideView @JvmOverloads constructor(
 
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
-                isDragging = true
-                isMoved = false
-                lastTouchX = x
-                lastTouchY = y
-                return true
+                // 가이드 박스의 사다리꼴을 감싸는 최소/최대 경계면 계산 (+60px 터치 마진 확보)
+                val minX = currentCorners.minOf { it.x } - 60f
+                val maxX = currentCorners.maxOf { it.x } + 60f
+                val minY = currentCorners.minOf { it.y } - 60f
+                val maxY = currentCorners.maxOf { it.y } + 60f
+
+                // 가이드 영역 내부를 누른 경우에만 터치 이벤트를 소모하여 가로챔
+                if (x in minX..maxX && y in minY..maxY) {
+                    isDragging = true
+                    isMoved = false
+                    lastTouchX = x
+                    lastTouchY = y
+                    return true
+                }
+                
+                // 가이드 영역 밖을 누르면 false를 리턴하여 WebView UI 버튼들로 클릭을 패스함
+                return false
             }
             MotionEvent.ACTION_MOVE -> {
                 if (isDragging) {
@@ -137,10 +150,11 @@ class NativeGuideView @JvmOverloads constructor(
                     val maxY = currentCorners.maxOf { it.y }
                     
                     val allowedDx = if (dx > 0) minOf(dx, width.toFloat() - maxX) else maxOf(dx, -minX)
+                    val allowedDxCorrected = allowedDx
                     val allowedDy = if (dy > 0) minOf(dy, height.toFloat() - maxY) else maxOf(dy, -minY)
 
                     for (point in currentCorners) {
-                        point.x += allowedDx
+                        point.x += allowedDxCorrected
                         point.y += allowedDy
                     }
 
@@ -156,6 +170,7 @@ class NativeGuideView @JvmOverloads constructor(
                     if (isMoved) {
                         onGuideDropListener?.invoke(currentMode)
                     }
+                    return true
                 }
             }
         }
