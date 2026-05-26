@@ -34,7 +34,6 @@ import org.opencv.android.Utils
 import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
-import org.opencv.core.MatOfPoint2f
 import org.opencv.core.Point
 import org.opencv.core.Scalar
 import org.opencv.core.Size
@@ -62,8 +61,6 @@ class MainActivity : AppCompatActivity() {
 
     private var imageCapture: ImageCapture? = null
     private lateinit var cameraExecutor: ExecutorService
-    
-    // [위험 6 해결] 작업 누적 방지: 대기열 1개, 꽉 차면 가장 오래된 작업 버림
     private lateinit var analysisExecutor: ThreadPoolExecutor
 
     private val bitmapLock = Any()
@@ -95,7 +92,6 @@ class MainActivity : AppCompatActivity() {
         btnModeDriver = findViewById(R.id.btnModeDriver)
 
         cameraExecutor = Executors.newSingleThreadExecutor()
-        
         analysisExecutor = ThreadPoolExecutor(
             1, 1, 0L, TimeUnit.MILLISECONDS,
             ArrayBlockingQueue(1), ThreadPoolExecutor.DiscardOldestPolicy()
@@ -124,7 +120,6 @@ class MainActivity : AppCompatActivity() {
                 ?: Toast.makeText(this, "저장할 이미지가 없습니다.", Toast.LENGTH_SHORT).show()
         }
 
-        // isProcessing 락 제거: 새 작업이 들어오면 ThreadPoolExecutor가 알아서 낡은 작업을 버림
         nativeGuideView?.onGuideDropListener = { mode ->
             triggerAnalysis(mode)
         }
@@ -155,7 +150,6 @@ class MainActivity : AppCompatActivity() {
     private fun resetToLiveMode() {
         btnCapture?.isEnabled = true
 
-        // [위험 3 방어] ImageView 참조 먼저 끊기
         nativeBackgroundView?.setImageDrawable(null)
         displayedBitmap?.recycle()
         displayedBitmap = null
@@ -218,7 +212,6 @@ class MainActivity : AppCompatActivity() {
                     try {
                         val rawBitmap = imageProxy.toUprightBitmap()
                         
-                        // [위험 5 방어] 고해상도 OOM 방지를 위한 Downsampling (Max 1920px)
                         val maxDim = 1920f
                         val scale = minOf(1f, maxDim / maxOf(rawBitmap.width, rawBitmap.height))
                         
@@ -228,7 +221,6 @@ class MainActivity : AppCompatActivity() {
 
                         val uprightBitmap = resizedBitmap.copy(Bitmap.Config.ARGB_8888, true)
                         
-                        // 메모리 누수 방지: 참조가 달라진 비트맵 확실히 제거
                         if (resizedBitmap !== rawBitmap) resizedBitmap.recycle()
                         if (rawBitmap !== uprightBitmap) rawBitmap.recycle() 
 
@@ -238,7 +230,6 @@ class MainActivity : AppCompatActivity() {
                         }
 
                         runOnUiThread {
-                            // [위험 2 방어] Activity 종료 여부 확인
                             if (isFinishing || isDestroyed) return@runOnUiThread
 
                             viewFinder?.visibility = View.GONE
@@ -247,9 +238,12 @@ class MainActivity : AppCompatActivity() {
                             
                             nativeGuideView?.visibility = View.VISIBLE
                             modeSelectionLayout?.visibility = View.VISIBLE
-                            resultActionLayout?.visibility = View.VISIBLE
                             
+                            // 요청 반영: 촬영 직후에는 다시 촬영/다운로드 버튼을 노출하지 않음
+                            resultActionLayout?.visibility = View.GONE
                             progressBar?.visibility = View.GONE
+                            
+                            // 🛠️ 자동 1회 분석 트리거 제거됨 (사용자가 드래그하기 전까지 원본 대기)
                         }
                     } catch (t: Throwable) {
                         runOnUiThread {
@@ -274,7 +268,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun triggerAnalysis(mode: String) {
-        // [위험 1 방어] Race Condition 방지를 위한 작업용 Deep Copy 확보
         val safeTargetBitmap = synchronized(bitmapLock) { 
             lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) 
         } ?: return
@@ -289,7 +282,10 @@ class MainActivity : AppCompatActivity() {
         }
 
         runOnUiThread {
-            if (!isFinishing && !isDestroyed) progressBar?.visibility = View.VISIBLE
+            if (!isFinishing && !isDestroyed) {
+                progressBar?.visibility = View.VISIBLE
+                resultActionLayout?.visibility = View.GONE 
+            }
         }
 
         val uiCorners = guideView.getCorners()
@@ -329,7 +325,6 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
-                // [위험 4 방어] OpenCV 변환 전 정렬 강제 적용
                 val orderedCorners = orderCorners(bmpCorners)
 
                 val resultMat = Mat()
@@ -347,13 +342,15 @@ class MainActivity : AppCompatActivity() {
                         return@runOnUiThread
                     }
 
-                    // [위험 3 방어] 안전한 교체 로직
                     nativeBackgroundView?.setImageDrawable(null)
                     displayedBitmap?.recycle()
                     displayedBitmap = resultBitmap
                     nativeBackgroundView?.setImageBitmap(resultBitmap)
                     
                     progressBar?.visibility = View.GONE
+                    
+                    // 요청 반영: 가림막 합성이 완벽히 끝난 시점에 버튼들 활성화
+                    resultActionLayout?.visibility = View.VISIBLE
                 }
             } catch (t: Throwable) {
                 Log.e("CAMERA_DEBUG", "Analysis Error", t)
@@ -361,9 +358,9 @@ class MainActivity : AppCompatActivity() {
                     if (isFinishing || isDestroyed) return@runOnUiThread
                     Toast.makeText(this@MainActivity, "가림막 처리 중 오류가 발생했습니다.", Toast.LENGTH_SHORT).show()
                     progressBar?.visibility = View.GONE
+                    resultActionLayout?.visibility = View.VISIBLE 
                 }
             } finally {
-                // 안전하게 분리된 복사본이므로 Background에서 안심하고 제거
                 safeTargetBitmap.recycle()
             }
         }
@@ -388,7 +385,6 @@ class MainActivity : AppCompatActivity() {
         return bmpPts.map { PointF(it.x * scale + dx, it.y * scale + dy) }
     }
 
-    // [위험 4 방어] 수학적 좌표 정렬 함수 (TL, TR, BR, BL 순서 보장)
     private fun orderCorners(corners: List<PointF>): List<PointF> {
         if (corners.size != 4) return corners
         val tl = corners.minByOrNull { it.x + it.y } ?: corners[0]
@@ -400,8 +396,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun applyMaskToMat(mat: Mat, corners: List<PointF>) {
         if (corners.size != 4) return
-        var srcPoints: MatOfPoint2f? = null; var dstPoints: MatOfPoint2f? = null
-        var transformMatrix: Mat? = null; var transformedMat: Mat? = null
         var maskMat: Mat? = null; var contour: org.opencv.core.MatOfPoint? = null
         var blurredMask: Mat? = null; var coloredMask: Mat? = null; var alphaMat: Mat? = null
         val matChannels = ArrayList<Mat>(); val coloredChannels = ArrayList<Mat>()
@@ -410,26 +404,9 @@ class MainActivity : AppCompatActivity() {
             val pts = corners.map { Point(it.x.toDouble(), it.y.toDouble()) }
             val maskColor = Scalar(0.0, 255.0, 0.0, 255.0) 
 
-            srcPoints = MatOfPoint2f(*pts.toTypedArray())
-            val minX = pts.minOf { it.x }; val maxX = pts.maxOf { it.x }
-            val minY = pts.minOf { it.y }; val maxY = pts.maxOf { it.y }
-            val w = maxX - minX; val h = maxY - minY
-            val targetRatio = 3.0 / 1.0
-            var newW = w; var newH = h
-            if (w / h > targetRatio) newH = w / targetRatio else newW = h * targetRatio
-
-            val center = Point((minX + maxX) / 2.0, (minY + maxY) / 2.0)
-            dstPoints = MatOfPoint2f(
-                Point(center.x - newW / 2.0, center.y - newH / 2.0), Point(center.x + newW / 2.0, center.y - newH / 2.0),
-                Point(center.x + newW / 2.0, center.y + newH / 2.0), Point(center.x - newW / 2.0, center.y + newH / 2.0)
-            )
-
-            transformMatrix = Imgproc.getPerspectiveTransform(srcPoints, dstPoints)
-            transformedMat = Mat()
-            Imgproc.warpPerspective(mat, transformedMat, transformMatrix, Size(mat.cols().toDouble(), mat.rows().toDouble()))
-
             maskMat = Mat.zeros(mat.size(), CvType.CV_8UC1)
-            contour = org.opencv.core.MatOfPoint(*dstPoints.toArray().map { Point(it.x, it.y) }.toTypedArray())
+            contour = org.opencv.core.MatOfPoint(*pts.toTypedArray())
+            
             Imgproc.fillPoly(maskMat, listOf(contour), Scalar(255.0))
 
             blurredMask = Mat()
@@ -464,8 +441,7 @@ class MainActivity : AppCompatActivity() {
             }
             Core.merge(matChannels, mat)
         } finally {
-            srcPoints?.release(); dstPoints?.release(); transformMatrix?.release()
-            transformedMat?.release(); maskMat?.release(); contour?.release()
+            maskMat?.release(); contour?.release()
             blurredMask?.release(); coloredMask?.release(); alphaMat?.release()
             matChannels.forEach { it.release() }; coloredChannels.forEach { it.release() }
         }
