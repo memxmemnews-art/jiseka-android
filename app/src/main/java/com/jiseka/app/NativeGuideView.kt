@@ -18,7 +18,6 @@ class NativeGuideView @JvmOverloads constructor(
 
     var onGuideDropListener: ((String) -> Unit)? = null
 
-    private var isInitialized = false
     var currentMode: String = "FRONT"
         private set
 
@@ -48,23 +47,32 @@ class NativeGuideView @JvmOverloads constructor(
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
-        if (!isInitialized && w > 0 && h > 0) {
-            isInitialized = true
-            setMode(currentMode)
-        } else if (isInitialized && (w != oldw || h != oldh) && w > 0 && h > 0) {
-            recalculateCornersOnResize(w, h, oldw, oldh)
+        if (w > 0 && h > 0) {
+            // 화면 회전 등으로 인해 사이즈가 변경될 때 기존 좌표 비율 유지
+            if (currentCorners.size == 4 && oldw > 0 && oldh > 0) {
+                recalculateCornersOnResize(w, h, oldw, oldh)
+            } else {
+                // 뷰가 처음 생성되었거나 GONE에서 VISIBLE로 돌아와 크기가 확정된 경우
+                applyModeGeometry()
+            }
         }
     }
 
     fun setMode(mode: String) {
         this.currentMode = mode
-        if (!isInitialized) return
+        applyModeGeometry()
+    }
 
+    // 뷰 크기가 준비되지 않았으면 안전하게 보류 (크래시 방지 및 라이프사이클 독립성 확보)
+    private fun applyModeGeometry() {
         val w = width.toFloat()
         val h = height.toFloat()
+
+        if (w <= 0f || h <= 0f) return
+
         currentCorners.clear()
         
-        when (mode) {
+        when (currentMode) {
             "FRONT" -> currentCorners.addAll(listOf(
                 PointF(w * 0.15f, h * 0.42f), PointF(w * 0.85f, h * 0.42f),
                 PointF(w * 0.85f, h * 0.58f), PointF(w * 0.15f, h * 0.58f)
@@ -94,7 +102,7 @@ class NativeGuideView @JvmOverloads constructor(
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        if (!isInitialized || currentCorners.size != 4) return
+        if (currentCorners.size != 4) return
 
         path.reset()
         path.moveTo(currentCorners[0].x, currentCorners[0].y)
@@ -112,7 +120,7 @@ class NativeGuideView @JvmOverloads constructor(
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        if (!isInitialized || currentCorners.isEmpty()) return false
+        if (currentCorners.isEmpty()) return false
 
         val x = event.x
         val y = event.y
@@ -132,8 +140,6 @@ class NativeGuideView @JvmOverloads constructor(
                     lastTouchY = y
                     return true
                 }
-                
-                // 영역 밖이면 false를 반환하여 하단의 Button UI 들이 터치 이벤트를 받게 함
                 return false
             }
             MotionEvent.ACTION_MOVE -> {
@@ -142,17 +148,10 @@ class NativeGuideView @JvmOverloads constructor(
                     val dx = x - lastTouchX
                     val dy = y - lastTouchY
 
-                    val minX = currentCorners.minOf { it.x }
-                    val maxX = currentCorners.maxOf { it.x }
-                    val minY = currentCorners.minOf { it.y }
-                    val maxY = currentCorners.maxOf { it.y }
-                    
-                    val allowedDx = if (dx > 0) minOf(dx, width.toFloat() - maxX) else maxOf(dx, -minX)
-                    val allowedDy = if (dy > 0) minOf(dy, height.toFloat() - maxY) else maxOf(dy, -minY)
-
+                    // UI 레벨에서는 화면 밖으로 넘어가도 부드럽게 드래그 되도록 제한 해제 (자유도 100%)
                     for (point in currentCorners) {
-                        point.x += allowedDx
-                        point.y += allowedDy
+                        point.x += dx
+                        point.y += dy
                     }
 
                     lastTouchX = x
@@ -176,5 +175,12 @@ class NativeGuideView @JvmOverloads constructor(
 
     fun getCorners(): List<PointF> {
         return currentCorners.toList()
+    }
+
+    fun setCorners(newCorners: List<PointF>) {
+        if (newCorners.size != 4) return
+        currentCorners.clear()
+        currentCorners.addAll(newCorners)
+        invalidate()
     }
 }
