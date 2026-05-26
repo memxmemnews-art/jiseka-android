@@ -64,7 +64,6 @@ class NativeGuideView @JvmOverloads constructor(
         val h = height.toFloat()
         currentCorners.clear()
         
-        // 원근 왜곡 및 OCR 안정성을 고려한 최적의 상하footprint(약 16% 폭) 반영
         when (mode) {
             "FRONT" -> currentCorners.addAll(listOf(
                 PointF(w * 0.15f, h * 0.42f), PointF(w * 0.85f, h * 0.42f),
@@ -120,13 +119,12 @@ class NativeGuideView @JvmOverloads constructor(
 
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
-                // 가이드 박스의 사다리꼴을 감싸는 최소/최대 경계면 계산 (+60px 터치 마진 확보)
+                // 터치 필터링 유지: 가이드 박스 영역(+60px 마진) 내부 터치시에만 이벤트를 가로챔
                 val minX = currentCorners.minOf { it.x } - 60f
                 val maxX = currentCorners.maxOf { it.x } + 60f
                 val minY = currentCorners.minOf { it.y } - 60f
                 val maxY = currentCorners.maxOf { it.y } + 60f
 
-                // 가이드 영역 내부를 누른 경우에만 터치 이벤트를 소모하여 가로챔
                 if (x in minX..maxX && y in minY..maxY) {
                     isDragging = true
                     isMoved = false
@@ -135,7 +133,7 @@ class NativeGuideView @JvmOverloads constructor(
                     return true
                 }
                 
-                // 가이드 영역 밖을 누르면 false를 리턴하여 WebView UI 버튼들로 클릭을 패스함
+                // 영역 밖이면 false를 반환하여 하단의 Button UI 들이 터치 이벤트를 받게 함
                 return false
             }
             MotionEvent.ACTION_MOVE -> {
@@ -150,11 +148,10 @@ class NativeGuideView @JvmOverloads constructor(
                     val maxY = currentCorners.maxOf { it.y }
                     
                     val allowedDx = if (dx > 0) minOf(dx, width.toFloat() - maxX) else maxOf(dx, -minX)
-                    val allowedDxCorrected = allowedDx
                     val allowedDy = if (dy > 0) minOf(dy, height.toFloat() - maxY) else maxOf(dy, -minY)
 
                     for (point in currentCorners) {
-                        point.x += allowedDxCorrected
+                        point.x += allowedDx
                         point.y += allowedDy
                     }
 
