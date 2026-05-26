@@ -69,8 +69,8 @@ class NativeGuideView @JvmOverloads constructor(
 
         currentCorners.clear()
         
-        // 가이드 박스 크기: 화면 너비의 30% 수준
-        val boxW = w * 0.3f 
+        // 🛠️ 가이드 박스 크기: 기존 30%에서 10% 증가시킨 33% 수준으로 변경
+        val boxW = w * 0.33f 
         val boxH = boxW / 4.7f // 실제 자동차 번호판 비율 적용
         val cx = w / 2f
         val cy = h / 2f
