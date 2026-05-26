@@ -48,11 +48,9 @@ class NativeGuideView @JvmOverloads constructor(
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
         if (w > 0 && h > 0) {
-            // 화면 회전 등으로 인해 사이즈가 변경될 때 기존 좌표 비율 유지
             if (currentCorners.size == 4 && oldw > 0 && oldh > 0) {
                 recalculateCornersOnResize(w, h, oldw, oldh)
             } else {
-                // 뷰가 처음 생성되었거나 GONE에서 VISIBLE로 돌아와 크기가 확정된 경우
                 applyModeGeometry()
             }
         }
@@ -63,7 +61,6 @@ class NativeGuideView @JvmOverloads constructor(
         applyModeGeometry()
     }
 
-    // 뷰 크기가 준비되지 않았으면 안전하게 보류 (크래시 방지 및 라이프사이클 독립성 확보)
     private fun applyModeGeometry() {
         val w = width.toFloat()
         val h = height.toFloat()
@@ -72,18 +69,24 @@ class NativeGuideView @JvmOverloads constructor(
 
         currentCorners.clear()
         
+        // 가이드 박스 크기: 화면 너비의 30% 수준
+        val boxW = w * 0.3f 
+        val boxH = boxW / 4.7f // 실제 자동차 번호판 비율 적용
+        val cx = w / 2f
+        val cy = h / 2f
+        
         when (currentMode) {
             "FRONT" -> currentCorners.addAll(listOf(
-                PointF(w * 0.15f, h * 0.42f), PointF(w * 0.85f, h * 0.42f),
-                PointF(w * 0.85f, h * 0.58f), PointF(w * 0.15f, h * 0.58f)
+                PointF(cx - boxW/2, cy - boxH/2), PointF(cx + boxW/2, cy - boxH/2),
+                PointF(cx + boxW/2, cy + boxH/2), PointF(cx - boxW/2, cy + boxH/2)
             ))
             "PASSENGER" -> currentCorners.addAll(listOf(
-                PointF(w * 0.15f, h * 0.44f), PointF(w * 0.85f, h * 0.40f),
-                PointF(w * 0.85f, h * 0.56f), PointF(w * 0.15f, h * 0.60f)
+                PointF(cx - boxW/2, cy - boxH/2 * 0.7f), PointF(cx + boxW/2, cy - boxH/2 * 1.3f),
+                PointF(cx + boxW/2, cy + boxH/2 * 1.3f), PointF(cx - boxW/2, cy + boxH/2 * 0.7f)
             ))
             "DRIVER" -> currentCorners.addAll(listOf(
-                PointF(w * 0.15f, h * 0.40f), PointF(w * 0.85f, h * 0.44f),
-                PointF(w * 0.85f, h * 0.60f), PointF(w * 0.15f, h * 0.56f)
+                PointF(cx - boxW/2, cy - boxH/2 * 1.3f), PointF(cx + boxW/2, cy - boxH/2 * 0.7f),
+                PointF(cx + boxW/2, cy + boxH/2 * 0.7f), PointF(cx - boxW/2, cy + boxH/2 * 1.3f)
             ))
         }
         invalidate()
@@ -127,7 +130,6 @@ class NativeGuideView @JvmOverloads constructor(
 
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
-                // 터치 필터링 유지: 가이드 박스 영역(+60px 마진) 내부 터치시에만 이벤트를 가로챔
                 val minX = currentCorners.minOf { it.x } - 60f
                 val maxX = currentCorners.maxOf { it.x } + 60f
                 val minY = currentCorners.minOf { it.y } - 60f
@@ -148,7 +150,6 @@ class NativeGuideView @JvmOverloads constructor(
                     val dx = x - lastTouchX
                     val dy = y - lastTouchY
 
-                    // UI 레벨에서는 화면 밖으로 넘어가도 부드럽게 드래그 되도록 제한 해제 (자유도 100%)
                     for (point in currentCorners) {
                         point.x += dx
                         point.y += dy
