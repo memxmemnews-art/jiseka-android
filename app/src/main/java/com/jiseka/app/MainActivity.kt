@@ -5,9 +5,11 @@ import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.PointF
 import android.os.Build
 import android.os.Bundle
+import android.os.Looper
 import android.provider.MediaStore
 import android.util.Log
 import android.view.View
@@ -239,11 +241,8 @@ class MainActivity : AppCompatActivity() {
                             nativeGuideView?.visibility = View.VISIBLE
                             modeSelectionLayout?.visibility = View.VISIBLE
                             
-                            // 요청 반영: 촬영 직후에는 다시 촬영/다운로드 버튼을 노출하지 않음
                             resultActionLayout?.visibility = View.GONE
                             progressBar?.visibility = View.GONE
-                            
-                            // 🛠️ 자동 1회 분석 트리거 제거됨 (사용자가 드래그하기 전까지 원본 대기)
                         }
                     } catch (t: Throwable) {
                         runOnUiThread {
@@ -267,34 +266,85 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
+    private fun calculatePolygonArea(pts: List<PointF>): Float {
+        if (pts.size < 3) return 0f
+        var area = 0f
+        var j = pts.size - 1
+        for (i in pts.indices) {
+            area += (pts[j].x * pts[i].y) - (pts[i].x * pts[j].y)
+            j = i
+        }
+        return Math.abs(area / 2.0f)
+    }
+
     private fun triggerAnalysis(mode: String) {
+        // 🛠️ [치명적 문제 4 방어] UI 스레드 런타임 상태 완벽 고정 유도
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnUiThread { triggerAnalysis(mode) }
+            return
+        }
+
         val safeTargetBitmap = synchronized(bitmapLock) { 
             lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) 
         } ?: return
 
         val guideView = nativeGuideView
-        val viewW = nativeBackgroundView?.width ?: 1
-        val viewH = nativeBackgroundView?.height ?: 1
+        val bgView = nativeBackgroundView
 
-        if (guideView == null || viewW <= 1) {
+        if (guideView == null || bgView == null || bgView.width <= 1 || bgView.drawable == null) {
             safeTargetBitmap.recycle()
             return
         }
 
-        runOnUiThread {
-            if (!isFinishing && !isDestroyed) {
-                progressBar?.visibility = View.VISIBLE
-                resultActionLayout?.visibility = View.GONE 
-            }
+        // 🛠️ [치명적 문제 1 & 4 스냅숏화] 매트릭스, 패딩, 계층 오프셋 정보를 UI 스레드 컨텍스트에서 원자적으로 캡처
+        val viewMatrix = Matrix(bgView.imageMatrix)
+        val inverseMatrix = Matrix()
+        val invertSuccess = viewMatrix.invert(inverseMatrix)
+        if (!invertSuccess) {
+            Log.e("CAMERA_DEBUG", "Matrix inversion failed (singular matrix).")
+            safeTargetBitmap.recycle()
+            return
         }
 
+        // 🛠️ [치명적 문제 2 방어] ImageView 내부 패딩 정보 독립 확보
+        val padLeft = bgView.paddingLeft
+        val padTop = bgView.paddingTop
+
+        // 🛠️ [치명적 문제 1 해결] 공통 부모 계층 구조의 미세 오차 무력화를 위해 스크린 절대 물리 좌표 기준 오프셋 수립
+        val guideLoc = IntArray(2)
+        val bgLoc = IntArray(2)
+        guideView.getLocationOnScreen(guideLoc)
+        bgView.getLocationOnScreen(bgLoc)
+        val offsetX = guideLoc[0] - bgLoc[0]
+        val offsetY = guideLoc[1] - bgLoc[1]
+
         val uiCorners = guideView.getCorners()
-        
+
+        if (!isFinishing && !isDestroyed) {
+            progressBar?.visibility = View.VISIBLE
+            resultActionLayout?.visibility = View.GONE 
+        }
+
         analysisExecutor.execute {
             try {
-                var bmpCorners = mapUiToBitmap(uiCorners, viewW, viewH, safeTargetBitmap.width, safeTargetBitmap.height)
+                // 🛠️ [치명적 문제 1 & 2 병합 정합] GuideView 로컬 ➔ ImageView 로컬 이동 후, 패딩을 차감하여 순수 Drawable 차원으로 투영
+                var bmpCorners = uiCorners.map { pt ->
+                    val bgLocalX = pt.x + offsetX
+                    val bgLocalY = pt.y + offsetY
+                    val drawableX = bgLocalX - padLeft
+                    val drawableY = bgLocalY - padTop
+                    
+                    val pts = floatArrayOf(drawableX, drawableY)
+                    inverseMatrix.mapPoints(pts)
+                    
+                    val safeX = pts[0].coerceIn(0f, (safeTargetBitmap.width - 1).toFloat())
+                    val safeY = pts[1].coerceIn(0f, (safeTargetBitmap.height - 1).toFloat())
+                    PointF(safeX, safeY)
+                }
+                
+                val originalArea = calculatePolygonArea(bmpCorners)
 
-                val padding = 30
+                val padding = 0 
                 val minX = maxOf(0, bmpCorners.minOf { it.x }.toInt() - padding)
                 val minY = maxOf(0, bmpCorners.minOf { it.y }.toInt() - padding)
                 val maxX = minOf(safeTargetBitmap.width, bmpCorners.maxOf { it.x }.toInt() + padding)
@@ -303,19 +353,33 @@ class MainActivity : AppCompatActivity() {
                 val cropWidth = maxX - minX
                 val cropHeight = maxY - minY
 
-                if (cropWidth > 0 && cropHeight > 0) {
+                // 🛠️ [치명적 문제 5 방어] 다운스트림 OpenCV 컨투어 붕괴 및 크래시 방지 최소 안전 한계 도출 (50px)
+                if (cropWidth >= 50 && cropHeight >= 50) {
                     val croppedBitmap = Bitmap.createBitmap(safeTargetBitmap, minX, minY, cropWidth, cropHeight)
 
                     try {
                         val detected = PlateDetectionEngine.findPlateCorners(croppedBitmap)
                   
-                        if (detected != null) {
-                            bmpCorners = detected.map { PointF(it.x + minX, it.y + minY) }
+                        if (detected != null && detected.size == 4) {
+                            val detectedArea = calculatePolygonArea(detected)
                             
-                            val newUiCorners = mapBitmapToUi(bmpCorners, viewW, viewH, safeTargetBitmap.width, safeTargetBitmap.height)
-                            runOnUiThread {
-                                if (isFinishing || isDestroyed) return@runOnUiThread
-                                nativeGuideView?.setCorners(newUiCorners)
+                            // 실무 타겟 정합 범위 압축 (0.6 ~ 1.4)
+                            if (detectedArea >= originalArea * 0.6f && detectedArea <= originalArea * 1.4f) {
+                                bmpCorners = detected.map { PointF(it.x + minX, it.y + minY) }
+                                
+                                // 역변환 정합 파이프라인 (Drawable ➔ ImageView ➔ GuideView 순방향 복원)
+                                val newUiCorners = bmpCorners.map { pt ->
+                                    val pts = floatArrayOf(pt.x, pt.y)
+                                    viewMatrix.mapPoints(pts)
+                                    val uiX = pts[0] + padLeft - offsetX
+                                    val uiY = pts[1] + padTop - offsetY
+                                    PointF(uiX, uiY)
+                                }
+                                
+                                runOnUiThread {
+                                    if (isFinishing || isDestroyed) return@runOnUiThread
+                                    nativeGuideView?.setCorners(newUiCorners)
+                                }
                             }
                         }
                     } catch (e: Exception) {
@@ -342,14 +406,19 @@ class MainActivity : AppCompatActivity() {
                         return@runOnUiThread
                     }
 
-                    nativeBackgroundView?.setImageDrawable(null)
-                    displayedBitmap?.recycle()
-                    displayedBitmap = resultBitmap
+                    // 🛠️ [치명적 문제 6 방어] 하드웨어 가속 렌더큐 레이스 컨디션 해결을 위한 지연 소멸 아키텍처
+                    val oldBitmap = displayedBitmap
                     nativeBackgroundView?.setImageBitmap(resultBitmap)
+                    displayedBitmap = resultBitmap
+                    
+                    // 현재 프레임 그리기가 끝나고 메시지 큐의 다음 턴에 안전하게 소멸 지시
+                    oldBitmap?.let { bmp ->
+                        nativeBackgroundView?.post {
+                            if (!bmp.isRecycled) bmp.recycle()
+                        }
+                    }
                     
                     progressBar?.visibility = View.GONE
-                    
-                    // 요청 반영: 가림막 합성이 완벽히 끝난 시점에 버튼들 활성화
                     resultActionLayout?.visibility = View.VISIBLE
                 }
             } catch (t: Throwable) {
@@ -366,32 +435,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun mapUiToBitmap(uiPts: List<PointF>, vw: Int, vh: Int, bw: Int, bh: Int): List<PointF> {
-        val scale = Math.max(vw.toFloat() / bw, vh.toFloat() / bh)
-        val dx = (vw - bw * scale) / 2f
-        val dy = (vh - bh * scale) / 2f
-        
-        return uiPts.map { 
-            val safeX = ((it.x - dx) / scale).coerceIn(0f, (bw - 1).toFloat())
-            val safeY = ((it.y - dy) / scale).coerceIn(0f, (bh - 1).toFloat())
-            PointF(safeX, safeY) 
-        }
-    }
-
-    private fun mapBitmapToUi(bmpPts: List<PointF>, vw: Int, vh: Int, bw: Int, bh: Int): List<PointF> {
-        val scale = Math.max(vw.toFloat() / bw, vh.toFloat() / bh)
-        val dx = (vw - bw * scale) / 2f
-        val dy = (vh - bh * scale) / 2f
-        return bmpPts.map { PointF(it.x * scale + dx, it.y * scale + dy) }
-    }
-
     private fun orderCorners(corners: List<PointF>): List<PointF> {
         if (corners.size != 4) return corners
-        val tl = corners.minByOrNull { it.x + it.y } ?: corners[0]
-        val br = corners.maxByOrNull { it.x + it.y } ?: corners[2]
-        val tr = corners.minByOrNull { it.y - it.x } ?: corners[1]
-        val bl = corners.maxByOrNull { it.y - it.x } ?: corners[3]
-        return listOf(tl, tr, br, bl)
+        val cx = corners.map { it.x }.average().toFloat()
+        val cy = corners.map { it.y }.average().toFloat()
+        
+        return corners.sortedBy { Math.atan2((it.y - cy).toDouble(), (it.x - cx).toDouble()) }
     }
 
     private fun applyMaskToMat(mat: Mat, corners: List<PointF>) {
