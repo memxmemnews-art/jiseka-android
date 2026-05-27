@@ -4,8 +4,10 @@ import android.Manifest
 import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.PointF
+import android.graphics.RectF
 import android.os.Build
 import android.os.Bundle
 import android.os.Looper
@@ -67,6 +69,10 @@ class MainActivity : AppCompatActivity() {
     private var displayedBitmap: Bitmap? = null    
 
     private val captureSessionId = AtomicInteger(0)
+    
+    // 🌟 레이스 컨디션 방어선 (ACTION_UP 인터셉트용)
+    @Volatile private var isRefining = false
+    @Volatile private var pendingMaskRequest = false
 
     @Volatile private var precalculatedCandidates: List<CandidatePolygon> = emptyList()
     @Volatile private var currentlyHoveredBitmapPolygon: List<ImmutablePoint>? = null
@@ -123,9 +129,14 @@ class MainActivity : AppCompatActivity() {
             val targetLevel = currentLevel + 1
             
             if (anchorSnapshot != null) {
+                isRefining = true // 🌟 정밀 탐색 진입 (상태 플래그 On)
+                val msg = if (targetLevel == 1) "🔍 1차 정밀 밀착 중..." else "🔬 2차 초정밀 밀착 중..."
+                Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+                
                 precomputeExecutor.execute {
-                    if (captureSessionId.get() != currentSession) return@execute
+                    if (captureSessionId.get() != currentSession) { isRefining = false; return@execute }
                     val safeBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) }
+                    
                     if (safeBitmap != null) {
                         val tightenedPolygon = PlateDetectionEngine.refineAnchoredPolygon(safeBitmap, anchorSnapshot, targetLevel)
                         safeBitmap.recycle()
@@ -133,30 +144,57 @@ class MainActivity : AppCompatActivity() {
                         runOnUiThread {
                             if (tightenedPolygon != null && tightenedPolygon != anchorSnapshot && captureSessionId.get() == currentSession) {
                                 currentlyHoveredBitmapPolygon = tightenedPolygon
+                                
+                                // 🌟 영속성(Persistence) 확보: 전체 후보군 내 원본을 갱신하여 살짝 움직여도 초기화되지 않도록 보강
+                                val xCoords = tightenedPolygon.map { it.x }; val yCoords = tightenedPolygon.map { it.y }
+                                val newBounds = RectF(xCoords.min(), yCoords.min(), xCoords.max(), yCoords.max())
+                                precalculatedCandidates = precalculatedCandidates.map { 
+                                    if (it.points == anchorSnapshot) CandidatePolygon(tightenedPolygon, newBounds) else it 
+                                }
+
                                 val uiTightPolygon = tightenedPolygon.map { pt ->
                                     matrixMappingBuffer[0] = pt.x; matrixMappingBuffer[1] = pt.y
                                     viewMatrix.mapPoints(matrixMappingBuffer)
                                     PointF(matrixMappingBuffer[0], matrixMappingBuffer[1])
                                 }.toTypedArray()
+                                
                                 nativeGuideView?.setHoveredPolygon(uiTightPolygon)
                                 nativeGuideView?.notifyRefinementCompleted(true)
                             } else {
                                 nativeGuideView?.notifyRefinementCompleted(false)
                             }
+
+                            // 🌟 레이스 컨디션 처리: 연산 도중 손을 뗐다면 여기서 즉시 마스킹 토스
+                            isRefining = false
+                            if (pendingMaskRequest) {
+                                pendingMaskRequest = false
+                                val target = currentlyHoveredBitmapPolygon?.toList()
+                                if (target != null) triggerInstantMasking(target)
+                            }
                         }
+                    } else {
+                        runOnUiThread { isRefining = false }
                     }
                 }
             }
         }
 
         nativeGuideView?.onCrosshairDropListener = {
-            val targetSnapshot = currentlyHoveredBitmapPolygon?.toList() 
-            if (targetSnapshot != null) triggerInstantMasking(targetSnapshot)
+            // 🌟 비동기 충돌 방지: 정밀 연산 중 손을 뗐다면 마스킹을 예약만 하고 대기
+            if (isRefining) {
+                pendingMaskRequest = true
+            } else {
+                val targetSnapshot = currentlyHoveredBitmapPolygon?.toList() 
+                if (targetSnapshot != null) triggerInstantMasking(targetSnapshot)
+            }
         }
     }
 
     private fun resetToLiveMode() {
         captureSessionId.incrementAndGet()
+        isRefining = false
+        pendingMaskRequest = false
+        
         btnCapture?.isEnabled = true
         nativeBackgroundView?.setImageDrawable(null)
         displayedBitmap?.recycle(); displayedBitmap = null
@@ -164,6 +202,8 @@ class MainActivity : AppCompatActivity() {
         synchronized(bitmapLock) { lastCapturedBitmap?.recycle(); lastCapturedBitmap = null }
         precalculatedCandidates = emptyList(); currentlyHoveredBitmapPolygon = null; isMatrixReady = false
 
+        nativeGuideView?.resetState() // 🌟 뷰 내부 상태 완벽 초기화 연결
+        
         viewFinder?.visibility = View.VISIBLE
         btnCapture?.visibility = View.VISIBLE
         nativeGuideView?.visibility = View.GONE
@@ -307,15 +347,22 @@ class MainActivity : AppCompatActivity() {
             coloredMask = Mat(mat.size(), mat.type(), Scalar(0.0, 255.0, 0.0, 255.0))
             alphaMat = Mat(); blurredMask.convertTo(alphaMat, CvType.CV_32F, 1.0 / 255.0)
             Core.split(mat, matChannels); Core.split(coloredMask, coloredChannels)
+            
             for (i in 0 until 3) {
                 var mcF: Mat? = null; var ccF: Mat? = null; var blendedF: Mat? = null
+                var invAlpha: Mat? = null; var scalarMat: Mat? = null
                 try {
                     mcF = Mat(); ccF = Mat(); matChannels[i].convertTo(mcF, CvType.CV_32F); coloredChannels[i].convertTo(ccF, CvType.CV_32F)
                     blendedF = Mat(); Core.multiply(ccF, alphaMat, ccF)
-                    val invAlpha = Mat(); val scalarMat = Mat(alphaMat.size(), alphaMat.type(), Scalar(1.0))
+                    
+                    // 🌟 OpenCV 메모리 릭(Leak) 완벽 차단 블록
+                    invAlpha = Mat(); scalarMat = Mat(alphaMat.size(), alphaMat.type(), Scalar(1.0))
                     Core.subtract(scalarMat, alphaMat, invAlpha); Core.multiply(mcF, invAlpha, mcF); Core.add(ccF, mcF, blendedF)
                     blendedF.convertTo(matChannels[i], CvType.CV_8U)
-                } finally { mcF?.release(); ccF?.release(); blendedF?.release() }
+                } finally { 
+                    mcF?.release(); ccF?.release(); blendedF?.release()
+                    invAlpha?.release(); scalarMat?.release() // 누락되었던 릴리즈 확보
+                }
             }
             Core.merge(matChannels, mat)
         } finally {
