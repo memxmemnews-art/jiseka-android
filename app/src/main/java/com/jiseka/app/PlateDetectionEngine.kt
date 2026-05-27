@@ -23,7 +23,8 @@ object PlateDetectionEngine {
             Imgproc.bilateralFilter(grayMat, bilateralMat, 9, 15.0, 15.0)
             Imgproc.Canny(bilateralMat, edgeMat, 60.0, 180.0)
             
-            morphKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(15.0, 5.0))
+            // 🌟 1. 글자 연결성은 유지하면서 대각선 윤곽을 보존하는 절충형 커널로 변경
+            morphKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(9.0, 3.0))
             Imgproc.morphologyEx(edgeMat, edgeMat, Imgproc.MORPH_CLOSE, morphKernel)
             Imgproc.findContours(edgeMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
@@ -31,6 +32,8 @@ object PlateDetectionEngine {
 
             for (contour in contours) {
                 val contour2f = MatOfPoint2f(*contour.toArray())
+                
+                // 🌟 핵심: minAreaRect를 통해 회전 정보를 유지한 사각형 추출
                 val rotatedRect = Imgproc.minAreaRect(contour2f)
                 
                 val rectW = max(rotatedRect.size.width, rotatedRect.size.height)
@@ -38,13 +41,17 @@ object PlateDetectionEngine {
                 if (rectH < minPlateHeight) continue 
                 
                 val aspectRatio = rectW / rectH
-                if (aspectRatio in 2.3..5.7) {
+                
+                // 🌟 2. 크게 기울어진 번호판도 허용할 수 있도록 비율 범위 확장 (기존 2.3~5.7)
+                if (aspectRatio in 1.8..6.0) {
                     val roughPoints = arrayOfNulls<Point>(4)
                     rotatedRect.points(roughPoints)
                     
                     val immutablePoints = roughPoints.filterNotNull().map { ImmutablePoint(it.x.toFloat(), it.y.toFloat()) }
                     val xCoords = immutablePoints.map { it.x }; val yCoords = immutablePoints.map { it.y }
                     val bounds = RectF(xCoords.min(), yCoords.min(), xCoords.max(), yCoords.max())
+                    
+                    // 회전된 4개의 꼭짓점 포인트와 축 정렬 바운드 박스를 함께 저장
                     candidates.add(CandidatePolygon(immutablePoints, bounds))
                 }
             }
@@ -70,7 +77,6 @@ object PlateDetectionEngine {
             min(fullBitmap.width, maxX.toInt()), min(fullBitmap.height, maxY.toInt())
         )
         
-        // 🌟 폭발 방지 (크래시 차단): 자르려는 영역이 너무 작거나 0이면 원본 앵커 반환
         if (safeRect.width() <= 1 || safeRect.height() <= 1) return null
 
         val roiBitmap = Bitmap.createBitmap(fullBitmap, safeRect.left, safeRect.top, safeRect.width(), safeRect.height())
@@ -105,8 +111,10 @@ object PlateDetectionEngine {
 
                 if (candArea / anchorArea !in 0.7..1.3) continue 
                 if (Math.hypot(candGlobalCenter.x - anchorCenter.x, candGlobalCenter.y - anchorCenter.y) > 30.0) continue 
+                
+                // 🌟 3. 각도 차이 허용 범위 확장 (기울어진 상태에서 재검색 시 실패 방지)
                 val angleDiff = Math.abs(anchorAngle - candRect.angle)
-                if (angleDiff > 10.0 && angleDiff < 80.0) continue 
+                if (angleDiff > 15.0 && angleDiff < 75.0) continue 
 
                 val areaDiff = Math.abs(anchorArea - candArea)
                 if (areaDiff < minAreaDiff) {
