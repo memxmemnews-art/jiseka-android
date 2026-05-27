@@ -20,15 +20,17 @@ class NativeGuideView @JvmOverloads constructor(
 
     var onCrosshairMoveListener: ((PointF) -> Unit)? = null
     var onCrosshairDropListener: (() -> Unit)? = null
-    
-    // 🌟 시그니처 일치: 정밀도 레벨을 전달하는 리스너
     var onDwellTriggeredListener: ((Int) -> Unit)? = null
 
-    private var crosshairPoint: PointF? = null
+    // 🌟 핵심 개선: nullable 제거, 객체 재사용(Object Pooling) 방식 채택
+    private val crosshairPoint = PointF()
+    
+    // 🌟 핵심 추가: 렌더링 플래그로 뷰의 가시성 상태 관리
+    private var hasCrosshair = false
+    
     private val uiPolygonBuffer = Array(4) { PointF() }
     private var hasHoveredPolygon = false
 
-    // 🌟 내부 독점 상태 머신 (State Machine)
     private val dwellHandler = Handler(Looper.getMainLooper())
     private var isDwelling = false
     private var refinementLevel = 0
@@ -48,7 +50,6 @@ class NativeGuideView @JvmOverloads constructor(
         }
     }
 
-    // 🌟 구조 불일치 해결: 성공 여부에 따라 다단계 타이머를 관리하는 코어 함수
     fun notifyRefinementCompleted(success: Boolean) {
         if (success && refinementLevel < MAX_REFINEMENT_LEVEL) {
             refinementLevel++
@@ -63,13 +64,13 @@ class NativeGuideView @JvmOverloads constructor(
         postInvalidateOnAnimation()
     }
 
-    // 🌟 생명주기 동기화: 액티비티 초기화 시 뷰 내부 상태도 리셋
+    // 🌟 핵심 개선: 생명주기 안정화 (유령 호출 방지 및 상태 초기화)
     fun resetState() {
-        dwellHandler.removeCallbacks(dwellRunnable)
+        dwellHandler.removeCallbacksAndMessages(null) // 모든 예약된 스레드 제거 보장
         isDwelling = false
         refinementLevel = 0
         hasHoveredPolygon = false
-        crosshairPoint = null
+        hasCrosshair = false // 객체를 null로 만들지 않고 플래그만 Off
         postInvalidateOnAnimation()
     }
 
@@ -83,7 +84,10 @@ class NativeGuideView @JvmOverloads constructor(
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
-        if (w > 0 && h > 0 && crosshairPoint == null) crosshairPoint = PointF(w / 2f, h / 2f)
+        // onSizeChanged에서는 화면의 중앙 좌표만 초기 세팅해둡니다.
+        if (w > 0 && h > 0 && !hasCrosshair) {
+            crosshairPoint.set(w / 2f, h / 2f)
+        }
     }
 
     fun setHoveredPolygon(points: Array<PointF>?) {
@@ -118,7 +122,9 @@ class NativeGuideView @JvmOverloads constructor(
             canvas.drawPath(polygonPath, hoverStrokePaint)
         }
 
-        crosshairPoint?.let { pt ->
+        // 🌟 플래그를 통한 렌더링 분기
+        if (hasCrosshair) {
+            val pt = crosshairPoint
             val radius = 40f
             canvas.drawCircle(pt.x, pt.y, radius, crosshairBackPaint); canvas.drawLine(pt.x - radius - 20f, pt.y, pt.x - radius, pt.y, crosshairBackPaint)
             canvas.drawLine(pt.x + radius, pt.y, pt.x + radius + 20f, pt.y, crosshairBackPaint); canvas.drawLine(pt.x, pt.y - radius - 20f, pt.x, pt.y - radius, crosshairBackPaint)
@@ -132,14 +138,17 @@ class NativeGuideView @JvmOverloads constructor(
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val x = event.x
         
-        // 🌟 팻핑거(Fat Finger) 방지 오프셋
-        // 손가락 위치보다 약 150픽셀 위쪽에 조준점이 위치하도록 조정
+        // 팻핑거 오프셋 (테스트 후 최적의 값을 찾으셨길 바랍니다!)
         val fatFingerOffsetY = -150f 
         val y = event.y + fatFingerOffsetY
 
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
-                crosshairPoint?.set(x, y); lastMoveX = x; lastMoveY = y
+                // 🌟 객체 생성 체크 없이 안전하게 상태 변경 및 좌표 갱신
+                hasCrosshair = true 
+                crosshairPoint.set(x, y)
+                
+                lastMoveX = x; lastMoveY = y
                 refinementLevel = 0; isDwelling = false
                 
                 dwellHandler.removeCallbacks(dwellRunnable)
@@ -150,7 +159,7 @@ class NativeGuideView @JvmOverloads constructor(
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
-                crosshairPoint?.set(x, y)
+                crosshairPoint.set(x, y)
                 if (Math.abs(x - lastMoveX) > touchSlop || Math.abs(y - lastMoveY) > touchSlop) {
                     refinementLevel = 0; isDwelling = false
                     lastMoveX = x; lastMoveY = y
