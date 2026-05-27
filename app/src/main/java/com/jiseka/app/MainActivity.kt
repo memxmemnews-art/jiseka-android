@@ -93,12 +93,12 @@ class MainActivity : AppCompatActivity() {
 
         viewFinder = findViewById(R.id.viewFinder)
         viewFinder?.implementationMode = PreviewView.ImplementationMode.COMPATIBLE
-        
-        // [적용됨] 센서 비율을 유지하며 레터박스 없이 꽉 차게 표시
         viewFinder?.scaleType = PreviewView.ScaleType.FILL_CENTER
         
         nativeBackgroundView = findViewById(R.id.nativeBackgroundView)
-        nativeBackgroundView?.scaleType = ImageView.ScaleType.FILL_CENTER
+        
+        // 🌟 수정 완료: ImageView 호환 옵션 적용 (빌드 에러 해결)
+        nativeBackgroundView?.scaleType = ImageView.ScaleType.CENTER_CROP
         
         nativeGuideView = findViewById(R.id.nativeGuideView)
         resultActionLayout = findViewById(R.id.resultActionLayout)
@@ -195,11 +195,20 @@ class MainActivity : AppCompatActivity() {
         pendingMaskRequest = false
         
         btnCapture?.isEnabled = true
+        
+        // 🌟 수정 완료: Canvas 렌더링 충돌 방지를 위해 먼저 뷰와 연결을 끊음
         nativeBackgroundView?.setImageDrawable(null)
-        displayedBitmap?.recycle(); displayedBitmap = null
+        displayedBitmap?.recycle()
+        displayedBitmap = null
 
-        synchronized(bitmapLock) { lastCapturedBitmap?.recycle(); lastCapturedBitmap = null }
-        precalculatedCandidates = emptyList(); currentlyHoveredBitmapPolygon = null; isMatrixReady = false
+        synchronized(bitmapLock) { 
+            lastCapturedBitmap?.recycle()
+            lastCapturedBitmap = null 
+        }
+        
+        precalculatedCandidates = emptyList()
+        currentlyHoveredBitmapPolygon = null
+        isMatrixReady = false
 
         nativeGuideView?.resetState()
         
@@ -222,7 +231,6 @@ class MainActivity : AppCompatActivity() {
             try {
                 cameraProvider.unbindAll()
                 
-                // [적용됨] ViewPort와 UseCaseGroup을 활용하여 Preview와 Capture의 프레이밍 일치
                 val viewPort = viewFinder?.viewPort
                 if (viewPort != null) {
                     val useCaseGroup = UseCaseGroup.Builder()
@@ -260,35 +268,36 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
-    // 🌟 [적용됨] YUV 제거, JPEG 전용, 완벽한 Bounds Checking이 적용된 내부 확장 함수
     private fun ImageProxy.toUprightBitmapInternal(): Bitmap {
-        // 1. JPEG 포맷 기반 디코딩 (YUV 로직 삭제)
         val buffer = planes[0].buffer
         val bytes = ByteArray(buffer.remaining())
         buffer.get(bytes)
         val originalBitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
 
-        // 2. ViewPort 크롭 좌표계를 가져오되, 기기 호환성을 위해 안전한(Safe) 경계값 보정 처리
         val rect = this.cropRect
         val safeLeft = rect.left.coerceIn(0, originalBitmap.width - 1)
         val safeTop = rect.top.coerceIn(0, originalBitmap.height - 1)
         val safeWidth = rect.width().coerceAtMost(originalBitmap.width - safeLeft)
         val safeHeight = rect.height().coerceAtMost(originalBitmap.height - safeTop)
 
-        // 3. 자르기 (CameraX cropRect는 원본 센서 버퍼 기준이므로 회전 전에 잘라야 좌표가 정확함)
+        // 🌟 수정 완료: 계산된 크롭 영역이 유효하지 않을 때 크래시 방지 및 원본 반환
+        if (safeWidth <= 0 || safeHeight <= 0) {
+            val fallbackBitmap = originalBitmap.copy(Bitmap.Config.ARGB_8888, true)
+            originalBitmap.recycle()
+            return fallbackBitmap
+        }
+
         val croppedBitmap = Bitmap.createBitmap(originalBitmap, safeLeft, safeTop, safeWidth, safeHeight)
         if (croppedBitmap != originalBitmap) {
             originalBitmap.recycle()
         }
 
-        // 4. 회전 (자른 이미지를 최종적으로 화면 방향에 맞게 회전)
         val matrix = Matrix().apply { postRotate(imageInfo.rotationDegrees.toFloat()) }
         val rotatedBitmap = Bitmap.createBitmap(croppedBitmap, 0, 0, croppedBitmap.width, croppedBitmap.height, matrix, true)
         if (rotatedBitmap != croppedBitmap) {
             croppedBitmap.recycle()
         }
 
-        // 5. OpenCV 처리를 위한 ARGB_8888 포맷 전환
         val finalBitmap = rotatedBitmap.copy(Bitmap.Config.ARGB_8888, true)
         if (finalBitmap != rotatedBitmap) {
             rotatedBitmap.recycle()
@@ -320,7 +329,7 @@ class MainActivity : AppCompatActivity() {
         bgView.invalidate() 
     }
 
-private fun handleCrosshairMove(uiPoint: PointF) {
+    private fun handleCrosshairMove(uiPoint: PointF) {
         if (!isMatrixReady || precalculatedCandidates.isEmpty()) return
         matrixMappingBuffer[0] = uiPoint.x; matrixMappingBuffer[1] = uiPoint.y
         inverseMatrix.mapPoints(matrixMappingBuffer)
@@ -330,14 +339,8 @@ private fun handleCrosshairMove(uiPoint: PointF) {
         var minArea = Float.MAX_VALUE
 
         for (candidate in precalculatedCandidates) {
-            // 1. 고속 필터링 (축 정렬 박스 내부에 있는지 먼저 빠르게 확인)
             if (candidate.bounds.contains(bitmapX, bitmapY)) {
-                // 2. 정밀 확인 (실제 회전된 폴리곤 내부에 터치 좌표가 들어왔는지 확인)
                 if (isPointInPolygon(bitmapX, bitmapY, candidate.points)) {
-                    
-                    // 🌟 3. 가장 치명적인 문제 해결 (면적 계산)
-                    // 기존코드: candidate.bounds.width() * candidate.bounds.height() -> 축 정렬 사각형이라 기울어지면 거대해짐
-                    // 수정코드: 신발끈 공식(Shoelace formula)을 이용하여 회전된 폴리곤의 '진짜' 면적 계산
                     val pts = candidate.points
                     val actualArea = 0.5f * Math.abs(
                         pts[0].x * pts[1].y + pts[1].x * pts[2].y + pts[2].x * pts[3].y + pts[3].x * pts[0].y -
@@ -381,8 +384,15 @@ private fun handleCrosshairMove(uiPoint: PointF) {
                     runOnUiThread {
                         if (isFinishing || isDestroyed || captureSessionId.get() != currentSessionId) { resultBitmap.recycle(); return@runOnUiThread }
                         val oldBitmap = displayedBitmap
-                        nativeBackgroundView?.setImageBitmap(resultBitmap); displayedBitmap = resultBitmap
-                        oldBitmap?.let { bmp -> nativeBackgroundView?.post { if (!bmp.isRecycled) bmp.recycle() } }
+                        
+                        nativeBackgroundView?.setImageBitmap(resultBitmap)
+                        displayedBitmap = resultBitmap
+                        
+                        // 🌟 수정 완료: Canvas 렌더 꼬임 방지를 위해 post 블록에서 이전 뷰를 확실히 해제
+                        oldBitmap?.let { bmp -> 
+                            nativeBackgroundView?.post { if (!bmp.isRecycled) bmp.recycle() } 
+                        }
+                        
                         progressBar?.visibility = View.GONE; resultActionLayout?.visibility = View.VISIBLE
                     }
                 } finally { safeTargetBitmap.recycle() }
