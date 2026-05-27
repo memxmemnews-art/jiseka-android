@@ -6,6 +6,8 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PointF
+import android.os.Handler
+import android.os.Looper
 import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.View
@@ -16,172 +18,147 @@ class NativeGuideView @JvmOverloads constructor(
     defStyleAttr: Int = 0
 ) : View(context, attrs, defStyleAttr) {
 
-    var onGuideDropListener: ((String) -> Unit)? = null
+    var onCrosshairMoveListener: ((PointF) -> Unit)? = null
+    var onCrosshairDropListener: (() -> Unit)? = null
+    
+    // 현재 정밀도 레벨(0 또는 1)을 액티비티로 전달하는 리스너
+    var onDwellTriggeredListener: ((Int) -> Unit)? = null
 
-    var currentMode: String = "FRONT"
-        private set
+    private var crosshairPoint: PointF? = null
+    private val uiPolygonBuffer = Array(4) { PointF() }
+    private var hasHoveredPolygon = false
 
-    private val currentCorners = mutableListOf<PointF>()
+    // 🌟 다단계 Progressive Refinement 제어기
+    private val dwellHandler = Handler(Looper.getMainLooper())
+    private var isDwelling = false
+    private var refinementLevel = 0
+    private val MAX_REFINEMENT_LEVEL = 2
+    
+    private var lastMoveX = 0f
+    private var lastMoveY = 0f
+    private val touchSlop = 15f 
 
-    private val path = Path()
-    private val strokePaint = Paint().apply {
-        color = Color.GREEN
-        style = Paint.Style.STROKE
-        strokeWidth = 6f
-        isAntiAlias = true
+    // 레벨 0에서는 1.5초 대기, 레벨 1에서는 1.0초 대기
+    private fun getCurrentDwellTime() = if (refinementLevel == 0) 1500L else 1000L
+
+    private val dwellRunnable = Runnable {
+        if (!isDwelling && refinementLevel < MAX_REFINEMENT_LEVEL) {
+            isDwelling = true
+            onDwellTriggeredListener?.invoke(refinementLevel)
+            postInvalidateOnAnimation()
+        }
     }
-    private val fillPaint = Paint().apply {
-        color = Color.parseColor("#3300FF00")
-        style = Paint.Style.FILL
-    }
-    private val cornerPaint = Paint().apply {
-        color = Color.GREEN
-        style = Paint.Style.FILL
-        isAntiAlias = true
+
+    // 🌟 엔진 연산 종료 후 다음 단계 타이머 재장전
+    fun notifyRefinementCompleted(success: Boolean) {
+        if (success && refinementLevel < MAX_REFINEMENT_LEVEL) {
+            refinementLevel++
+            isDwelling = false 
+            
+            dwellHandler.removeCallbacks(dwellRunnable)
+            if (refinementLevel < MAX_REFINEMENT_LEVEL) {
+                dwellHandler.postDelayed(dwellRunnable, getCurrentDwellTime())
+            }
+        } else {
+            isDwelling = false
+        }
+        postInvalidateOnAnimation()
     }
 
-    private var isDragging = false
-    private var isMoved = false
-    private var lastTouchX = 0f
-    private var lastTouchY = 0f
+    private val crosshairBackPaint = Paint().apply { color = Color.BLACK; style = Paint.Style.STROKE; strokeWidth = 9f; isAntiAlias = true }
+    private val crosshairFrontPaint = Paint().apply { color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = 5f; isAntiAlias = true }
+    private val centerDotPaint = Paint().apply { color = Color.RED; style = Paint.Style.FILL; isAntiAlias = true }
+
+    private val hoverStrokePaint = Paint().apply { style = Paint.Style.STROKE; strokeWidth = 8f; isAntiAlias = true }
+    private val hoverFillPaint = Paint().apply { color = Color.parseColor("#4400FF00"); style = Paint.Style.FILL }
+
+    private val polygonPath = Path()
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
-        if (w > 0 && h > 0) {
-            if (currentCorners.size == 4 && oldw > 0 && oldh > 0) {
-                recalculateCornersOnResize(w, h, oldw, oldh)
-            } else {
-                applyModeGeometry()
-            }
-        }
+        if (w > 0 && h > 0 && crosshairPoint == null) crosshairPoint = PointF(w / 2f, h / 2f)
     }
 
-    fun setMode(mode: String) {
-        this.currentMode = mode
-        applyModeGeometry()
-    }
-
-    private fun applyModeGeometry() {
-        val w = width.toFloat()
-        val h = height.toFloat()
-
-        if (w <= 0f || h <= 0f) return
-
-        currentCorners.clear()
-        
-        // 🛠️ 가이드 박스 크기: 기존 30%에서 10% 증가시킨 33% 수준으로 변경
-        val boxW = w * 0.33f 
-        val boxH = boxW / 4.7f // 실제 자동차 번호판 비율 적용
-        val cx = w / 2f
-        val cy = h / 2f
-        
-        when (currentMode) {
-            "FRONT" -> currentCorners.addAll(listOf(
-                PointF(cx - boxW/2, cy - boxH/2), PointF(cx + boxW/2, cy - boxH/2),
-                PointF(cx + boxW/2, cy + boxH/2), PointF(cx - boxW/2, cy + boxH/2)
-            ))
-            "PASSENGER" -> currentCorners.addAll(listOf(
-                PointF(cx - boxW/2, cy - boxH/2 * 0.7f), PointF(cx + boxW/2, cy - boxH/2 * 1.3f),
-                PointF(cx + boxW/2, cy + boxH/2 * 1.3f), PointF(cx - boxW/2, cy + boxH/2 * 0.7f)
-            ))
-            "DRIVER" -> currentCorners.addAll(listOf(
-                PointF(cx - boxW/2, cy - boxH/2 * 1.3f), PointF(cx + boxW/2, cy - boxH/2 * 0.7f),
-                PointF(cx + boxW/2, cy + boxH/2 * 0.7f), PointF(cx - boxW/2, cy + boxH/2 * 1.3f)
-            ))
+    fun setHoveredPolygon(points: Array<PointF>?) {
+        if (points == null) {
+            hasHoveredPolygon = false
+        } else {
+            for (i in 0 until 4) uiPolygonBuffer[i].set(points[i].x, points[i].y)
+            hasHoveredPolygon = true
         }
-        invalidate()
-    }
-
-    private fun recalculateCornersOnResize(newW: Int, newH: Int, oldW: Int, oldH: Int) {
-        if (oldW <= 0 || oldH <= 0 || currentCorners.size != 4) return
-        val ratioX = newW.toFloat() / oldW.toFloat()
-        val ratioY = newH.toFloat() / oldH.toFloat()
-        for (point in currentCorners) {
-            point.x *= ratioX
-            point.y *= ratioY
-        }
-        invalidate()
+        postInvalidateOnAnimation()
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        if (currentCorners.size != 4) return
 
-        path.reset()
-        path.moveTo(currentCorners[0].x, currentCorners[0].y)
-        path.lineTo(currentCorners[1].x, currentCorners[1].y)
-        path.lineTo(currentCorners[2].x, currentCorners[2].y)
-        path.lineTo(currentCorners[3].x, currentCorners[3].y)
-        path.close()
+        if (hasHoveredPolygon) {
+            polygonPath.reset()
+            polygonPath.moveTo(uiPolygonBuffer[0].x, uiPolygonBuffer[0].y)
+            polygonPath.lineTo(uiPolygonBuffer[1].x, uiPolygonBuffer[1].y)
+            polygonPath.lineTo(uiPolygonBuffer[2].x, uiPolygonBuffer[2].y)
+            polygonPath.lineTo(uiPolygonBuffer[3].x, uiPolygonBuffer[3].y)
+            polygonPath.close()
 
-        canvas.drawPath(path, fillPaint)
-        canvas.drawPath(path, strokePaint)
+            // 🌟 시각적 피드백: 레벨 0(초록) -> 레벨 1(시안) -> 레벨 2(노랑)
+            hoverStrokePaint.color = when (refinementLevel) {
+                0 -> Color.GREEN
+                1 -> Color.CYAN
+                else -> Color.YELLOW
+            }
+            if (isDwelling) hoverStrokePaint.alpha = 128 else hoverStrokePaint.alpha = 255
 
-        for (point in currentCorners) {
-            canvas.drawCircle(point.x, point.y, 10f, cornerPaint)
+            canvas.drawPath(polygonPath, hoverFillPaint)
+            canvas.drawPath(polygonPath, hoverStrokePaint)
+        }
+
+        crosshairPoint?.let { pt ->
+            val radius = 40f
+            canvas.drawCircle(pt.x, pt.y, radius, crosshairBackPaint); canvas.drawLine(pt.x - radius - 20f, pt.y, pt.x - radius, pt.y, crosshairBackPaint)
+            canvas.drawLine(pt.x + radius, pt.y, pt.x + radius + 20f, pt.y, crosshairBackPaint); canvas.drawLine(pt.x, pt.y - radius - 20f, pt.x, pt.y - radius, crosshairBackPaint)
+            canvas.drawLine(pt.x, pt.y + radius, pt.x, pt.y + radius + 20f, crosshairBackPaint)
+            canvas.drawCircle(pt.x, pt.y, radius, crosshairFrontPaint); canvas.drawLine(pt.x - radius - 20f, pt.y, pt.x - radius, pt.y, crosshairFrontPaint)
+            canvas.drawLine(pt.x + radius, pt.y, pt.x + radius + 20f, pt.y, crosshairFrontPaint); canvas.drawLine(pt.x, pt.y - radius - 20f, pt.x, pt.y - radius, crosshairFrontPaint)
+            canvas.drawLine(pt.x, pt.y + radius, pt.x, pt.y + radius + 20f, crosshairFrontPaint); canvas.drawCircle(pt.x, pt.y, 8f, centerDotPaint)
         }
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        if (currentCorners.isEmpty()) return false
-
-        val x = event.x
-        val y = event.y
+        val x = event.x; val y = event.y
 
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
-                val minX = currentCorners.minOf { it.x } - 60f
-                val maxX = currentCorners.maxOf { it.x } + 60f
-                val minY = currentCorners.minOf { it.y } - 60f
-                val maxY = currentCorners.maxOf { it.y } + 60f
-
-                if (x in minX..maxX && y in minY..maxY) {
-                    isDragging = true
-                    isMoved = false
-                    lastTouchX = x
-                    lastTouchY = y
-                    return true
-                }
-                return false
+                crosshairPoint?.set(x, y); lastMoveX = x; lastMoveY = y
+                refinementLevel = 0; isDwelling = false
+                
+                dwellHandler.removeCallbacks(dwellRunnable)
+                dwellHandler.postDelayed(dwellRunnable, getCurrentDwellTime())
+                
+                onCrosshairMoveListener?.invoke(PointF(x, y))
+                postInvalidateOnAnimation()
+                return true
             }
             MotionEvent.ACTION_MOVE -> {
-                if (isDragging) {
-                    isMoved = true
-                    val dx = x - lastTouchX
-                    val dy = y - lastTouchY
-
-                    for (point in currentCorners) {
-                        point.x += dx
-                        point.y += dy
-                    }
-
-                    lastTouchX = x
-                    lastTouchY = y
-                    invalidate()
-                    return true
+                crosshairPoint?.set(x, y)
+                
+                if (Math.abs(x - lastMoveX) > touchSlop || Math.abs(y - lastMoveY) > touchSlop) {
+                    refinementLevel = 0; isDwelling = false
+                    lastMoveX = x; lastMoveY = y
+                    dwellHandler.removeCallbacks(dwellRunnable)
+                    dwellHandler.postDelayed(dwellRunnable, getCurrentDwellTime())
                 }
+
+                onCrosshairMoveListener?.invoke(PointF(x, y))
+                postInvalidateOnAnimation()
+                return true
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                if (isDragging) {
-                    isDragging = false
-                    if (isMoved) {
-                        onGuideDropListener?.invoke(currentMode)
-                    }
-                    return true
-                }
+                dwellHandler.removeCallbacks(dwellRunnable)
+                isDwelling = false
+                onCrosshairDropListener?.invoke()
+                return true
             }
         }
         return super.onTouchEvent(event)
-    }
-
-    fun getCorners(): List<PointF> {
-        return currentCorners.toList()
-    }
-
-    fun setCorners(newCorners: List<PointF>) {
-        if (newCorners.size != 4) return
-        currentCorners.clear()
-        currentCorners.addAll(newCorners)
-        invalidate()
     }
 }
