@@ -27,7 +27,6 @@ object PlateDetectionEngine {
             Imgproc.morphologyEx(edgeMat, edgeMat, Imgproc.MORPH_CLOSE, morphKernel)
             Imgproc.findContours(edgeMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
-            // 🌟 비율 파편화에 강한 Height 기반 정규화 (전체 높이의 2.5% 이상)
             val minPlateHeight = fullBitmap.height * 0.025
 
             for (contour in contours) {
@@ -58,10 +57,7 @@ object PlateDetectionEngine {
         }
     }
 
-    // 🌟 레벨별 ROI 축소 및 수학적 철창(Constraint) 다듬기
     fun refineAnchoredPolygon(fullBitmap: Bitmap, anchorPolygon: List<ImmutablePoint>, targetLevel: Int): List<ImmutablePoint>? {
-        
-        // 타겟 레벨이 높을수록 방해물 차단을 위해 ROI 여백을 더 타이트하게 죔
         val padding = if (targetLevel == 1) 30f else 15f 
         
         val minX = anchorPolygon.minOf { it.x } - padding
@@ -73,7 +69,9 @@ object PlateDetectionEngine {
             max(0, minX.toInt()), max(0, minY.toInt()),
             min(fullBitmap.width, maxX.toInt()), min(fullBitmap.height, maxY.toInt())
         )
-        if (safeRect.width() <= 0 || safeRect.height() <= 0) return null
+        
+        // 🌟 폭발 방지 (크래시 차단): 자르려는 영역이 너무 작거나 0이면 원본 앵커 반환
+        if (safeRect.width() <= 1 || safeRect.height() <= 1) return null
 
         val roiBitmap = Bitmap.createBitmap(fullBitmap, safeRect.left, safeRect.top, safeRect.width(), safeRect.height())
 
@@ -90,7 +88,6 @@ object PlateDetectionEngine {
             Utils.bitmapToMat(roiBitmap, roiMat)
             Imgproc.cvtColor(roiMat, roiGray, Imgproc.COLOR_RGBA2GRAY)
             
-            // 타겟 레벨이 높을수록 엣지 민감도를 올려 진짜 선을 찾음
             val cannyThresh1 = if (targetLevel == 1) 40.0 else 20.0
             val cannyThresh2 = if (targetLevel == 1) 120.0 else 60.0
             
@@ -106,7 +103,6 @@ object PlateDetectionEngine {
                 val candArea = candRect.size.width * candRect.size.height
                 val candGlobalCenter = Point(candRect.center.x + safeRect.left, candRect.center.y + safeRect.top)
 
-                // 🛡️ 수학적 철창 (점프 방지)
                 if (candArea / anchorArea !in 0.7..1.3) continue 
                 if (Math.hypot(candGlobalCenter.x - anchorCenter.x, candGlobalCenter.y - anchorCenter.y) > 30.0) continue 
                 val angleDiff = Math.abs(anchorAngle - candRect.angle)
