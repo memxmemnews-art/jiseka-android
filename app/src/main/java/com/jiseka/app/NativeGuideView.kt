@@ -130,7 +130,12 @@ class NativeGuideView @JvmOverloads constructor(
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        val x = event.x; val y = event.y
+        val x = event.x
+        
+        // 🌟 팻핑거(Fat Finger) 방지 오프셋
+        // 손가락 위치보다 약 150픽셀 위쪽에 조준점이 위치하도록 조정
+        val fatFingerOffsetY = -150f 
+        val y = event.y + fatFingerOffsetY
 
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
