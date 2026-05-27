@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.PointF
@@ -386,12 +387,52 @@ class MainActivity : AppCompatActivity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == 1001 && allPermissionsGranted()) viewFinder?.post { startCamera() }
     }
+    
     private fun allPermissionsGranted() = arrayOf(Manifest.permission.CAMERA).all { ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED }
+    
     override fun onDestroy() {
         synchronized(bitmapLock) { lastCapturedBitmap?.recycle(); lastCapturedBitmap = null }
         nativeBackgroundView?.setImageDrawable(null); displayedBitmap?.recycle(); displayedBitmap = null
         cameraExecutor.shutdownNow(); precomputeExecutor.shutdownNow(); maskExecutor.shutdownNow()
         super.onDestroy()
     }
+
+    // 🌟 누락되었던 핵심 확장 함수: ImageProxy를 정방향 Bitmap으로 변환
+    private fun ImageProxy.toUprightBitmap(): Bitmap {
+        val buffer = planes[0].buffer
+        val bytes = ByteArray(buffer.remaining())
+        buffer.get(bytes)
+
+        // ImageCapture는 기본적으로 JPEG를 반환하므로 BitmapFactory로 즉시 디코딩 가능
+        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+
+        val matrix = Matrix().apply {
+            postRotate(imageInfo.rotationDegrees.toFloat())
+        }
+
+        val rotatedBitmap = Bitmap.createBitmap(
+            bitmap,
+            0,
+            0,
+            bitmap.width,
+            bitmap.height,
+            matrix,
+            true
+        )
+
+        // 원본과 회전된 객체가 다르다면 원본 메모리 즉시 해제
+        if (rotatedBitmap != bitmap) {
+            bitmap.recycle()
+        }
+
+        // OpenCV 처리를 위해 안전한 ARGB_8888 포맷으로 복제 후 반환
+        val finalBitmap = rotatedBitmap.copy(Bitmap.Config.ARGB_8888, true)
+        if (finalBitmap != rotatedBitmap) {
+            rotatedBitmap.recycle()
+        }
+
+        return finalBitmap
+    }
+
     companion object { private const val REQUEST_CODE_PERMISSIONS = 1001; private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA) }
 }
