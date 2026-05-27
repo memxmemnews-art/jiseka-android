@@ -320,20 +320,40 @@ class MainActivity : AppCompatActivity() {
         bgView.invalidate() 
     }
 
-    private fun handleCrosshairMove(uiPoint: PointF) {
+private fun handleCrosshairMove(uiPoint: PointF) {
         if (!isMatrixReady || precalculatedCandidates.isEmpty()) return
         matrixMappingBuffer[0] = uiPoint.x; matrixMappingBuffer[1] = uiPoint.y
         inverseMatrix.mapPoints(matrixMappingBuffer)
         val bitmapX = matrixMappingBuffer[0]; val bitmapY = matrixMappingBuffer[1]
-        var bestPolygon: List<ImmutablePoint>? = null; var minArea = Float.MAX_VALUE
+        
+        var bestPolygon: List<ImmutablePoint>? = null
+        var minArea = Float.MAX_VALUE
 
         for (candidate in precalculatedCandidates) {
-            if (candidate.bounds.contains(bitmapX, bitmapY) && isPointInPolygon(bitmapX, bitmapY, candidate.points)) {
-                val area = candidate.bounds.width() * candidate.bounds.height()
-                if (area < minArea) { minArea = area; bestPolygon = candidate.points }
+            // 1. 고속 필터링 (축 정렬 박스 내부에 있는지 먼저 빠르게 확인)
+            if (candidate.bounds.contains(bitmapX, bitmapY)) {
+                // 2. 정밀 확인 (실제 회전된 폴리곤 내부에 터치 좌표가 들어왔는지 확인)
+                if (isPointInPolygon(bitmapX, bitmapY, candidate.points)) {
+                    
+                    // 🌟 3. 가장 치명적인 문제 해결 (면적 계산)
+                    // 기존코드: candidate.bounds.width() * candidate.bounds.height() -> 축 정렬 사각형이라 기울어지면 거대해짐
+                    // 수정코드: 신발끈 공식(Shoelace formula)을 이용하여 회전된 폴리곤의 '진짜' 면적 계산
+                    val pts = candidate.points
+                    val actualArea = 0.5f * Math.abs(
+                        pts[0].x * pts[1].y + pts[1].x * pts[2].y + pts[2].x * pts[3].y + pts[3].x * pts[0].y -
+                        (pts[1].x * pts[0].y + pts[2].x * pts[1].y + pts[3].x * pts[2].y + pts[0].x * pts[3].y)
+                    )
+                    
+                    if (actualArea < minArea) { 
+                        minArea = actualArea
+                        bestPolygon = candidate.points 
+                    }
+                }
             }
         }
+        
         currentlyHoveredBitmapPolygon = bestPolygon
+        
         if (bestPolygon != null) {
             for (i in 0 until 4) {
                 val pt = bestPolygon[i]; matrixMappingBuffer[0] = pt.x; matrixMappingBuffer[1] = pt.y
