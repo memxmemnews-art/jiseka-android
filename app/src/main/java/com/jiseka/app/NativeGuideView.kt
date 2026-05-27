@@ -21,14 +21,14 @@ class NativeGuideView @JvmOverloads constructor(
     var onCrosshairMoveListener: ((PointF) -> Unit)? = null
     var onCrosshairDropListener: (() -> Unit)? = null
     
-    // 현재 정밀도 레벨(0 또는 1)을 액티비티로 전달하는 리스너
+    // 🌟 시그니처 일치: 정밀도 레벨을 전달하는 리스너
     var onDwellTriggeredListener: ((Int) -> Unit)? = null
 
     private var crosshairPoint: PointF? = null
     private val uiPolygonBuffer = Array(4) { PointF() }
     private var hasHoveredPolygon = false
 
-    // 🌟 다단계 Progressive Refinement 제어기
+    // 🌟 내부 독점 상태 머신 (State Machine)
     private val dwellHandler = Handler(Looper.getMainLooper())
     private var isDwelling = false
     private var refinementLevel = 0
@@ -38,7 +38,6 @@ class NativeGuideView @JvmOverloads constructor(
     private var lastMoveY = 0f
     private val touchSlop = 15f 
 
-    // 레벨 0에서는 1.5초 대기, 레벨 1에서는 1.0초 대기
     private fun getCurrentDwellTime() = if (refinementLevel == 0) 1500L else 1000L
 
     private val dwellRunnable = Runnable {
@@ -49,19 +48,28 @@ class NativeGuideView @JvmOverloads constructor(
         }
     }
 
-    // 🌟 엔진 연산 종료 후 다음 단계 타이머 재장전
+    // 🌟 구조 불일치 해결: 성공 여부에 따라 다단계 타이머를 관리하는 코어 함수
     fun notifyRefinementCompleted(success: Boolean) {
         if (success && refinementLevel < MAX_REFINEMENT_LEVEL) {
             refinementLevel++
-            isDwelling = false 
-            
-            dwellHandler.removeCallbacks(dwellRunnable)
-            if (refinementLevel < MAX_REFINEMENT_LEVEL) {
-                dwellHandler.postDelayed(dwellRunnable, getCurrentDwellTime())
-            }
-        } else {
-            isDwelling = false
         }
+        
+        isDwelling = false 
+        
+        if (refinementLevel < MAX_REFINEMENT_LEVEL) {
+            dwellHandler.removeCallbacks(dwellRunnable)
+            dwellHandler.postDelayed(dwellRunnable, getCurrentDwellTime())
+        }
+        postInvalidateOnAnimation()
+    }
+
+    // 🌟 생명주기 동기화: 액티비티 초기화 시 뷰 내부 상태도 리셋
+    fun resetState() {
+        dwellHandler.removeCallbacks(dwellRunnable)
+        isDwelling = false
+        refinementLevel = 0
+        hasHoveredPolygon = false
+        crosshairPoint = null
         postInvalidateOnAnimation()
     }
 
@@ -71,7 +79,6 @@ class NativeGuideView @JvmOverloads constructor(
 
     private val hoverStrokePaint = Paint().apply { style = Paint.Style.STROKE; strokeWidth = 8f; isAntiAlias = true }
     private val hoverFillPaint = Paint().apply { color = Color.parseColor("#4400FF00"); style = Paint.Style.FILL }
-
     private val polygonPath = Path()
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
@@ -100,7 +107,6 @@ class NativeGuideView @JvmOverloads constructor(
             polygonPath.lineTo(uiPolygonBuffer[3].x, uiPolygonBuffer[3].y)
             polygonPath.close()
 
-            // 🌟 시각적 피드백: 레벨 0(초록) -> 레벨 1(시안) -> 레벨 2(노랑)
             hoverStrokePaint.color = when (refinementLevel) {
                 0 -> Color.GREEN
                 1 -> Color.CYAN
@@ -140,14 +146,12 @@ class NativeGuideView @JvmOverloads constructor(
             }
             MotionEvent.ACTION_MOVE -> {
                 crosshairPoint?.set(x, y)
-                
                 if (Math.abs(x - lastMoveX) > touchSlop || Math.abs(y - lastMoveY) > touchSlop) {
                     refinementLevel = 0; isDwelling = false
                     lastMoveX = x; lastMoveY = y
                     dwellHandler.removeCallbacks(dwellRunnable)
                     dwellHandler.postDelayed(dwellRunnable, getCurrentDwellTime())
                 }
-
                 onCrosshairMoveListener?.invoke(PointF(x, y))
                 postInvalidateOnAnimation()
                 return true
