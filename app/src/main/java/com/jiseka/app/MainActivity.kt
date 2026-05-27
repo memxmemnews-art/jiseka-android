@@ -4,7 +4,6 @@ import android.Manifest
 import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.PointF
@@ -232,6 +231,7 @@ class MainActivity : AppCompatActivity() {
         imageCapture?.takePicture(cameraExecutor, object : ImageCapture.OnImageCapturedCallback() {
             override fun onCaptureSuccess(imageProxy: ImageProxy) {
                 try {
+                    // 🌟 ImageProxyExtensions.kt 에 정의된 확장 함수를 전역적으로 호출합니다.
                     val uprightBitmap = imageProxy.toUprightBitmap()
                     synchronized(bitmapLock) { lastCapturedBitmap?.recycle(); lastCapturedBitmap = uprightBitmap }
                     runOnUiThread {
@@ -362,7 +362,7 @@ class MainActivity : AppCompatActivity() {
                     blendedF.convertTo(matChannels[i], CvType.CV_8U)
                 } finally { 
                     mcF?.release(); ccF?.release(); blendedF?.release()
-                    invAlpha?.release(); scalarMat?.release() // 누락되었던 릴리즈 확보
+                    invAlpha?.release(); scalarMat?.release()
                 }
             }
             Core.merge(matChannels, mat)
@@ -395,43 +395,6 @@ class MainActivity : AppCompatActivity() {
         nativeBackgroundView?.setImageDrawable(null); displayedBitmap?.recycle(); displayedBitmap = null
         cameraExecutor.shutdownNow(); precomputeExecutor.shutdownNow(); maskExecutor.shutdownNow()
         super.onDestroy()
-    }
-
-    // 🌟 누락되었던 핵심 확장 함수: ImageProxy를 정방향 Bitmap으로 변환
-    private fun ImageProxy.toUprightBitmap(): Bitmap {
-        val buffer = planes[0].buffer
-        val bytes = ByteArray(buffer.remaining())
-        buffer.get(bytes)
-
-        // ImageCapture는 기본적으로 JPEG를 반환하므로 BitmapFactory로 즉시 디코딩 가능
-        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-
-        val matrix = Matrix().apply {
-            postRotate(imageInfo.rotationDegrees.toFloat())
-        }
-
-        val rotatedBitmap = Bitmap.createBitmap(
-            bitmap,
-            0,
-            0,
-            bitmap.width,
-            bitmap.height,
-            matrix,
-            true
-        )
-
-        // 원본과 회전된 객체가 다르다면 원본 메모리 즉시 해제
-        if (rotatedBitmap != bitmap) {
-            bitmap.recycle()
-        }
-
-        // OpenCV 처리를 위해 안전한 ARGB_8888 포맷으로 복제 후 반환
-        val finalBitmap = rotatedBitmap.copy(Bitmap.Config.ARGB_8888, true)
-        if (finalBitmap != rotatedBitmap) {
-            rotatedBitmap.recycle()
-        }
-
-        return finalBitmap
     }
 
     companion object { private const val REQUEST_CODE_PERMISSIONS = 1001; private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA) }
