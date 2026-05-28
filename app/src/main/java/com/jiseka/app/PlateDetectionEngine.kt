@@ -23,7 +23,6 @@ object PlateDetectionEngine {
             Imgproc.bilateralFilter(grayMat, bilateralMat, 9, 15.0, 15.0)
             Imgproc.Canny(bilateralMat, edgeMat, 60.0, 180.0)
             
-            // 🌟 1. 글자 연결성은 유지하면서 대각선 윤곽을 보존하는 절충형 커널로 변경
             morphKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(9.0, 3.0))
             Imgproc.morphologyEx(edgeMat, edgeMat, Imgproc.MORPH_CLOSE, morphKernel)
             Imgproc.findContours(edgeMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
@@ -32,8 +31,6 @@ object PlateDetectionEngine {
 
             for (contour in contours) {
                 val contour2f = MatOfPoint2f(*contour.toArray())
-                
-                // 🌟 핵심: minAreaRect를 통해 회전 정보를 유지한 사각형 추출
                 val rotatedRect = Imgproc.minAreaRect(contour2f)
                 
                 val rectW = max(rotatedRect.size.width, rotatedRect.size.height)
@@ -42,16 +39,22 @@ object PlateDetectionEngine {
                 
                 val aspectRatio = rectW / rectH
                 
-                // 🌟 2. 크게 기울어진 번호판도 허용할 수 있도록 비율 범위 확장 (기존 2.3~5.7)
                 if (aspectRatio in 1.8..6.0) {
                     val roughPoints = arrayOfNulls<Point>(4)
                     rotatedRect.points(roughPoints)
                     
                     val immutablePoints = roughPoints.filterNotNull().map { ImmutablePoint(it.x.toFloat(), it.y.toFloat()) }
-                    val xCoords = immutablePoints.map { it.x }; val yCoords = immutablePoints.map { it.y }
-                    val bounds = RectF(xCoords.min(), yCoords.min(), xCoords.max(), yCoords.max())
+                    val xCoords = immutablePoints.map { it.x }
+                    val yCoords = immutablePoints.map { it.y }
                     
-                    // 회전된 4개의 꼭짓점 포인트와 축 정렬 바운드 박스를 함께 저장
+                    // 🌟 널 안정성이 확보된 RectF 바운딩 박스 생성
+                    val bounds = RectF(
+                        xCoords.minOrNull() ?: 0f,
+                        yCoords.minOrNull() ?: 0f,
+                        xCoords.maxOrNull() ?: 0f,
+                        yCoords.maxOrNull() ?: 0f
+                    )
+                    
                     candidates.add(CandidatePolygon(immutablePoints, bounds))
                 }
             }
@@ -67,10 +70,11 @@ object PlateDetectionEngine {
     fun refineAnchoredPolygon(fullBitmap: Bitmap, anchorPolygon: List<ImmutablePoint>, targetLevel: Int): List<ImmutablePoint>? {
         val padding = if (targetLevel == 1) 30f else 15f 
         
-        val minX = anchorPolygon.minOf { it.x } - padding
-        val minY = anchorPolygon.minOf { it.y } - padding
-        val maxX = anchorPolygon.maxOf { it.x } + padding
-        val maxY = anchorPolygon.maxOf { it.y } + padding
+        // 🌟 minOf/maxOf 역시 런타임 예외 방지를 위해 minOfOrNull/maxOfOrNull로 보강
+        val minX = (anchorPolygon.minOfOrNull { it.x } ?: 0f) - padding
+        val minY = (anchorPolygon.minOfOrNull { it.y } ?: 0f) - padding
+        val maxX = (anchorPolygon.maxOfOrNull { it.x } ?: 0f) + padding
+        val maxY = (anchorPolygon.maxOfOrNull { it.y } ?: 0f) + padding
 
         val safeRect = android.graphics.Rect(
             max(0, minX.toInt()), max(0, minY.toInt()),
@@ -112,7 +116,6 @@ object PlateDetectionEngine {
                 if (candArea / anchorArea !in 0.7..1.3) continue 
                 if (Math.hypot(candGlobalCenter.x - anchorCenter.x, candGlobalCenter.y - anchorCenter.y) > 30.0) continue 
                 
-                // 🌟 3. 각도 차이 허용 범위 확장 (기울어진 상태에서 재검색 시 실패 방지)
                 val angleDiff = Math.abs(anchorAngle - candRect.angle)
                 if (angleDiff > 15.0 && angleDiff < 75.0) continue 
 
