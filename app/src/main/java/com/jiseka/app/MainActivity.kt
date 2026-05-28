@@ -272,38 +272,77 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
-    private fun ImageProxy.toUprightBitmapInternal(): Bitmap {
+private fun ImageProxy.toUprightBitmapInternal(): Bitmap {
+        // 1. 버퍼에서 원본 ByteArray 추출 (JPEG 포맷 전제)
         val buffer = planes[0].buffer
         val bytes = ByteArray(buffer.remaining())
         buffer.get(bytes)
+
         val originalBitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
 
-        val rect = this.cropRect
-        val safeLeft = rect.left.coerceIn(0, originalBitmap.width - 1)
-        val safeTop = rect.top.coerceIn(0, originalBitmap.height - 1)
-        val safeWidth = rect.width().coerceAtMost(originalBitmap.width - safeLeft)
-        val safeHeight = rect.height().coerceAtMost(originalBitmap.height - safeTop)
+        // 2. 센서 방향에 맞춰 우선 회전 (가로/세로 방향성을 실제 눈에 보이는 대로 정렬)
+        val rotateMatrix = Matrix().apply {
+            postRotate(imageInfo.rotationDegrees.toFloat())
+        }
 
-        if (safeWidth <= 0 || safeHeight <= 0) {
-            val fallbackBitmap = originalBitmap.copy(Bitmap.Config.ARGB_8888, true)
+        val rotatedBitmap = Bitmap.createBitmap(
+            originalBitmap,
+            0,
+            0,
+            originalBitmap.width,
+            originalBitmap.height,
+            rotateMatrix,
+            true
+        )
+
+        if (rotatedBitmap != originalBitmap) {
             originalBitmap.recycle()
-            return fallbackBitmap
         }
 
-        val croppedBitmap = Bitmap.createBitmap(originalBitmap, safeLeft, safeTop, safeWidth, safeHeight)
-        if (croppedBitmap != originalBitmap) {
-            originalBitmap.recycle()
+        // 3. 스마트폰 화면(PreviewView)의 실제 렌더 영역 비율 계산
+        val viewFinderWidth = viewFinder?.width ?: 1
+        val viewFinderHeight = viewFinder?.height ?: 1
+        
+        val targetRatio = viewFinderWidth.toFloat() / viewFinderHeight.toFloat()
+        
+        val bmpWidth = rotatedBitmap.width
+        val bmpHeight = rotatedBitmap.height
+        val bmpRatio = bmpWidth.toFloat() / bmpHeight.toFloat()
+
+        var cropWidth = bmpWidth
+        var cropHeight = bmpHeight
+
+        // 4. 화면 비율과 일치하도록 정중앙을 기준으로 크롭 영역 계산 (CENTER_CROP 알고리즘)
+        if (bmpRatio > targetRatio) {
+            // 비트맵이 화면보다 가로로 더 넓은 경우 -> 좌우를 잘라냄
+            cropHeight = bmpHeight
+            cropWidth = (bmpHeight * targetRatio).toInt()
+        } else {
+            // 비트맵이 화면보다 세로로 더 긴 경우 -> 상하를 잘라냄
+            cropWidth = bmpWidth
+            cropHeight = (bmpWidth / targetRatio).toInt()
         }
 
-        val matrix = Matrix().apply { postRotate(imageInfo.rotationDegrees.toFloat()) }
-        val rotatedBitmap = Bitmap.createBitmap(croppedBitmap, 0, 0, croppedBitmap.width, croppedBitmap.height, matrix, true)
-        if (rotatedBitmap != croppedBitmap) {
-            croppedBitmap.recycle()
-        }
+        val left = (bmpWidth - cropWidth) / 2
+        val top = (bmpHeight - cropHeight) / 2
 
-        val finalBitmap = rotatedBitmap.copy(Bitmap.Config.ARGB_8888, true)
-        if (finalBitmap != rotatedBitmap) {
+        // 5. 계산된 영역만큼 최종 크롭
+        val croppedBitmap = Bitmap.createBitmap(
+            rotatedBitmap,
+            left,
+            top,
+            cropWidth,
+            cropHeight
+        )
+
+        if (croppedBitmap != rotatedBitmap) {
             rotatedBitmap.recycle()
+        }
+
+        // 6. OpenCV 하드웨어 연산 호환성을 위해 ARGB_8888로 최종 복제
+        val finalBitmap = croppedBitmap.copy(Bitmap.Config.ARGB_8888, true)
+        if (finalBitmap != croppedBitmap) {
+            croppedBitmap.recycle()
         }
 
         return finalBitmap
