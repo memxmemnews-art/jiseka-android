@@ -96,8 +96,6 @@ class MainActivity : AppCompatActivity() {
         viewFinder?.scaleType = PreviewView.ScaleType.FILL_CENTER
         
         nativeBackgroundView = findViewById(R.id.nativeBackgroundView)
-        
-        // 🌟 수정 완료: ImageView 호환 옵션 적용 (빌드 에러 해결)
         nativeBackgroundView?.scaleType = ImageView.ScaleType.CENTER_CROP
         
         nativeGuideView = findViewById(R.id.nativeGuideView)
@@ -147,8 +145,16 @@ class MainActivity : AppCompatActivity() {
                         runOnUiThread {
                             if (tightenedPolygon != null && tightenedPolygon != anchorSnapshot && captureSessionId.get() == currentSession) {
                                 currentlyHoveredBitmapPolygon = tightenedPolygon
-                                val xCoords = tightenedPolygon.map { it.x }; val yCoords = tightenedPolygon.map { it.y }
-                                val newBounds = RectF(xCoords.min(), yCoords.min(), xCoords.max(), yCoords.max())
+                                val xCoords = tightenedPolygon.map { it.x }
+                                val yCoords = tightenedPolygon.map { it.y }
+                                
+                                // 🌟 널 안정성이 확보된 RectF 바운딩 박스 생성
+                                val newBounds = RectF(
+                                    xCoords.minOrNull() ?: 0f,
+                                    yCoords.minOrNull() ?: 0f,
+                                    xCoords.maxOrNull() ?: 0f,
+                                    yCoords.maxOrNull() ?: 0f
+                                )
                                 precalculatedCandidates = precalculatedCandidates.map { 
                                     if (it.points == anchorSnapshot) CandidatePolygon(tightenedPolygon, newBounds) else it 
                                 }
@@ -195,8 +201,6 @@ class MainActivity : AppCompatActivity() {
         pendingMaskRequest = false
         
         btnCapture?.isEnabled = true
-        
-        // 🌟 수정 완료: Canvas 렌더링 충돌 방지를 위해 먼저 뷰와 연결을 끊음
         nativeBackgroundView?.setImageDrawable(null)
         displayedBitmap?.recycle()
         displayedBitmap = null
@@ -280,7 +284,6 @@ class MainActivity : AppCompatActivity() {
         val safeWidth = rect.width().coerceAtMost(originalBitmap.width - safeLeft)
         val safeHeight = rect.height().coerceAtMost(originalBitmap.height - safeTop)
 
-        // 🌟 수정 완료: 계산된 크롭 영역이 유효하지 않을 때 크래시 방지 및 원본 반환
         if (safeWidth <= 0 || safeHeight <= 0) {
             val fallbackBitmap = originalBitmap.copy(Bitmap.Config.ARGB_8888, true)
             originalBitmap.recycle()
@@ -388,7 +391,6 @@ class MainActivity : AppCompatActivity() {
                         nativeBackgroundView?.setImageBitmap(resultBitmap)
                         displayedBitmap = resultBitmap
                         
-                        // 🌟 수정 완료: Canvas 렌더 꼬임 방지를 위해 post 블록에서 이전 뷰를 확실히 해제
                         oldBitmap?.let { bmp -> 
                             nativeBackgroundView?.post { if (!bmp.isRecycled) bmp.recycle() } 
                         }
