@@ -5,72 +5,113 @@ import android.graphics.RectF
 import org.opencv.android.Utils
 import org.opencv.core.*
 import org.opencv.imgproc.Imgproc
+import kotlin.math.abs
+import kotlin.math.acos
+import kotlin.math.cos
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sin
+
+// 스레드 안전성을 보장하는 불변 포인트
+data class ImmutablePoint(val x: Float, val y: Float)
+
+// 1차 고속 필터링(바운딩 박스)과 2차 정밀 다각형을 묶어둔 앵커 데이터
+data class CandidatePolygon(
+    val points: List<ImmutablePoint>,
+    val bounds: RectF
+)
 
 object PlateDetectionEngine {
 
+    /**
+     * 1. 전체 이미지 대상: 1차 다각형 후보군 사전 계산
+     */
     fun precalculateGeometryCandidates(fullBitmap: Bitmap): List<CandidatePolygon> {
         val candidates = mutableListOf<CandidatePolygon>()
         val mat = Mat(); val grayMat = Mat(); val bilateralMat = Mat()
-        val edgeMat = Mat(); val hierarchy = Mat()
-        val contours = ArrayList<MatOfPoint>(); var morphKernel: Mat? = null
+        val tophatMat = Mat(); val edgeMat = Mat(); val hierarchy = Mat()
+        val contours = ArrayList<MatOfPoint>()
+        var topHatKernel: Mat? = null; var morphKernel: Mat? = null
+        var clahe: org.opencv.imgproc.CLAHE? = null
 
         try {
             Utils.bitmapToMat(fullBitmap, mat)
             Imgproc.cvtColor(mat, grayMat, Imgproc.COLOR_RGBA2GRAY)
             
-            Imgproc.bilateralFilter(grayMat, bilateralMat, 9, 15.0, 15.0)
-            Imgproc.Canny(bilateralMat, edgeMat, 60.0, 180.0)
+            // 국부 조도 보정
+            clahe = Imgproc.createCLAHE(2.0, Size(8.0, 8.0))
+            clahe.apply(grayMat, grayMat)
             
+            // 양방향 필터 (엣지 보존)
+            Imgproc.bilateralFilter(grayMat, bilateralMat, 5, 20.0, 20.0)
+            
+            // Top-Hat 변환 (그림자/빛반사 전역 평활화)
+            topHatKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(25.0, 9.0))
+            Imgproc.morphologyEx(bilateralMat, tophatMat, Imgproc.MORPH_TOPHAT, topHatKernel)
+            
+            // 동적 Canny
+            val meanVal = Core.mean(tophatMat).`val`[0]
+            val sigma = 0.33
+            val lowerThresh = max(0.0, (1.0 - sigma) * meanVal)
+            val upperThresh = min(255.0, (1.0 + sigma) * meanVal)
+            Imgproc.Canny(tophatMat, edgeMat, lowerThresh, upperThresh)
+            
+            // 선 닫힘 유도
             morphKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(9.0, 3.0))
             Imgproc.morphologyEx(edgeMat, edgeMat, Imgproc.MORPH_CLOSE, morphKernel)
+            
             Imgproc.findContours(edgeMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
             val minPlateHeight = fullBitmap.height * 0.025
 
             for (contour in contours) {
-                val contour2f = MatOfPoint2f(*contour.toArray())
-                val rotatedRect = Imgproc.minAreaRect(contour2f)
+                val rect = Imgproc.boundingRect(contour)
+                if (rect.height < minPlateHeight) continue
                 
-                val rectW = max(rotatedRect.size.width, rotatedRect.size.height)
-                val rectH = min(rotatedRect.size.width, rotatedRect.size.height)
-                if (rectH < minPlateHeight) continue 
+                // 1차 다각형 추출 (이진 탐색)
+                val approxPoints = extractRobustQuadrilateral(contour) ?: continue
                 
-                val aspectRatio = rectW / rectH
-                
-                if (aspectRatio in 1.8..6.0) {
-                    val roughPoints = arrayOfNulls<Point>(4)
-                    rotatedRect.points(roughPoints)
-                    
-                    val immutablePoints = roughPoints.filterNotNull().map { ImmutablePoint(it.x.toFloat(), it.y.toFloat()) }
-                    val xCoords = immutablePoints.map { it.x }
-                    val yCoords = immutablePoints.map { it.y }
-                    
-                    // 🌟 널 안정성이 확보된 RectF 바운딩 박스 생성
-                    val bounds = RectF(
-                        xCoords.minOrNull() ?: 0f,
-                        yCoords.minOrNull() ?: 0f,
-                        xCoords.maxOrNull() ?: 0f,
-                        yCoords.maxOrNull() ?: 0f
-                    )
-                    
-                    candidates.add(CandidatePolygon(immutablePoints, bounds))
+                // 2차 기하학적 사전 지식 필터링 (볼록성, 내각, 투영 종횡비 검증)
+                val pointArray = approxPoints.toArray()
+                if (!isValidLicensePlateGeometry(pointArray)) {
+                    approxPoints.release()
+                    continue
                 }
+
+                // 3차 서브픽셀 미세 보정
+                val refinedPoints = applySubPixelCorrection(grayMat, approxPoints)
+                approxPoints.release()
+
+                val immutablePoints = refinedPoints.map { ImmutablePoint(it.x.toFloat(), it.y.toFloat()) }
+                val xCoords = immutablePoints.map { it.x }
+                val yCoords = immutablePoints.map { it.y }
+                
+                val bounds = RectF(
+                    xCoords.minOrNull() ?: 0f,
+                    yCoords.minOrNull() ?: 0f,
+                    xCoords.maxOrNull() ?: 0f,
+                    yCoords.maxOrNull() ?: 0f
+                )
+                
+                candidates.add(CandidatePolygon(immutablePoints, bounds))
             }
             return candidates
-        } catch (e: Exception) {
-            return emptyList()
         } finally {
             mat.release(); grayMat.release(); bilateralMat.release()
-            edgeMat.release(); hierarchy.release(); contours.forEach { it.release() }; morphKernel?.release()
+            tophatMat.release(); edgeMat.release(); hierarchy.release()
+            contours.forEach { it.release() }
+            topHatKernel?.release(); morphKernel?.release()
+            clahe?.collectGarbage()
         }
     }
 
+    /**
+     * 2. 관심 영역(ROI) 대상: 십자선 정밀 추적 및 롱프레스(Dwell) 대응 복원
+     */
     fun refineAnchoredPolygon(fullBitmap: Bitmap, anchorPolygon: List<ImmutablePoint>, targetLevel: Int): List<ImmutablePoint>? {
-        val padding = if (targetLevel == 1) 30f else 15f 
+        val padding = if (targetLevel == 1) 40f else 20f 
         
-        // 🌟 minOf/maxOf 역시 런타임 예외 방지를 위해 minOfOrNull/maxOfOrNull로 보강
         val minX = (anchorPolygon.minOfOrNull { it.x } ?: 0f) - padding
         val minY = (anchorPolygon.minOfOrNull { it.y } ?: 0f) - padding
         val maxX = (anchorPolygon.maxOfOrNull { it.x } ?: 0f) + padding
@@ -85,56 +126,16 @@ object PlateDetectionEngine {
 
         val roiBitmap = Bitmap.createBitmap(fullBitmap, safeRect.left, safeRect.top, safeRect.width(), safeRect.height())
 
-        val anchorMatOfPoint2f = MatOfPoint2f(*anchorPolygon.map { Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
-        val anchorRotatedRect = Imgproc.minAreaRect(anchorMatOfPoint2f)
-        val anchorArea = anchorRotatedRect.size.width * anchorRotatedRect.size.height
-        val anchorCenter = anchorRotatedRect.center
-        val anchorAngle = anchorRotatedRect.angle
-
-        val roiMat = Mat(); val roiGray = Mat(); val roiEdge = Mat(); val roiContours = ArrayList<MatOfPoint>()
-        var bestTightPolygon: List<ImmutablePoint>? = null
+        val roiMat = Mat(); val roiGray = Mat(); val roiEdge = Mat()
+        val roiContours = ArrayList<MatOfPoint>()
+        var bestGlobalPoints: List<ImmutablePoint>? = null
         
         try {
             Utils.bitmapToMat(roiBitmap, roiMat)
             Imgproc.cvtColor(roiMat, roiGray, Imgproc.COLOR_RGBA2GRAY)
             
-            val cannyThresh1 = if (targetLevel == 1) 40.0 else 20.0
-            val cannyThresh2 = if (targetLevel == 1) 120.0 else 60.0
+            // ROI 영역에 대해서도 CLAHE와 Top-Hat 적용
+            val clahe = Imgproc.createCLAHE(2.0, Size(4.0, 4.0))
+            clahe.apply(roiGray, roiGray)
             
-            Imgproc.Canny(roiGray, roiEdge, cannyThresh1, cannyThresh2) 
-            Imgproc.findContours(roiEdge, roiContours, Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
-
-            var minAreaDiff = Double.MAX_VALUE
-
-            for (contour in roiContours) {
-                val contour2f = MatOfPoint2f(*contour.toArray())
-                val candRect = Imgproc.minAreaRect(contour2f)
-                
-                val candArea = candRect.size.width * candRect.size.height
-                val candGlobalCenter = Point(candRect.center.x + safeRect.left, candRect.center.y + safeRect.top)
-
-                if (candArea / anchorArea !in 0.7..1.3) continue 
-                if (Math.hypot(candGlobalCenter.x - anchorCenter.x, candGlobalCenter.y - anchorCenter.y) > 30.0) continue 
-                
-                val angleDiff = Math.abs(anchorAngle - candRect.angle)
-                if (angleDiff > 15.0 && angleDiff < 75.0) continue 
-
-                val areaDiff = Math.abs(anchorArea - candArea)
-                if (areaDiff < minAreaDiff) {
-                    minAreaDiff = areaDiff
-                    val candPoints = arrayOfNulls<Point>(4)
-                    candRect.points(candPoints)
-                    bestTightPolygon = candPoints.filterNotNull().map { 
-                        ImmutablePoint((it.x + safeRect.left).toFloat(), (it.y + safeRect.top).toFloat()) 
-                    }
-                }
-            }
-        } finally {
-            roiMat.release(); roiGray.release(); roiEdge.release()
-            roiContours.forEach { it.release() }; anchorMatOfPoint2f.release()
-            roiBitmap.recycle()
-        }
-
-        return bestTightPolygon
-    }
-}
+            // Dwell(targetLevel 1) 시 Canny 하한선을 강제로 낮춰 숨겨진 엣지까지 모두 끌어
