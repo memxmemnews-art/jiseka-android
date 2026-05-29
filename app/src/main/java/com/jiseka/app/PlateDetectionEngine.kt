@@ -13,13 +13,8 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
 
-// 💡 주의: ImmutablePoint와 CandidatePolygon data class는 이미 다른 곳에 있으므로 여기서는 제거했습니다.
-
 object PlateDetectionEngine {
 
-    /**
-     * 1. 전체 이미지 대상: 1차 다각형 후보군 사전 계산
-     */
     fun precalculateGeometryCandidates(fullBitmap: Bitmap): List<CandidatePolygon> {
         val candidates = mutableListOf<CandidatePolygon>()
         val mat = Mat(); val grayMat = Mat(); val bilateralMat = Mat()
@@ -51,16 +46,42 @@ object PlateDetectionEngine {
             
             Imgproc.findContours(edgeMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
+            // 🌟 1. 기준치 사전 계산 (타입 일관성 확보 및 권장 물리적 한계치 적용)
+            val totalArea = fullBitmap.width * fullBitmap.height.toDouble()
             val minPlateHeight = fullBitmap.height * 0.025
+            val maxPlateHeight = fullBitmap.height * 0.22
+            val maxPlateWidth = fullBitmap.width * 0.55
+            val maxPlateArea = totalArea * 0.12
+            val maxPolygonArea = totalArea * 0.15 
 
             for (contour in contours) {
                 val rect = Imgproc.boundingRect(contour)
-                if (rect.height < minPlateHeight) continue
+                
+                // 🌟 2. 이미지 가장자리(Border) 접촉 Contour 원천 제거
+                if (rect.x <= 2 || rect.y <= 2 || 
+                    rect.x + rect.width >= fullBitmap.width - 2 || 
+                    rect.y + rect.height >= fullBitmap.height - 2) {
+                    continue
+                }
+
+                // 🌟 3. 거대 Contour 후보 사전 필터링 (높이, 너비, 면적)
+                val area = Imgproc.contourArea(contour)
+                if (rect.height < minPlateHeight || rect.height > maxPlateHeight || 
+                    rect.width > maxPlateWidth || area > maxPlateArea) {
+                    continue
+                }
                 
                 val approxPoints = extractRobustQuadrilateral(contour) ?: continue
                 
                 val pointArray = approxPoints.toArray()
-                if (!isValidLicensePlateGeometry(pointArray)) {
+                
+                // 🌟 4. Polygon 면적 및 Bounding Box 크기 제한 파라미터 전달
+                if (!isValidLicensePlateGeometry(
+                        pointArray, 
+                        maxPolygonArea, 
+                        maxPlateWidth, 
+                        maxPlateHeight
+                )) {
                     approxPoints.release()
                     continue
                 }
@@ -94,9 +115,6 @@ object PlateDetectionEngine {
         }
     }
 
-    /**
-     * 2. 관심 영역(ROI) 대상: 십자선 정밀 추적 및 롱프레스(Dwell) 대응 복원
-     */
     fun refineAnchoredPolygon(fullBitmap: Bitmap, anchorPolygon: List<ImmutablePoint>, targetLevel: Int): List<ImmutablePoint>? {
         val padding = if (targetLevel == 1) 40f else 20f 
         
@@ -117,6 +135,12 @@ object PlateDetectionEngine {
         val roiMat = Mat(); val roiGray = Mat(); val roiEdge = Mat()
         val roiContours = ArrayList<MatOfPoint>()
         var bestGlobalPoints: List<ImmutablePoint>? = null
+        
+        // 🌟 절대적인 번호판 물리적 한계치 계산 (fullBitmap 기준, 타입 일관성 확보)
+        val totalArea = fullBitmap.width * fullBitmap.height.toDouble()
+        val maxPlateWidth = fullBitmap.width * 0.55
+        val maxPlateHeight = fullBitmap.height * 0.22
+        val maxPolygonArea = totalArea * 0.15
         
         try {
             Utils.bitmapToMat(roiBitmap, roiMat)
@@ -146,7 +170,8 @@ object PlateDetectionEngine {
 
                 val approx = extractRobustQuadrilateral(contour)
                 if (approx != null) {
-                    if (isValidLicensePlateGeometry(approx.toArray()) && area > maxArea) {
+                    // 🌟 ROI 내부의 후보군 검증 시에도 동일한 Bounding Box 한계치 적용
+                    if (isValidLicensePlateGeometry(approx.toArray(), maxPolygonArea, maxPlateWidth, maxPlateHeight) && area > maxArea) {
                         maxArea = area
                         bestApprox2f?.release()
                         bestApprox2f = approx
@@ -158,14 +183,16 @@ object PlateDetectionEngine {
 
             if (bestApprox2f == null && targetLevel == 1) {
                 val houghPoints = fallbackToHoughIntersections(roiEdge)
-                if (houghPoints != null && isValidLicensePlateGeometry(houghPoints.toTypedArray())) {
+                // 🌟 Hough 변환 폴백(Fallback) 시 생성된 기하학적 형태에도 동일한 제약 적용
+                if (houghPoints != null && isValidLicensePlateGeometry(houghPoints.toTypedArray(), maxPolygonArea, maxPlateWidth, maxPlateHeight)) {
                     bestApprox2f = MatOfPoint2f(*houghPoints.toTypedArray())
                 }
             }
 
-            if (bestApprox2f != null) {
-                val refinedLocalPoints = applySubPixelCorrection(roiGray, bestApprox2f!!)
-                bestApprox2f!!.release()
+            // 🌟 !! 연산자 제거 및 안전한 스코프 함수(?.let) 사용
+            bestApprox2f?.let { approx ->
+                val refinedLocalPoints = applySubPixelCorrection(roiGray, approx)
+                approx.release()
                 
                 bestGlobalPoints = refinedLocalPoints.map { 
                     ImmutablePoint((it.x + safeRect.left).toFloat(), (it.y + safeRect.top).toFloat()) 
@@ -185,10 +212,6 @@ object PlateDetectionEngine {
 
         return bestGlobalPoints
     }
-
-    // =========================================================================
-    // 💡 아래는 모두 헬퍼 함수입니다. 반드시 object 내부에 위치해야 합니다.
-    // =========================================================================
 
     private fun extractRobustQuadrilateral(contour: MatOfPoint): MatOfPoint2f? {
         val contour2f = MatOfPoint2f(*contour.toArray())
@@ -221,14 +244,28 @@ object PlateDetectionEngine {
         return bestApprox
     }
 
-    private fun isValidLicensePlateGeometry(points: Array<Point>): Boolean {
+    /**
+     * 🌟 기하학적 검증 함수에 BoundingRect 기반 최대 폭/높이 제한 추가
+     */
+    private fun isValidLicensePlateGeometry(
+        points: Array<Point>, 
+        maxAllowedArea: Double = Double.MAX_VALUE,
+        maxWidth: Double = Double.MAX_VALUE,
+        maxHeight: Double = Double.MAX_VALUE
+    ): Boolean {
         if (points.size != 4) return false
 
         val matOfPoint = MatOfPoint(*points)
+        val polygonArea = Imgproc.contourArea(matOfPoint)
         val isConvex = Imgproc.isContourConvex(matOfPoint)
+        
+        // 🌟 최종 4포인트 다각형 기준의 Bounding Box 추출
+        val polygonRect = Imgproc.boundingRect(matOfPoint) 
         matOfPoint.release()
         
-        if (!isConvex) return false
+        // 🌟 다각형 면적 및 가로/세로 한계선 최종 검증 (오목 다각형, 화면 대부분을 덮는 기형적 얇은 다각형 차단)
+        if (!isConvex || polygonArea > maxAllowedArea) return false
+        if (polygonRect.width > maxWidth || polygonRect.height > maxHeight) return false
 
         var minAngleDeg = 180.0
         var maxAngleDeg = 0.0
