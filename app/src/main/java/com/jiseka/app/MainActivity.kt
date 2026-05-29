@@ -110,6 +110,7 @@ class MainActivity : AppCompatActivity() {
         progressBar = findViewById(R.id.progressBar)
 
         cameraExecutor = Executors.newSingleThreadExecutor()
+         
         precomputeExecutor = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(1), ThreadPoolExecutor.DiscardOldestPolicy())
         maskExecutor = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(1), ThreadPoolExecutor.AbortPolicy())
 
@@ -131,6 +132,7 @@ class MainActivity : AppCompatActivity() {
         nativeGuideView?.onCrosshairMoveListener = { uiPoint -> handleCrosshairMove(uiPoint) }
         
         nativeGuideView?.onDwellTriggeredListener = { currentLevel ->
+             
             val anchorSnapshot = currentlyHoveredBitmapPolygon?.toList()
             val currentSession = captureSessionId.get()
             val targetLevel = currentLevel + 1
@@ -142,10 +144,11 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
                 
                 precomputeExecutor.execute {
-                    if (captureSessionId.get() != currentSession) { 
+                   if (captureSessionId.get() != currentSession) { 
                         isRefining = false
                         return@execute 
                     }
+                    
                     val safeBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) }
                     
                     if (safeBitmap != null) {
@@ -154,7 +157,7 @@ class MainActivity : AppCompatActivity() {
 
                         runOnUiThread {
                             if (tightenedPolygon != null && tightenedPolygon != anchorSnapshot && captureSessionId.get() == currentSession) {
-                                currentlyHoveredBitmapPolygon = tightenedPolygon
+                               currentlyHoveredBitmapPolygon = tightenedPolygon
                                 val xCoords = tightenedPolygon.map { it.x }
                                 val yCoords = tightenedPolygon.map { it.y }
                                 
@@ -163,7 +166,7 @@ class MainActivity : AppCompatActivity() {
                                     yCoords.minOrNull() ?: 0f,
                                     xCoords.maxOrNull() ?: 0f,
                                     yCoords.maxOrNull() ?: 0f
-                                )
+                               )
          
                                 precalculatedCandidates = precalculatedCandidates.map { 
                                     if (it.points == anchorSnapshot) CandidatePolygon(tightenedPolygon, newBounds) else it 
@@ -175,7 +178,7 @@ class MainActivity : AppCompatActivity() {
                                     viewMatrix.mapPoints(matrixMappingBuffer)
                                     PointF(matrixMappingBuffer[0], matrixMappingBuffer[1])
                                 }.toTypedArray()
-                                
+                              
                                 nativeGuideView?.setHoveredPolygon(uiTightPolygon)
                                 nativeGuideView?.notifyRefinementCompleted(true)
                             } else {
@@ -229,6 +232,7 @@ class MainActivity : AppCompatActivity() {
         
         viewFinder?.visibility = View.VISIBLE
         btnCapture?.visibility = View.VISIBLE
+         
         nativeGuideView?.visibility = View.GONE
         nativeBackgroundView?.visibility = View.GONE
         resultActionLayout?.visibility = View.GONE
@@ -245,7 +249,6 @@ class MainActivity : AppCompatActivity() {
             
             try {
                 cameraProvider.unbindAll()
-                
                 val viewPort = viewFinder?.viewPort
                 if (viewPort != null) {
                     val useCaseGroup = UseCaseGroup.Builder()
@@ -265,6 +268,7 @@ class MainActivity : AppCompatActivity() {
         btnCapture?.isEnabled = false
         progressBar?.visibility = View.VISIBLE
         btnCapture?.visibility = View.GONE
+         
         val currentSessionId = captureSessionId.incrementAndGet()
         imageCapture?.takePicture(cameraExecutor, object : ImageCapture.OnImageCapturedCallback() {
             override fun onCaptureSuccess(imageProxy: ImageProxy) {
@@ -295,10 +299,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun ImageProxy.toUprightBitmapInternal(): Bitmap {
-        // 🌟 ImageProxy에 담긴 ViewPort 기반의 정밀 CropRect 추출
         val cropRect = this.cropRect
 
-        // 🌟 포맷에 맞춰 디코딩 (YUV or JPEG) 및 정확한 ViewPort Crop 적용
         val croppedOriginalBitmap = if (this.format == ImageFormat.YUV_420_888) {
             yuv420ToCroppedBitmap(this, cropRect)
         } else {
@@ -306,16 +308,14 @@ class MainActivity : AppCompatActivity() {
             val bytes = ByteArray(buffer.remaining())
             buffer.get(bytes)
             
-            // 🌟 디코딩 즉시 null 체크 후 예외 발생 (Fail-Fast)
             val fullBitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                 ?: throw IllegalStateException("Bitmap decode failed: JPEG 데이터를 디코딩할 수 없습니다.")
                 
             val cropped = Bitmap.createBitmap(fullBitmap, cropRect.left, cropRect.top, cropRect.width(), cropRect.height())
             if (cropped != fullBitmap) fullBitmap.recycle()
             cropped
-        }
+         }
 
-        // 🌟 센서 방향에 맞춰 최종 회전
         val rotateMatrix = Matrix().apply {
             postRotate(imageInfo.rotationDegrees.toFloat())
         }
@@ -323,7 +323,8 @@ class MainActivity : AppCompatActivity() {
         val rotatedBitmap = Bitmap.createBitmap(
             croppedOriginalBitmap,
             0, 0,
-            croppedOriginalBitmap.width, croppedOriginalBitmap.height,
+            croppedOriginalBitmap.width, 
+            croppedOriginalBitmap.height,
             rotateMatrix, true
         )
 
@@ -331,18 +332,14 @@ class MainActivity : AppCompatActivity() {
             croppedOriginalBitmap.recycle()
         }
 
-        // 🌟 OpenCV 하드웨어 연산 호환성을 위해 ARGB_8888 복제
         val finalBitmap = rotatedBitmap.copy(Bitmap.Config.ARGB_8888, true)
         if (finalBitmap != rotatedBitmap) {
-            rotatedBitmap.recycle()
+             rotatedBitmap.recycle()
         }
 
         return finalBitmap
     }
 
-    /**
-     * YUV_420_888 포맷을 ViewPort 영역(cropRect)에 맞춰 안전하게 Bitmap으로 변환
-     */
     private fun yuv420ToCroppedBitmap(image: ImageProxy, cropRect: Rect): Bitmap {
         val yBuffer = image.planes[0].buffer
         val uBuffer = image.planes[1].buffer
@@ -360,18 +357,14 @@ class MainActivity : AppCompatActivity() {
 
         val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
         val out = ByteArrayOutputStream()
-        
-        // 🌟 전체 영역 디코딩을 생략하고, YuvImage 자체 기능으로 정밀 영역만 추출하여 압축
+         
         yuvImage.compressToJpeg(cropRect, 100, out)
         
         val imageBytes = out.toByteArray()
-        
-        // 🌟 헬퍼 함수에서도 디코딩 즉시 null 체크 후 예외 발생 보장
         return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
             ?: throw IllegalStateException("Bitmap decode failed: YUV 데이터를 비트맵으로 변환할 수 없습니다.")
     }
 
-    // 🌟 CenterCrop 변환 수동 계산으로 맵핑 오차 원천 차단
     private fun setupMatrixAndPrecalculate(sessionId: Int) {
         val bgView = nativeBackgroundView ?: return
         val safeBitmap = synchronized(bitmapLock) { lastCapturedBitmap } ?: return
@@ -385,7 +378,6 @@ class MainActivity : AppCompatActivity() {
                 val imgW = safeBitmap.width.toFloat()
                 val imgH = safeBitmap.height.toFloat()
                 
-                // 🌟 kotlin.math.max를 사용하여 빌드 안정성 확보
                 val scale = max(viewW / imgW, viewH / imgH)
                 val offsetX = (viewW - (imgW * scale)) / 2f
                 val offsetY = (viewH - (imgH * scale)) / 2f
@@ -393,7 +385,7 @@ class MainActivity : AppCompatActivity() {
                 viewMatrix.reset()
                 viewMatrix.postScale(scale, scale)
                 viewMatrix.postTranslate(offsetX, offsetY)
-                
+         
                 isMatrixReady = viewMatrix.invert(inverseMatrix)
                 
                 nativeGuideView?.visibility = View.VISIBLE
@@ -413,11 +405,23 @@ class MainActivity : AppCompatActivity() {
         bgView.invalidate() 
     }
 
+    /**
+     * 십자선 이동 시 매칭 시스템 검증 로그 통합 버전
+     */
     private fun handleCrosshairMove(uiPoint: PointF) {
-        // 🌟 스레드 안전성(Thread-Safety)을 위한 방어적 복사 (Snapshot)
         val candidatesSnapshot = precalculatedCandidates.toList()
         
-        if (!isMatrixReady || candidatesSnapshot.isEmpty()) return
+        // 🌟 [로그 1] 엔진이 찾은 원본 후보군 총 개수 출력
+        Log.d("DEBUG", "candidate count = ${candidatesSnapshot.size}")
+        
+        if (!isMatrixReady) {
+            Log.d("DEBUG", "[Skip] 역연산 매트릭스(inverseMatrix) 준비 해제 상태")
+            return
+        }
+        if (candidatesSnapshot.isEmpty()) {
+            // 후보군 자체가 0개면 뒤쪽 연산을 수행할 필요 없이 조기 종료
+            return
+        }
         
         matrixMappingBuffer[0] = uiPoint.x
         matrixMappingBuffer[1] = uiPoint.y
@@ -426,17 +430,23 @@ class MainActivity : AppCompatActivity() {
         val bitmapX = matrixMappingBuffer[0]
         val bitmapY = matrixMappingBuffer[1]
         
+        // 🌟 [로그 2] 변환된 비트맵 기준 실제 매핑 픽셀 좌표 출력
+        Log.d("DEBUG", "bitmap point = $bitmapX, $bitmapY")
+        
         var bestPolygon: List<ImmutablePoint>? = null
         var minArea = Float.MAX_VALUE
 
         for (candidate in candidatesSnapshot) {
+            // 🌟 [로그 4] 순회 중인 개별 후보 다각형의 바운딩 박스 출력
+            Log.d("DEBUG", "candidate bounds = ${candidate.bounds}")
+            
             if (candidate.bounds.contains(bitmapX, bitmapY)) {
+                // Bounds 필터 합격 시 다각형 내부 매칭 여부 체크 시작
                 if (isPointInPolygon(bitmapX, bitmapY, candidate.points)) {
                     val pts = candidate.points
-                    
-                    // 🌟 Shoelace 수식 대신 안전한 OpenCV contourArea 활용
                     val pointArray = Array(4) { idx -> Point(pts[idx].x.toDouble(), pts[idx].y.toDouble()) }
                     val matOfPoint = MatOfPoint(*pointArray)
+                  
                     val actualArea = Imgproc.contourArea(matOfPoint).toFloat()
                     matOfPoint.release() 
                     
@@ -444,12 +454,17 @@ class MainActivity : AppCompatActivity() {
                         minArea = actualArea
                         bestPolygon = pts.toList() 
                     }
+                } else {
+                    Log.d("DEBUG", "-> [Fail] Bounds 내부엔 들어왔으나 Point-In-Polygon 수학 공식 검사 탈락")
                 }
             }
         }
         
-        currentlyHoveredBitmapPolygon = bestPolygon
+        // 🌟 [로그 3] 최종적으로 매칭에 성공한 최적 다각형 확보 여부 출력
+        Log.d("DEBUG", "best polygon found = ${bestPolygon != null}")
         
+        currentlyHoveredBitmapPolygon = bestPolygon
+         
         if (bestPolygon != null) {
             for (i in 0 until 4) {
                 val pt = bestPolygon[i]
@@ -460,7 +475,6 @@ class MainActivity : AppCompatActivity() {
             }
             nativeGuideView?.setHoveredPolygon(nativeGuidePassingBuffer)
         } else {
-            // 🌟 UI 초기화 누락 방지
             nativeGuideView?.setHoveredPolygon(null)
         }
     }
@@ -474,7 +488,7 @@ class MainActivity : AppCompatActivity() {
         val currentSessionId = captureSessionId.get()
         progressBar?.visibility = View.VISIBLE
         nativeGuideView?.visibility = View.GONE
-        
+         
         maskExecutor.execute {
             if (captureSessionId.get() != currentSessionId) return@execute
             val safeTargetBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) }
@@ -485,6 +499,7 @@ class MainActivity : AppCompatActivity() {
                     Utils.bitmapToMat(safeTargetBitmap, resultMat)
                     applyMaskToMat(resultMat, orderedCorners)
                     val resultBitmap = Bitmap.createBitmap(resultMat.cols(), resultMat.rows(), Bitmap.Config.ARGB_8888)
+                     
                     Utils.matToBitmap(resultMat, resultBitmap)
                     resultMat.release()
                     
@@ -493,11 +508,11 @@ class MainActivity : AppCompatActivity() {
                             resultBitmap.recycle()
                             return@runOnUiThread 
                         }
+           
                         val oldBitmap = displayedBitmap
-                        
                         nativeBackgroundView?.setImageBitmap(resultBitmap)
                         displayedBitmap = resultBitmap
-                        
+                         
                         oldBitmap?.let { bmp -> 
                             nativeBackgroundView?.post { if (!bmp.isRecycled) bmp.recycle() } 
                         }
@@ -531,6 +546,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun applyMaskToMat(mat: Mat, corners: List<PointF>) {
         if (corners.size != 4) return
+         
         var maskMat: Mat? = null
         var contour: org.opencv.core.MatOfPoint? = null
         var blurredMask: Mat? = null
@@ -544,6 +560,7 @@ class MainActivity : AppCompatActivity() {
             val pts = corners.map { Point(it.x.toDouble(), it.y.toDouble()) }
             maskMat = Mat.zeros(mat.size(), CvType.CV_8UC1)
             contour = org.opencv.core.MatOfPoint(*pts.toTypedArray())
+             
             Imgproc.fillPoly(maskMat, listOf(contour), Scalar(255.0))
             
             blurredMask = Mat()
@@ -551,6 +568,7 @@ class MainActivity : AppCompatActivity() {
             
             coloredMask = Mat(mat.size(), mat.type(), Scalar(0.0, 255.0, 0.0, 255.0))
             alphaMat = Mat()
+             
             blurredMask.convertTo(alphaMat, CvType.CV_32F, 1.0 / 255.0)
             
             Core.split(mat, matChannels)
@@ -566,16 +584,19 @@ class MainActivity : AppCompatActivity() {
                     mcF = Mat()
                     ccF = Mat()
                     matChannels[i].convertTo(mcF, CvType.CV_32F)
+                     
                     coloredChannels[i].convertTo(ccF, CvType.CV_32F)
                     
                     blendedF = Mat()
                     Core.multiply(ccF, alphaMat, ccF)
                     
+                     
                     invAlpha = Mat()
                     scalarMat = Mat(alphaMat.size(), alphaMat.type(), Scalar(1.0))
                     
                     Core.subtract(scalarMat, alphaMat, invAlpha)
                     Core.multiply(mcF, invAlpha, mcF)
+                     
                     Core.add(ccF, mcF, blendedF)
                     blendedF.convertTo(matChannels[i], CvType.CV_8U)
                 } finally { 
@@ -586,6 +607,7 @@ class MainActivity : AppCompatActivity() {
                     scalarMat?.release()
                 }
             }
+             
             Core.merge(matChannels, mat)
         } finally {
             maskMat?.release()
@@ -604,7 +626,7 @@ class MainActivity : AppCompatActivity() {
             val values = ContentValues().apply { 
                 put(MediaStore.Images.Media.DISPLAY_NAME, filename)
                 put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg") 
-            }
+             }
             val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return
             contentResolver.openOutputStream(uri)?.use { bitmap.compress(Bitmap.CompressFormat.JPEG, 95, it) }
             Toast.makeText(this, "💾 저장 완료", Toast.LENGTH_SHORT).show()
@@ -623,7 +645,7 @@ class MainActivity : AppCompatActivity() {
     
     override fun onDestroy() {
         synchronized(bitmapLock) { 
-            lastCapturedBitmap?.recycle()
+             lastCapturedBitmap?.recycle()
             lastCapturedBitmap = null 
         }
         nativeBackgroundView?.setImageDrawable(null)
@@ -636,7 +658,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object { 
-        private const val REQUEST_CODE_PERMISSIONS = 1001
+         private const val REQUEST_CODE_PERMISSIONS = 1001
         private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA) 
     }
 }
