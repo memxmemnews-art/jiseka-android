@@ -63,7 +63,6 @@ object PlateDetectionEngine {
                 val approxPoints = extractRobustPolygon(contour) ?: continue
                 val pointArray = approxPoints.toArray()
                 
-                // 🌟 파라미터 추가: imageArea, imageHeight 전달
                 if (!isValidLicensePlateGeometry(contourArea, pointArray, imageArea, imageHeight, isRoi = false)) {
                     approxPoints.release()
                     continue
@@ -147,7 +146,6 @@ object PlateDetectionEngine {
                 
                 if (approx != null) {
                     val candidateArray = approx.toArray()
-                    // 🌟 파라미터 추가: roiImageArea, roiImageHeight 전달
                     val isValid = isValidLicensePlateGeometry(contourArea, candidateArray, roiImageArea, roiImageHeight, isRoi = true)
                     
                     if (isValid) {
@@ -252,9 +250,6 @@ object PlateDetectionEngine {
         return sorted
     }
 
-    /**
-     * 🌟 [완전 교체] 해상도 독립적 정규화 면적(Normalized Area) 기반 스코어링 적용
-     */
     fun calculatePolygonScore(points: List<ImmutablePoint>, imageArea: Double): Double {
         if (points.size < 4) return 0.0
         
@@ -285,11 +280,9 @@ object PlateDetectionEngine {
         val rectArea = w * h
         val rectangularity = if (rectArea > 0) polygonArea / rectArea else 0.0
         
-        // 정규화된 면적 점수 (화면 대비 25% 차지 시 만점)
         val normalizedArea = polygonArea / imageArea
         val normalizedAreaScore = min(normalizedArea / 0.25, 1.0)
         
-        // 종합 점수 계산
         val score = (solidity * 0.30) + (rectangularity * 0.25) + (extent * 0.20) + (normalizedAreaScore * 0.25)
         
         hullIndices.release()
@@ -300,9 +293,6 @@ object PlateDetectionEngine {
         return score
     }
 
-    /**
-     * 🌟 [완전 교체] 최소 높이(Height) 컷오프를 통한 글자 조각 조기 차단
-     */
     private fun isValidLicensePlateGeometry(
         originalContourArea: Double,
         hullPoints: Array<Point>, 
@@ -323,7 +313,6 @@ object PlateDetectionEngine {
                 return false
             }
         } else {
-            // 하한선 상향 조정: 0.002(0.2%) 이하의 엠블럼, 글자는 사전 탈락
             if (normalizedArea < 0.002 || normalizedArea > 0.05) {
                 hullMat.release()
                 return false
@@ -336,7 +325,6 @@ object PlateDetectionEngine {
         var h = minAreaRect.size.height
         if (w < h) { val temp = w; w = h; h = temp }
         
-        // 이미지 높이 기준 1.5% 미만인 얇은 선이나 글자는 탈락
         if (!isRoi && h < referenceImageHeight * 0.015) {
             hullMat.release()
             hullMat2f.release()
