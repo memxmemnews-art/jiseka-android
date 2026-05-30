@@ -5,99 +5,80 @@ import android.graphics.RectF
 import org.opencv.android.Utils
 import org.opencv.core.*
 import org.opencv.imgproc.Imgproc
-import kotlin.math.abs
-import kotlin.math.acos
-import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.sin
 
 object PlateDetectionEngine {
+
+    // 🌟 [문제 해결] CLAHE 객체와 기본 커널을 지연 초기화(Lazy)하여 스레드-안전하게 재사용
+    private val defaultClahe: org.opencv.imgproc.CLAHE by lazy {
+        Imgproc.createCLAHE(2.0, Size(8.0, 8.0))
+    }
+    
+    private val roiClahe: org.opencv.imgproc.CLAHE by lazy {
+        Imgproc.createCLAHE(2.0, Size(4.0, 4.0))
+    }
+
+    private val morphCloseKernelRoi: Mat by lazy {
+        Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 5.0))
+    }
 
     fun precalculateGeometryCandidates(fullBitmap: Bitmap): List<CandidatePolygon> {
         val candidates = mutableListOf<CandidatePolygon>()
         val mat = Mat(); val grayMat = Mat(); val bilateralMat = Mat()
-        val tophatMat = Mat(); val edgeMat = Mat(); val hierarchy = Mat()
+        val edgeMat = Mat(); val hierarchy = Mat()
         val contours = ArrayList<MatOfPoint>()
-        var topHatKernel: Mat? = null; var morphKernel: Mat? = null
-        var clahe: org.opencv.imgproc.CLAHE? = null
+        var morphKernel: Mat? = null
 
         try {
             Utils.bitmapToMat(fullBitmap, mat)
             Imgproc.cvtColor(mat, grayMat, Imgproc.COLOR_RGBA2GRAY)
             
-            clahe = Imgproc.createCLAHE(2.0, Size(8.0, 8.0))
-            clahe.apply(grayMat, grayMat)
+            // 🌟 재사용 가능한 CLAHE 적용 (매번 생성/해제하는 오버헤드 제거)
+            defaultClahe.apply(grayMat, grayMat)
             
-            Imgproc.bilateralFilter(grayMat, bilateralMat, 5, 20.0, 20.0)
+            Imgproc.GaussianBlur(grayMat, bilateralMat, Size(5.0, 5.0), 0.0)
             
-            topHatKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(25.0, 9.0))
-            Imgproc.morphologyEx(bilateralMat, tophatMat, Imgproc.MORPH_TOPHAT, topHatKernel)
+            val meanVal = Core.mean(bilateralMat).`val`[0]
+            val lowerThresh = max(0.0, 0.5 * meanVal)
+            val upperThresh = min(255.0, 1.5 * meanVal)
+            Imgproc.Canny(bilateralMat, edgeMat, lowerThresh, upperThresh)
             
-            val meanVal = Core.mean(tophatMat).`val`[0]
-            val sigma = 0.33
-            val lowerThresh = max(0.0, (1.0 - sigma) * meanVal)
-            val upperThresh = min(255.0, (1.0 + sigma) * meanVal)
-            Imgproc.Canny(tophatMat, edgeMat, lowerThresh, upperThresh)
-            
-            morphKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(9.0, 3.0))
+            val kernelWidth = (fullBitmap.width * 0.012).coerceIn(15.0, 60.0)
+            val kernelHeight = (kernelWidth * 0.25).coerceIn(3.0, 15.0)
+            morphKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(kernelWidth, kernelHeight))
             Imgproc.morphologyEx(edgeMat, edgeMat, Imgproc.MORPH_CLOSE, morphKernel)
             
             Imgproc.findContours(edgeMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
-            // 🌟 1. 기준치 사전 계산 (타입 일관성 확보 및 권장 물리적 한계치 적용)
-            val totalArea = fullBitmap.width * fullBitmap.height.toDouble()
-            val minPlateHeight = fullBitmap.height * 0.025
-            val maxPlateHeight = fullBitmap.height * 0.22
-            val maxPlateWidth = fullBitmap.width * 0.55
-            val maxPlateArea = totalArea * 0.12
-            val maxPolygonArea = totalArea * 0.15 
+            val imageArea = fullBitmap.width * fullBitmap.height.toDouble()
 
             for (contour in contours) {
                 val rect = Imgproc.boundingRect(contour)
                 
-                // 🌟 2. 이미지 가장자리(Border) 접촉 Contour 원천 제거
-                if (rect.x <= 2 || rect.y <= 2 || 
-                    rect.x + rect.width >= fullBitmap.width - 2 || 
-                    rect.y + rect.height >= fullBitmap.height - 2) {
+                if (rect.x <= 2 || rect.y <= 2 || rect.x + rect.width >= fullBitmap.width - 2 || rect.y + rect.height >= fullBitmap.height - 2) {
                     continue
                 }
 
-                // 🌟 3. 거대 Contour 후보 사전 필터링 (높이, 너비, 면적)
-                val area = Imgproc.contourArea(contour)
-                if (rect.height < minPlateHeight || rect.height > maxPlateHeight || 
-                    rect.width > maxPlateWidth || area > maxPlateArea) {
-                    continue
-                }
-                
-                val approxPoints = extractRobustQuadrilateral(contour) ?: continue
-                
+                val contourArea = Imgproc.contourArea(contour)
+                val approxPoints = extractRobustPolygon(contour) ?: continue
                 val pointArray = approxPoints.toArray()
                 
-                // 🌟 4. Polygon 면적 및 Bounding Box 크기 제한 파라미터 전달
-                if (!isValidLicensePlateGeometry(
-                        pointArray, 
-                        maxPolygonArea, 
-                        maxPlateWidth, 
-                        maxPlateHeight
-                )) {
+                if (!isValidLicensePlateGeometry(contourArea, pointArray, imageArea, isRoi = false)) {
                     approxPoints.release()
                     continue
                 }
 
-                val refinedPoints = applySubPixelCorrection(grayMat, approxPoints)
+                val immutablePoints = pointArray.map { ImmutablePoint(it.x.toFloat(), it.y.toFloat()) }
                 approxPoints.release()
 
-                val immutablePoints = refinedPoints.map { ImmutablePoint(it.x.toFloat(), it.y.toFloat()) }
                 val xCoords = immutablePoints.map { it.x }
                 val yCoords = immutablePoints.map { it.y }
                 
                 val bounds = RectF(
-                    xCoords.minOrNull() ?: 0f,
-                    yCoords.minOrNull() ?: 0f,
-                    xCoords.maxOrNull() ?: 0f,
-                    yCoords.maxOrNull() ?: 0f
+                    xCoords.minOrNull() ?: 0f, yCoords.minOrNull() ?: 0f,
+                    xCoords.maxOrNull() ?: 0f, yCoords.maxOrNull() ?: 0f
                 )
                 
                 candidates.add(CandidatePolygon(immutablePoints, bounds))
@@ -108,16 +89,16 @@ object PlateDetectionEngine {
             return emptyList()
         } finally {
             mat.release(); grayMat.release(); bilateralMat.release()
-            tophatMat.release(); edgeMat.release(); hierarchy.release()
+            edgeMat.release(); hierarchy.release()
             contours.forEach { it.release() }
-            topHatKernel?.release(); morphKernel?.release()
-            clahe?.collectGarbage()
+            
+            // 🌟 동적으로 생성된 커널만 release 처리, clahe.collectGarbage()는 안전을 위해 호출 제외
+            morphKernel?.release() 
         }
     }
 
     fun refineAnchoredPolygon(fullBitmap: Bitmap, anchorPolygon: List<ImmutablePoint>, targetLevel: Int): List<ImmutablePoint>? {
         val padding = if (targetLevel == 1) 40f else 20f 
-        
         val minX = (anchorPolygon.minOfOrNull { it.x } ?: 0f) - padding
         val minY = (anchorPolygon.minOfOrNull { it.y } ?: 0f) - padding
         val maxX = (anchorPolygon.maxOfOrNull { it.x } ?: 0f) + padding
@@ -130,24 +111,25 @@ object PlateDetectionEngine {
         
         if (safeRect.width() <= 1 || safeRect.height() <= 1) return null
 
-        val roiBitmap = Bitmap.createBitmap(fullBitmap, safeRect.left, safeRect.top, safeRect.width(), safeRect.height())
+        val anchorCx = anchorPolygon.map { it.x }.average()
+        val anchorCy = anchorPolygon.map { it.y }.average()
+        val anchorMatOfPoint = MatOfPoint(*anchorPolygon.map { Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray())
+        val anchorArea = Imgproc.contourArea(anchorMatOfPoint)
+        val anchorMatOfPointRoi = MatOfPoint(*anchorPolygon.map { Point((it.x - safeRect.left).toDouble(), (it.y - safeRect.top).toDouble()) }.toTypedArray())
 
+        val roiBitmap = Bitmap.createBitmap(fullBitmap, safeRect.left, safeRect.top, safeRect.width(), safeRect.height())
         val roiMat = Mat(); val roiGray = Mat(); val roiEdge = Mat()
         val roiContours = ArrayList<MatOfPoint>()
         var bestGlobalPoints: List<ImmutablePoint>? = null
         
-        // 🌟 절대적인 번호판 물리적 한계치 계산 (fullBitmap 기준, 타입 일관성 확보)
-        val totalArea = fullBitmap.width * fullBitmap.height.toDouble()
-        val maxPlateWidth = fullBitmap.width * 0.55
-        val maxPlateHeight = fullBitmap.height * 0.22
-        val maxPolygonArea = totalArea * 0.15
+        val roiImageArea = roiBitmap.width * roiBitmap.height.toDouble()
         
         try {
             Utils.bitmapToMat(roiBitmap, roiMat)
             Imgproc.cvtColor(roiMat, roiGray, Imgproc.COLOR_RGBA2GRAY)
             
-            val clahe = Imgproc.createCLAHE(2.0, Size(4.0, 4.0))
-            clahe.apply(roiGray, roiGray)
+            // 🌟 재사용 가능한 ROI 전용 CLAHE 적용
+            roiClahe.apply(roiGray, roiGray)
             
             val meanVal = Core.mean(roiGray).`val`[0]
             val sigma = if (targetLevel == 1) 0.5 else 0.33 
@@ -156,229 +138,216 @@ object PlateDetectionEngine {
             
             Imgproc.Canny(roiGray, roiEdge, lowerThresh, upperThresh)
             
-            val morphKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 5.0))
-            Imgproc.morphologyEx(roiEdge, roiEdge, Imgproc.MORPH_CLOSE, morphKernel)
-            
+            // 🌟 재사용 가능한 커널 객체 적용
+            Imgproc.morphologyEx(roiEdge, roiEdge, Imgproc.MORPH_CLOSE, morphCloseKernelRoi)
             Imgproc.findContours(roiEdge, roiContours, Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
             var bestApprox2f: MatOfPoint2f? = null
             var maxArea = -1.0
 
             for (contour in roiContours) {
-                val area = Imgproc.contourArea(contour)
-                if (area < 500) continue 
-
-                val approx = extractRobustQuadrilateral(contour)
+                val contourArea = Imgproc.contourArea(contour)
+                val approx = extractRobustPolygon(contour)
+                
                 if (approx != null) {
-                    // 🌟 ROI 내부의 후보군 검증 시에도 동일한 Bounding Box 한계치 적용
-                    if (isValidLicensePlateGeometry(approx.toArray(), maxPolygonArea, maxPlateWidth, maxPlateHeight) && area > maxArea) {
-                        maxArea = area
-                        bestApprox2f?.release()
-                        bestApprox2f = approx
-                    } else {
-                        approx.release()
+                    val candidateArray = approx.toArray()
+                    val isValid = isValidLicensePlateGeometry(contourArea, candidateArray, roiImageArea, isRoi = true)
+                    
+                    if (isValid) {
+                        val candidateMat = MatOfPoint(*candidateArray)
+                        
+                        val candGlobalCx = candidateArray.map { it.x + safeRect.left }.average()
+                        val candGlobalCy = candidateArray.map { it.y + safeRect.top }.average()
+                        val distance = hypot(anchorCx - candGlobalCx, anchorCy - candGlobalCy)
+                        
+                        val intersectPoints = MatOfPoint()
+                        val intersectArea = if (Imgproc.intersectConvexConvex(anchorMatOfPointRoi, candidateMat, intersectPoints) > 0f) {
+                            Imgproc.contourArea(intersectPoints)
+                        } else 0.0
+                        
+                        val unionArea = anchorArea + contourArea - intersectArea
+                        val iou = if (unionArea > 0) intersectArea / unionArea else 0.0
+                        
+                        intersectPoints.release()
+                        candidateMat.release()
+
+                        if (distance <= 50.0 && iou >= 0.4 && contourArea > maxArea) {
+                            maxArea = contourArea
+                            bestApprox2f?.release()
+                            bestApprox2f = approx
+                            continue
+                        }
                     }
+                    approx.release()
                 }
             }
 
-            if (bestApprox2f == null && targetLevel == 1) {
-                val houghPoints = fallbackToHoughIntersections(roiEdge)
-                // 🌟 Hough 변환 폴백(Fallback) 시 생성된 기하학적 형태에도 동일한 제약 적용
-                if (houghPoints != null && isValidLicensePlateGeometry(houghPoints.toTypedArray(), maxPolygonArea, maxPlateWidth, maxPlateHeight)) {
-                    bestApprox2f = MatOfPoint2f(*houghPoints.toTypedArray())
-                }
-            }
-
-            // 🌟 !! 연산자 제거 및 안전한 스코프 함수(?.let) 사용
             bestApprox2f?.let { approx ->
-                val refinedLocalPoints = applySubPixelCorrection(roiGray, approx)
+                val pointsArray = approx.toArray()
                 approx.release()
                 
-                bestGlobalPoints = refinedLocalPoints.map { 
+                bestGlobalPoints = pointsArray.map { 
                     ImmutablePoint((it.x + safeRect.left).toFloat(), (it.y + safeRect.top).toFloat()) 
                 }
             }
-            
-            morphKernel.release()
-            clahe.collectGarbage()
-
         } catch (e: Exception) {
             e.printStackTrace()
         } finally {
             roiMat.release(); roiGray.release(); roiEdge.release()
-            roiContours.forEach { it.release() }
-            roiBitmap.recycle()
+            roiContours.forEach { it.release() }; roiBitmap.recycle()
+            anchorMatOfPoint.release(); anchorMatOfPointRoi.release()
         }
-
         return bestGlobalPoints
     }
 
-    private fun extractRobustQuadrilateral(contour: MatOfPoint): MatOfPoint2f? {
+    private fun extractRobustPolygon(contour: MatOfPoint): MatOfPoint2f? {
         val contour2f = MatOfPoint2f(*contour.toArray())
-        val perimeter = Imgproc.arcLength(contour2f, true)
-        
-        var minEps = 0.0
-        var maxEps = perimeter * 0.1 
-        var bestApprox: MatOfPoint2f? = null
-
         val approx2f = MatOfPoint2f()
         
-        for (i in 0 until 10) {
-            val eps = (minEps + maxEps) / 2.0
-            Imgproc.approxPolyDP(contour2f, approx2f, eps, true)
-            
-            val pointsCount = approx2f.rows()
-            
-            if (pointsCount == 4) {
-                bestApprox = MatOfPoint2f(*approx2f.toArray())
-                break
-            } else if (pointsCount > 4) {
-                minEps = eps
-            } else {
-                maxEps = eps
-            }
-        }
+        val perimeter = Imgproc.arcLength(contour2f, true)
+        Imgproc.approxPolyDP(contour2f, approx2f, perimeter * 0.03, true)
         
+        val approxPointMat = MatOfPoint(*approx2f.toArray())
+        val hullIndices = MatOfInt()
+        
+        Imgproc.convexHull(approxPointMat, hullIndices)
+        
+        val hullPoints = mutableListOf<Point>()
+        val approxPointsArray = approxPointMat.toArray()
+        val indicesArray = hullIndices.toArray()
+        
+        for (index in indicesArray) {
+            hullPoints.add(approxPointsArray[index])
+        }
+
         approx2f.release()
         contour2f.release()
-        return bestApprox
+        approxPointMat.release()
+        hullIndices.release()
+
+        if (hullPoints.size in 4..10) {
+            val sortedHull = sortPolygonPoints(hullPoints)
+            return MatOfPoint2f(*sortedHull.toTypedArray())
+        }
+        return null
     }
 
-    /**
-     * 🌟 기하학적 검증 함수에 BoundingRect 기반 최대 폭/높이 제한 추가
-     */
-    private fun isValidLicensePlateGeometry(
-        points: Array<Point>, 
-        maxAllowedArea: Double = Double.MAX_VALUE,
-        maxWidth: Double = Double.MAX_VALUE,
-        maxHeight: Double = Double.MAX_VALUE
-    ): Boolean {
-        if (points.size != 4) return false
+    private fun sortPolygonPoints(points: List<Point>): List<Point> {
+        if (points.size < 3) return points
+        
+        val cx = points.map { it.x }.average()
+        val cy = points.map { it.y }.average()
 
-        val matOfPoint = MatOfPoint(*points)
+        var sorted = points.sortedBy { Math.atan2(it.y - cy, it.x - cx) }
+
+        var area = 0.0
+        val n = sorted.size
+        for (i in 0 until n) {
+            val p1 = sorted[i]
+            val p2 = sorted[(i + 1) % n]
+            area += (p1.x * p2.y - p2.x * p1.y)
+        }
+
+        if (area < 0) {
+            sorted = sorted.reversed()
+        }
+
+        return sorted
+    }
+
+    fun calculatePolygonScore(points: List<ImmutablePoint>): Double {
+        if (points.size < 4) return 0.0
+        
+        val pts = points.map { Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray()
+        val matOfPoint = MatOfPoint(*pts)
+        val matOfPoint2f = MatOfPoint2f(*pts)
+        
+        val hullIndices = MatOfInt()
+        Imgproc.convexHull(matOfPoint, hullIndices)
+        
+        val hullPoints = mutableListOf<Point>()
+        for (index in hullIndices.toArray()) {
+            hullPoints.add(pts[index])
+        }
+        val hullMat = MatOfPoint(*hullPoints.toTypedArray())
+        
         val polygonArea = Imgproc.contourArea(matOfPoint)
-        val isConvex = Imgproc.isContourConvex(matOfPoint)
+        val hullArea = Imgproc.contourArea(hullMat)
+        val solidity = if (hullArea > 0) polygonArea / hullArea else 0.0
         
-        // 🌟 최종 4포인트 다각형 기준의 Bounding Box 추출
-        val polygonRect = Imgproc.boundingRect(matOfPoint) 
+        val minAreaRect = Imgproc.minAreaRect(matOfPoint2f)
+        var w = minAreaRect.size.width
+        var h = minAreaRect.size.height
+        if (w < h) { val temp = w; w = h; h = temp }
+        val rectArea = w * h
+        val rectangularity = if (rectArea > 0) polygonArea / rectArea else 0.0
+        
+        val score = (solidity * 0.5) + (rectangularity * 0.5)
+        
+        hullIndices.release()
+        hullMat.release()
         matOfPoint.release()
+        matOfPoint2f.release()
         
-        // 🌟 다각형 면적 및 가로/세로 한계선 최종 검증 (오목 다각형, 화면 대부분을 덮는 기형적 얇은 다각형 차단)
-        if (!isConvex || polygonArea > maxAllowedArea) return false
-        if (polygonRect.width > maxWidth || polygonRect.height > maxHeight) return false
+        return score
+    }
 
-        var minAngleDeg = 180.0
-        var maxAngleDeg = 0.0
-        val edgeLengths = DoubleArray(4)
+    private fun isValidLicensePlateGeometry(
+        originalContourArea: Double,
+        hullPoints: Array<Point>, 
+        referenceImageArea: Double,
+        isRoi: Boolean
+    ): Boolean {
+        if (hullPoints.size !in 4..10) return false
 
-        for (i in 0 until 4) {
-            val pt1 = points[i]
-            val pt2 = points[(i + 1) % 4]
-            val pt0 = points[(i + 3) % 4] 
-
-            val dx = pt1.x - pt2.x
-            val dy = pt1.y - pt2.y
-            edgeLengths[i] = hypot(dx, dy)
-
-            val v1x = pt0.x - pt1.x
-            val v1y = pt0.y - pt1.y
-            val v2x = pt2.x - pt1.x
-            val v2y = pt2.y - pt1.y
-
-            val dot = v1x * v2x + v1y * v2y
-            val norm = hypot(v1x, v1y) * hypot(v2x, v2y)
-            
-            if (norm > 1e-6) {
-                var cosTheta = dot / norm
-                cosTheta = cosTheta.coerceIn(-1.0, 1.0) 
-                val angle = Math.toDegrees(acos(cosTheta))
-
-                minAngleDeg = min(minAngleDeg, angle)
-                maxAngleDeg = max(maxAngleDeg, angle)
+        val hullMat = MatOfPoint(*hullPoints)
+        val hullArea = Imgproc.contourArea(hullMat)
+        val boundingRect = Imgproc.boundingRect(hullMat)
+        
+        val normalizedArea = hullArea / referenceImageArea
+        if (isRoi) {
+            if (normalizedArea < 0.10) {
+                hullMat.release()
+                return false
+            }
+        } else {
+            if (normalizedArea < 0.0005 || normalizedArea > 0.05) {
+                hullMat.release()
+                return false
             }
         }
 
-        if (minAngleDeg < 45.0 || maxAngleDeg > 135.0) return false
+        val solidity = originalContourArea / hullArea
+        if (solidity < 0.75) {
+            hullMat.release()
+            return false
+        }
 
-        val widthApprox = (edgeLengths[0] + edgeLengths[2]) / 2.0
-        val heightApprox = (edgeLengths[1] + edgeLengths[3]) / 2.0
+        val extent = hullArea / (boundingRect.width * boundingRect.height).toDouble()
+        if (extent < 0.50) {
+            hullMat.release()
+            return false
+        }
 
-        if (widthApprox < 1e-6 || heightApprox < 1e-6) return false
+        val hullMat2f = MatOfPoint2f(*hullPoints)
+        val minAreaRect = Imgproc.minAreaRect(hullMat2f)
         
-        val ratio = if (widthApprox > heightApprox) widthApprox / heightApprox else heightApprox / widthApprox
-        if (ratio < 1.5 || ratio > 6.0) return false
+        var w = minAreaRect.size.width
+        var h = minAreaRect.size.height
+        if (w < h) { val temp = w; w = h; h = temp }
+        
+        val rectArea = w * h
+        val rectangularity = if (rectArea > 0) hullArea / rectArea else 0.0
+        
+        hullMat.release()
+        hullMat2f.release()
+
+        if (rectangularity < 0.65) return false
+
+        if (h < 1e-6) return false
+        val ratio = w / h
+        if (ratio < 1.2 || ratio > 8.0) return false
 
         return true
-    }
-
-    private fun applySubPixelCorrection(grayMat: Mat, approx2f: MatOfPoint2f): List<Point> {
-        val points = approx2f.toArray()
-        val cornersMat = MatOfPoint2f(*points)
-        
-        val winSize = Size(5.0, 5.0)
-        val zeroZone = Size(-1.0, -1.0)
-        val criteria = TermCriteria(TermCriteria.EPS + TermCriteria.MAX_ITER, 40, 0.001)
-
-        Imgproc.cornerSubPix(grayMat, cornersMat, winSize, zeroZone, criteria)
-
-        val refinedArray = cornersMat.toArray().toList()
-        cornersMat.release()
-        
-        return refinedArray
-    }
-
-    private fun fallbackToHoughIntersections(edgeMat: Mat): List<Point>? {
-        val lines = Mat()
-        Imgproc.HoughLines(edgeMat, lines, 1.0, Math.PI / 180.0, 40)
-
-        if (lines.rows() < 4) {
-            lines.release()
-            return null 
-        }
-
-        val horizontals = mutableListOf<DoubleArray>()
-        val verticals = mutableListOf<DoubleArray>()   
-
-        for (i in 0 until lines.rows()) {
-            val vec = lines.get(i, 0)
-            val angleDeg = Math.toDegrees(vec[1])
-            
-            if (angleDeg in 60.0..120.0) {
-                horizontals.add(vec)
-            } else if (angleDeg < 30.0 || angleDeg > 150.0) {
-                verticals.add(vec)
-            }
-        }
-        lines.release()
-
-        if (horizontals.size < 2 || verticals.size < 2) return null
-
-        horizontals.sortBy { abs(it[0]) } 
-        val topEdge = horizontals.first()
-        val bottomEdge = horizontals.last()
-
-        verticals.sortBy { abs(it[0]) }
-        val leftEdge = verticals.first()
-        val rightEdge = verticals.last()
-
-        val topLeft = calculateIntersection(topEdge, leftEdge) ?: return null
-        val topRight = calculateIntersection(topEdge, rightEdge) ?: return null
-        val bottomLeft = calculateIntersection(bottomEdge, leftEdge) ?: return null
-        val bottomRight = calculateIntersection(bottomEdge, rightEdge) ?: return null
-
-        return listOf(topLeft, topRight, bottomRight, bottomLeft)
-    }
-
-    private fun calculateIntersection(line1: DoubleArray, line2: DoubleArray): Point? {
-        val a1 = cos(line1[1]); val b1 = sin(line1[1]); val c1 = line1[0]
-        val a2 = cos(line2[1]); val b2 = sin(line2[1]); val c2 = line2[0]
-
-        val det = a1 * b2 - a2 * b1
-        if (abs(det) < 0.0001) return null
-
-        val x = (c1 * b2 - c2 * b1) / det
-        val y = (a1 * c2 - a2 * c1) / det
-
-        return Point(x, y)
     }
 }
