@@ -154,7 +154,6 @@ class MainActivity : AppCompatActivity() {
                         safeBitmap.recycle()
 
                         runOnUiThread {
-                            // 단순 객체 비교(!=) 대신 사이즈라도 체크하도록 완화(내부 점들의 좌표가 변했는지까지 완벽 비교는 생략 가능)
                             if (tightenedPolygon != null && tightenedPolygon.isNotEmpty() && captureSessionId.get() == currentSession) {
                                 currentlyHoveredBitmapPolygon = tightenedPolygon
                                 val xCoords = tightenedPolygon.map { it.x }
@@ -353,15 +352,16 @@ class MainActivity : AppCompatActivity() {
         val bitmapY = matrixMappingBuffer[1]
         
         var bestPolygon: List<ImmutablePoint>? = null
-        
-        // 🌟 [문제 6 해결] 면적이 아니라 형태 품질(Composite Score)이 가장 높은 다각형을 선택
         var maxScore = -1.0
+        
+        // 🌟 스코어링 공식에 필요한 이미지 전체 면적을 여기서 한 번만 계산하여 파라미터로 전달
+        val safeBitmapArea = synchronized(bitmapLock) { lastCapturedBitmap?.let { it.width * it.height.toDouble() } ?: 1.0 }
 
         for (candidate in candidatesSnapshot) {
             if (candidate.bounds.contains(bitmapX, bitmapY)) {
                 if (isPointInPolygon(bitmapX, bitmapY, candidate.points)) {
-                    // 다각형의 형태 점수 (0.0 ~ 1.0) 계산 (Solidity + Rectangularity)
-                    val currentScore = PlateDetectionEngine.calculatePolygonScore(candidate.points)
+                    // 🌟 수정된 스코어링 함수 호출 (imageArea 매개변수 전달)
+                    val currentScore = PlateDetectionEngine.calculatePolygonScore(candidate.points, safeBitmapArea)
                     
                     if (currentScore > maxScore) {
                         maxScore = currentScore
@@ -448,7 +448,6 @@ class MainActivity : AppCompatActivity() {
         return result
     }
 
-    // ConvexHull로 정렬 및 방향 통일이 끝난 상태이므로 그대로 반환합니다.
     private fun orderCorners(corners: List<ImmutablePoint>): List<PointF> {
         if (corners.isEmpty()) return emptyList()
         return corners.map { PointF(it.x, it.y) }
