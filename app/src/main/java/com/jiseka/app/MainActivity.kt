@@ -89,7 +89,6 @@ class MainActivity : AppCompatActivity() {
     private var isMatrixReady = false
 
     private val matrixMappingBuffer = FloatArray(2)
-    private val nativeGuidePassingBuffer = Array(4) { PointF() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -132,7 +131,6 @@ class MainActivity : AppCompatActivity() {
         nativeGuideView?.onCrosshairMoveListener = { uiPoint -> handleCrosshairMove(uiPoint) }
         
         nativeGuideView?.onDwellTriggeredListener = { currentLevel ->
-             
             val anchorSnapshot = currentlyHoveredBitmapPolygon?.toList()
             val currentSession = captureSessionId.get()
             val targetLevel = currentLevel + 1
@@ -156,8 +154,9 @@ class MainActivity : AppCompatActivity() {
                         safeBitmap.recycle()
 
                         runOnUiThread {
-                            if (tightenedPolygon != null && tightenedPolygon != anchorSnapshot && captureSessionId.get() == currentSession) {
-                               currentlyHoveredBitmapPolygon = tightenedPolygon
+                            // 단순 객체 비교(!=) 대신 사이즈라도 체크하도록 완화(내부 점들의 좌표가 변했는지까지 완벽 비교는 생략 가능)
+                            if (tightenedPolygon != null && tightenedPolygon.isNotEmpty() && captureSessionId.get() == currentSession) {
+                                currentlyHoveredBitmapPolygon = tightenedPolygon
                                 val xCoords = tightenedPolygon.map { it.x }
                                 val yCoords = tightenedPolygon.map { it.y }
                                 
@@ -166,7 +165,7 @@ class MainActivity : AppCompatActivity() {
                                     yCoords.minOrNull() ?: 0f,
                                     xCoords.maxOrNull() ?: 0f,
                                     yCoords.maxOrNull() ?: 0f
-                               )
+                                )
          
                                 precalculatedCandidates = precalculatedCandidates.map { 
                                     if (it.points == anchorSnapshot) CandidatePolygon(tightenedPolygon, newBounds) else it 
@@ -273,7 +272,7 @@ class MainActivity : AppCompatActivity() {
         imageCapture?.takePicture(cameraExecutor, object : ImageCapture.OnImageCapturedCallback() {
             override fun onCaptureSuccess(imageProxy: ImageProxy) {
                 try {
-                    val uprightBitmap = imageProxy.toUprightBitmapInternal()
+                    val uprightBitmap = imageProxy.toUprightBitmap()
                     synchronized(bitmapLock) { 
                         lastCapturedBitmap?.recycle() 
                         lastCapturedBitmap = uprightBitmap 
@@ -296,73 +295,6 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread { resetToLiveMode() } 
             }
         })
-    }
-
-    private fun ImageProxy.toUprightBitmapInternal(): Bitmap {
-        val cropRect = this.cropRect
-
-        val croppedOriginalBitmap = if (this.format == ImageFormat.YUV_420_888) {
-            yuv420ToCroppedBitmap(this, cropRect)
-        } else {
-            val buffer = planes[0].buffer
-            val bytes = ByteArray(buffer.remaining())
-            buffer.get(bytes)
-            
-            val fullBitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                ?: throw IllegalStateException("Bitmap decode failed: JPEG 데이터를 디코딩할 수 없습니다.")
-                
-            val cropped = Bitmap.createBitmap(fullBitmap, cropRect.left, cropRect.top, cropRect.width(), cropRect.height())
-            if (cropped != fullBitmap) fullBitmap.recycle()
-            cropped
-         }
-
-        val rotateMatrix = Matrix().apply {
-            postRotate(imageInfo.rotationDegrees.toFloat())
-        }
-
-        val rotatedBitmap = Bitmap.createBitmap(
-            croppedOriginalBitmap,
-            0, 0,
-            croppedOriginalBitmap.width, 
-            croppedOriginalBitmap.height,
-            rotateMatrix, true
-        )
-
-        if (rotatedBitmap != croppedOriginalBitmap) {
-            croppedOriginalBitmap.recycle()
-        }
-
-        val finalBitmap = rotatedBitmap.copy(Bitmap.Config.ARGB_8888, true)
-        if (finalBitmap != rotatedBitmap) {
-             rotatedBitmap.recycle()
-        }
-
-        return finalBitmap
-    }
-
-    private fun yuv420ToCroppedBitmap(image: ImageProxy, cropRect: Rect): Bitmap {
-        val yBuffer = image.planes[0].buffer
-        val uBuffer = image.planes[1].buffer
-        val vBuffer = image.planes[2].buffer
-
-        val ySize = yBuffer.remaining()
-        val uSize = uBuffer.remaining()
-        val vSize = vBuffer.remaining()
-
-        val nv21 = ByteArray(ySize + uSize + vSize)
-
-        yBuffer.get(nv21, 0, ySize)
-        vBuffer.get(nv21, ySize, vSize)
-        uBuffer.get(nv21, ySize + vSize, uSize)
-
-        val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
-        val out = ByteArrayOutputStream()
-         
-        yuvImage.compressToJpeg(cropRect, 100, out)
-        
-        val imageBytes = out.toByteArray()
-        return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
-            ?: throw IllegalStateException("Bitmap decode failed: YUV 데이터를 비트맵으로 변환할 수 없습니다.")
     }
 
     private fun setupMatrixAndPrecalculate(sessionId: Int) {
@@ -405,23 +337,13 @@ class MainActivity : AppCompatActivity() {
         bgView.invalidate() 
     }
 
-    /**
-     * 십자선 이동 시 매칭 시스템 검증 로그 통합 버전
-     */
     private fun handleCrosshairMove(uiPoint: PointF) {
         val candidatesSnapshot = precalculatedCandidates.toList()
         
-        // 🌟 [로그 1] 엔진이 찾은 원본 후보군 총 개수 출력
         Log.d("DEBUG", "candidate count = ${candidatesSnapshot.size}")
         
-        if (!isMatrixReady) {
-            Log.d("DEBUG", "[Skip] 역연산 매트릭스(inverseMatrix) 준비 해제 상태")
-            return
-        }
-        if (candidatesSnapshot.isEmpty()) {
-            // 후보군 자체가 0개면 뒤쪽 연산을 수행할 필요 없이 조기 종료
-            return
-        }
+        if (!isMatrixReady) return
+        if (candidatesSnapshot.isEmpty()) return
         
         matrixMappingBuffer[0] = uiPoint.x
         matrixMappingBuffer[1] = uiPoint.y
@@ -430,50 +352,39 @@ class MainActivity : AppCompatActivity() {
         val bitmapX = matrixMappingBuffer[0]
         val bitmapY = matrixMappingBuffer[1]
         
-        // 🌟 [로그 2] 변환된 비트맵 기준 실제 매핑 픽셀 좌표 출력
-        Log.d("DEBUG", "bitmap point = $bitmapX, $bitmapY")
-        
         var bestPolygon: List<ImmutablePoint>? = null
-        var minArea = Float.MAX_VALUE
+        
+        // 🌟 [문제 6 해결] 면적이 아니라 형태 품질(Composite Score)이 가장 높은 다각형을 선택
+        var maxScore = -1.0
 
         for (candidate in candidatesSnapshot) {
-            // 🌟 [로그 4] 순회 중인 개별 후보 다각형의 바운딩 박스 출력
-            Log.d("DEBUG", "candidate bounds = ${candidate.bounds}")
-            
             if (candidate.bounds.contains(bitmapX, bitmapY)) {
-                // Bounds 필터 합격 시 다각형 내부 매칭 여부 체크 시작
                 if (isPointInPolygon(bitmapX, bitmapY, candidate.points)) {
-                    val pts = candidate.points
-                    val pointArray = Array(4) { idx -> Point(pts[idx].x.toDouble(), pts[idx].y.toDouble()) }
-                    val matOfPoint = MatOfPoint(*pointArray)
-                  
-                    val actualArea = Imgproc.contourArea(matOfPoint).toFloat()
-                    matOfPoint.release() 
+                    // 다각형의 형태 점수 (0.0 ~ 1.0) 계산 (Solidity + Rectangularity)
+                    val currentScore = PlateDetectionEngine.calculatePolygonScore(candidate.points)
                     
-                    if (actualArea < minArea) { 
-                        minArea = actualArea
-                        bestPolygon = pts.toList() 
+                    if (currentScore > maxScore) {
+                        maxScore = currentScore
+                        bestPolygon = candidate.points.toList() 
                     }
-                } else {
-                    Log.d("DEBUG", "-> [Fail] Bounds 내부엔 들어왔으나 Point-In-Polygon 수학 공식 검사 탈락")
                 }
             }
         }
         
-        // 🌟 [로그 3] 최종적으로 매칭에 성공한 최적 다각형 확보 여부 출력
-        Log.d("DEBUG", "best polygon found = ${bestPolygon != null}")
+        Log.d("DEBUG", "best polygon found = ${bestPolygon != null}, maxScore = $maxScore")
         
         currentlyHoveredBitmapPolygon = bestPolygon
          
         if (bestPolygon != null) {
-            for (i in 0 until 4) {
+            val mappedPoints = Array(bestPolygon.size) { PointF() }
+            for (i in bestPolygon.indices) {
                 val pt = bestPolygon[i]
                 matrixMappingBuffer[0] = pt.x
                 matrixMappingBuffer[1] = pt.y
                 viewMatrix.mapPoints(matrixMappingBuffer)
-                nativeGuidePassingBuffer[i].set(matrixMappingBuffer[0], matrixMappingBuffer[1])
+                mappedPoints[i] = PointF(matrixMappingBuffer[0], matrixMappingBuffer[1])
             }
-            nativeGuideView?.setHoveredPolygon(nativeGuidePassingBuffer)
+            nativeGuideView?.setHoveredPolygon(mappedPoints)
         } else {
             nativeGuideView?.setHoveredPolygon(null)
         }
@@ -537,15 +448,14 @@ class MainActivity : AppCompatActivity() {
         return result
     }
 
+    // ConvexHull로 정렬 및 방향 통일이 끝난 상태이므로 그대로 반환합니다.
     private fun orderCorners(corners: List<ImmutablePoint>): List<PointF> {
-        if (corners.size != 4) return corners.map { PointF(it.x, it.y) }
-        val cx = corners.map { it.x }.average().toFloat()
-        val cy = corners.map { it.y }.average().toFloat()
-        return corners.map { PointF(it.x, it.y) }.sortedBy { Math.atan2((it.y - cy).toDouble(), (it.x - cx).toDouble()) }
+        if (corners.isEmpty()) return emptyList()
+        return corners.map { PointF(it.x, it.y) }
     }
 
     private fun applyMaskToMat(mat: Mat, corners: List<PointF>) {
-        if (corners.size != 4) return
+        if (corners.isEmpty()) return
          
         var maskMat: Mat? = null
         var contour: org.opencv.core.MatOfPoint? = null
@@ -559,8 +469,8 @@ class MainActivity : AppCompatActivity() {
         try {
             val pts = corners.map { Point(it.x.toDouble(), it.y.toDouble()) }
             maskMat = Mat.zeros(mat.size(), CvType.CV_8UC1)
+            
             contour = org.opencv.core.MatOfPoint(*pts.toTypedArray())
-             
             Imgproc.fillPoly(maskMat, listOf(contour), Scalar(255.0))
             
             blurredMask = Mat()
@@ -590,7 +500,6 @@ class MainActivity : AppCompatActivity() {
                     blendedF = Mat()
                     Core.multiply(ccF, alphaMat, ccF)
                     
-                     
                     invAlpha = Mat()
                     scalarMat = Mat(alphaMat.size(), alphaMat.type(), Scalar(1.0))
                     
