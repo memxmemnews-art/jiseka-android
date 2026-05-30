@@ -11,7 +11,6 @@ import kotlin.math.min
 
 object PlateDetectionEngine {
 
-    // 🌟 [문제 해결] CLAHE 객체와 기본 커널을 지연 초기화(Lazy)하여 스레드-안전하게 재사용
     private val defaultClahe: org.opencv.imgproc.CLAHE by lazy {
         Imgproc.createCLAHE(2.0, Size(8.0, 8.0))
     }
@@ -35,9 +34,7 @@ object PlateDetectionEngine {
             Utils.bitmapToMat(fullBitmap, mat)
             Imgproc.cvtColor(mat, grayMat, Imgproc.COLOR_RGBA2GRAY)
             
-            // 🌟 재사용 가능한 CLAHE 적용 (매번 생성/해제하는 오버헤드 제거)
             defaultClahe.apply(grayMat, grayMat)
-            
             Imgproc.GaussianBlur(grayMat, bilateralMat, Size(5.0, 5.0), 0.0)
             
             val meanVal = Core.mean(bilateralMat).`val`[0]
@@ -53,6 +50,7 @@ object PlateDetectionEngine {
             Imgproc.findContours(edgeMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
             val imageArea = fullBitmap.width * fullBitmap.height.toDouble()
+            val imageHeight = fullBitmap.height.toDouble()
 
             for (contour in contours) {
                 val rect = Imgproc.boundingRect(contour)
@@ -65,7 +63,8 @@ object PlateDetectionEngine {
                 val approxPoints = extractRobustPolygon(contour) ?: continue
                 val pointArray = approxPoints.toArray()
                 
-                if (!isValidLicensePlateGeometry(contourArea, pointArray, imageArea, isRoi = false)) {
+                // 🌟 파라미터 추가: imageArea, imageHeight 전달
+                if (!isValidLicensePlateGeometry(contourArea, pointArray, imageArea, imageHeight, isRoi = false)) {
                     approxPoints.release()
                     continue
                 }
@@ -91,8 +90,6 @@ object PlateDetectionEngine {
             mat.release(); grayMat.release(); bilateralMat.release()
             edgeMat.release(); hierarchy.release()
             contours.forEach { it.release() }
-            
-            // 🌟 동적으로 생성된 커널만 release 처리, clahe.collectGarbage()는 안전을 위해 호출 제외
             morphKernel?.release() 
         }
     }
@@ -123,12 +120,12 @@ object PlateDetectionEngine {
         var bestGlobalPoints: List<ImmutablePoint>? = null
         
         val roiImageArea = roiBitmap.width * roiBitmap.height.toDouble()
+        val roiImageHeight = roiBitmap.height.toDouble()
         
         try {
             Utils.bitmapToMat(roiBitmap, roiMat)
             Imgproc.cvtColor(roiMat, roiGray, Imgproc.COLOR_RGBA2GRAY)
             
-            // 🌟 재사용 가능한 ROI 전용 CLAHE 적용
             roiClahe.apply(roiGray, roiGray)
             
             val meanVal = Core.mean(roiGray).`val`[0]
@@ -138,7 +135,6 @@ object PlateDetectionEngine {
             
             Imgproc.Canny(roiGray, roiEdge, lowerThresh, upperThresh)
             
-            // 🌟 재사용 가능한 커널 객체 적용
             Imgproc.morphologyEx(roiEdge, roiEdge, Imgproc.MORPH_CLOSE, morphCloseKernelRoi)
             Imgproc.findContours(roiEdge, roiContours, Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
@@ -151,7 +147,8 @@ object PlateDetectionEngine {
                 
                 if (approx != null) {
                     val candidateArray = approx.toArray()
-                    val isValid = isValidLicensePlateGeometry(contourArea, candidateArray, roiImageArea, isRoi = true)
+                    // 🌟 파라미터 추가: roiImageArea, roiImageHeight 전달
+                    val isValid = isValidLicensePlateGeometry(contourArea, candidateArray, roiImageArea, roiImageHeight, isRoi = true)
                     
                     if (isValid) {
                         val candidateMat = MatOfPoint(*candidateArray)
@@ -255,7 +252,10 @@ object PlateDetectionEngine {
         return sorted
     }
 
-    fun calculatePolygonScore(points: List<ImmutablePoint>): Double {
+    /**
+     * 🌟 [완전 교체] 해상도 독립적 정규화 면적(Normalized Area) 기반 스코어링 적용
+     */
+    fun calculatePolygonScore(points: List<ImmutablePoint>, imageArea: Double): Double {
         if (points.size < 4) return 0.0
         
         val pts = points.map { Point(it.x.toDouble(), it.y.toDouble()) }.toTypedArray()
@@ -273,7 +273,10 @@ object PlateDetectionEngine {
         
         val polygonArea = Imgproc.contourArea(matOfPoint)
         val hullArea = Imgproc.contourArea(hullMat)
+        val boundingRect = Imgproc.boundingRect(hullMat)
+        
         val solidity = if (hullArea > 0) polygonArea / hullArea else 0.0
+        val extent = if (boundingRect.area() > 0) hullArea / boundingRect.area() else 0.0
         
         val minAreaRect = Imgproc.minAreaRect(matOfPoint2f)
         var w = minAreaRect.size.width
@@ -282,7 +285,12 @@ object PlateDetectionEngine {
         val rectArea = w * h
         val rectangularity = if (rectArea > 0) polygonArea / rectArea else 0.0
         
-        val score = (solidity * 0.5) + (rectangularity * 0.5)
+        // 정규화된 면적 점수 (화면 대비 25% 차지 시 만점)
+        val normalizedArea = polygonArea / imageArea
+        val normalizedAreaScore = min(normalizedArea / 0.25, 1.0)
+        
+        // 종합 점수 계산
+        val score = (solidity * 0.30) + (rectangularity * 0.25) + (extent * 0.20) + (normalizedAreaScore * 0.25)
         
         hullIndices.release()
         hullMat.release()
@@ -292,10 +300,14 @@ object PlateDetectionEngine {
         return score
     }
 
+    /**
+     * 🌟 [완전 교체] 최소 높이(Height) 컷오프를 통한 글자 조각 조기 차단
+     */
     private fun isValidLicensePlateGeometry(
         originalContourArea: Double,
         hullPoints: Array<Point>, 
         referenceImageArea: Double,
+        referenceImageHeight: Double,
         isRoi: Boolean
     ): Boolean {
         if (hullPoints.size !in 4..10) return false
@@ -311,30 +323,39 @@ object PlateDetectionEngine {
                 return false
             }
         } else {
-            if (normalizedArea < 0.0005 || normalizedArea > 0.05) {
+            // 하한선 상향 조정: 0.002(0.2%) 이하의 엠블럼, 글자는 사전 탈락
+            if (normalizedArea < 0.002 || normalizedArea > 0.05) {
                 hullMat.release()
                 return false
             }
         }
 
+        val hullMat2f = MatOfPoint2f(*hullPoints)
+        val minAreaRect = Imgproc.minAreaRect(hullMat2f)
+        var w = minAreaRect.size.width
+        var h = minAreaRect.size.height
+        if (w < h) { val temp = w; w = h; h = temp }
+        
+        // 이미지 높이 기준 1.5% 미만인 얇은 선이나 글자는 탈락
+        if (!isRoi && h < referenceImageHeight * 0.015) {
+            hullMat.release()
+            hullMat2f.release()
+            return false
+        }
+
         val solidity = originalContourArea / hullArea
         if (solidity < 0.75) {
             hullMat.release()
+            hullMat2f.release()
             return false
         }
 
         val extent = hullArea / (boundingRect.width * boundingRect.height).toDouble()
         if (extent < 0.50) {
             hullMat.release()
+            hullMat2f.release()
             return false
         }
-
-        val hullMat2f = MatOfPoint2f(*hullPoints)
-        val minAreaRect = Imgproc.minAreaRect(hullMat2f)
-        
-        var w = minAreaRect.size.width
-        var h = minAreaRect.size.height
-        if (w < h) { val temp = w; w = h; h = temp }
         
         val rectArea = w * h
         val rectangularity = if (rectArea > 0) hullArea / rectArea else 0.0
