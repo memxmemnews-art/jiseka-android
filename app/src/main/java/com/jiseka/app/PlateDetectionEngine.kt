@@ -35,7 +35,7 @@ object PlateDetectionEngine {
             Imgproc.cvtColor(mat, grayMat, Imgproc.COLOR_RGBA2GRAY)
             
             defaultClahe.apply(grayMat, grayMat)
-            Imgproc.GaussianBlur(grayMat, bilateralMat, Size(5.0, 5.0), 0.0)
+            Imgproc.GaussianBlur(grayMat, bilateralMat, Size(7.0, 7.0), 0.0) // 모아레 완화를 위해 블러 유지
             
             val meanVal = Core.mean(bilateralMat).`val`[0]
             val lowerThresh = max(0.0, 0.5 * meanVal)
@@ -43,7 +43,7 @@ object PlateDetectionEngine {
             Imgproc.Canny(bilateralMat, edgeMat, lowerThresh, upperThresh)
             
             val kernelWidth = (fullBitmap.width * 0.012).coerceIn(15.0, 60.0)
-            val kernelHeight = (kernelWidth * 0.25).coerceIn(3.0, 15.0)
+            val kernelHeight = (kernelWidth * 0.3).coerceIn(4.0, 15.0) 
             morphKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(kernelWidth, kernelHeight))
             Imgproc.morphologyEx(edgeMat, edgeMat, Imgproc.MORPH_CLOSE, morphKernel)
             
@@ -307,13 +307,15 @@ object PlateDetectionEngine {
         val boundingRect = Imgproc.boundingRect(hullMat)
         
         val normalizedArea = hullArea / referenceImageArea
+        
+        // 🌟 1차 테스트를 위한 코드 수정 (최소 면적 제한 하한선 완전 제거)
         if (isRoi) {
             if (normalizedArea < 0.10) {
                 hullMat.release()
                 return false
             }
         } else {
-            if (normalizedArea < 0.002 || normalizedArea > 0.05) {
+            if (normalizedArea > 0.05) {
                 hullMat.release()
                 return false
             }
@@ -325,21 +327,22 @@ object PlateDetectionEngine {
         var h = minAreaRect.size.height
         if (w < h) { val temp = w; w = h; h = temp }
         
-        if (!isRoi && h < referenceImageHeight * 0.015) {
+        // 이전 단계에서 완화해둔 모니터 환경 컷오프 수치 유지
+        if (!isRoi && h < referenceImageHeight * 0.008) {
             hullMat.release()
             hullMat2f.release()
             return false
         }
 
         val solidity = originalContourArea / hullArea
-        if (solidity < 0.75) {
+        if (solidity < 0.60) {
             hullMat.release()
             hullMat2f.release()
             return false
         }
 
         val extent = hullArea / (boundingRect.width * boundingRect.height).toDouble()
-        if (extent < 0.50) {
+        if (extent < 0.40) {
             hullMat.release()
             hullMat2f.release()
             return false
@@ -351,7 +354,7 @@ object PlateDetectionEngine {
         hullMat.release()
         hullMat2f.release()
 
-        if (rectangularity < 0.65) return false
+        if (rectangularity < 0.55) return false
 
         if (h < 1e-6) return false
         val ratio = w / h
