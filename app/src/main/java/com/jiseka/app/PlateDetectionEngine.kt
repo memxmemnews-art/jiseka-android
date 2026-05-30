@@ -35,19 +35,21 @@ object PlateDetectionEngine {
             Imgproc.cvtColor(mat, grayMat, Imgproc.COLOR_RGBA2GRAY)
             
             defaultClahe.apply(grayMat, grayMat)
-            Imgproc.GaussianBlur(grayMat, bilateralMat, Size(7.0, 7.0), 0.0) // 모아레 완화를 위해 블러 유지
+            Imgproc.GaussianBlur(grayMat, bilateralMat, Size(7.0, 7.0), 0.0)
             
             val meanVal = Core.mean(bilateralMat).`val`[0]
             val lowerThresh = max(0.0, 0.5 * meanVal)
             val upperThresh = min(255.0, 1.5 * meanVal)
             Imgproc.Canny(bilateralMat, edgeMat, lowerThresh, upperThresh)
             
-            val kernelWidth = (fullBitmap.width * 0.012).coerceIn(15.0, 60.0)
-            val kernelHeight = (kernelWidth * 0.3).coerceIn(4.0, 15.0) 
+            // 🌟 빛 번짐이나 모아레 때문에 범퍼와 번호판이 떡지는 것을 막기 위해 커널 다이어트
+            val kernelWidth = (fullBitmap.width * 0.008).coerceIn(10.0, 40.0)
+            val kernelHeight = (kernelWidth * 0.25).coerceIn(3.0, 10.0)
             morphKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(kernelWidth, kernelHeight))
             Imgproc.morphologyEx(edgeMat, edgeMat, Imgproc.MORPH_CLOSE, morphKernel)
             
-            Imgproc.findContours(edgeMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+            // 🌟 핵심: RETR_LIST를 사용하여 내/외부 모든 윤곽선을 추출합니다.
+            Imgproc.findContours(edgeMat, contours, hierarchy, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE)
 
             val imageArea = fullBitmap.width * fullBitmap.height.toDouble()
             val imageHeight = fullBitmap.height.toDouble()
@@ -135,7 +137,8 @@ object PlateDetectionEngine {
             Imgproc.Canny(roiGray, roiEdge, lowerThresh, upperThresh)
             
             Imgproc.morphologyEx(roiEdge, roiEdge, Imgproc.MORPH_CLOSE, morphCloseKernelRoi)
-            Imgproc.findContours(roiEdge, roiContours, Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+            // 🌟 ROI 재탐색 시에도 RETR_LIST 적용
+            Imgproc.findContours(roiEdge, roiContours, Mat(), Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE)
 
             var bestApprox2f: MatOfPoint2f? = null
             var maxArea = -1.0
@@ -200,7 +203,8 @@ object PlateDetectionEngine {
         val approx2f = MatOfPoint2f()
         
         val perimeter = Imgproc.arcLength(contour2f, true)
-        Imgproc.approxPolyDP(contour2f, approx2f, perimeter * 0.03, true)
+        // 🌟 둥근 번호판 정밀도를 살짝 높임 (0.02)
+        Imgproc.approxPolyDP(contour2f, approx2f, perimeter * 0.02, true)
         
         val approxPointMat = MatOfPoint(*approx2f.toArray())
         val hullIndices = MatOfInt()
@@ -308,14 +312,14 @@ object PlateDetectionEngine {
         
         val normalizedArea = hullArea / referenceImageArea
         
-        // 🌟 1차 테스트를 위한 코드 수정 (최소 면적 제한 하한선 완전 제거)
         if (isRoi) {
             if (normalizedArea < 0.10) {
                 hullMat.release()
                 return false
             }
         } else {
-            if (normalizedArea > 0.05) {
+            // 🌟 RETR_LIST로 인해 늘어난 노이즈를 컷오프(0.1%)로 다시 차단합니다.
+            if (normalizedArea < 0.001 || normalizedArea > 0.05) {
                 hullMat.release()
                 return false
             }
@@ -327,14 +331,15 @@ object PlateDetectionEngine {
         var h = minAreaRect.size.height
         if (w < h) { val temp = w; w = h; h = temp }
         
-        // 이전 단계에서 완화해둔 모니터 환경 컷오프 수치 유지
-        if (!isRoi && h < referenceImageHeight * 0.008) {
+        // 🌟 최소 높이 제한 1.0%
+        if (!isRoi && h < referenceImageHeight * 0.01) {
             hullMat.release()
             hullMat2f.release()
             return false
         }
 
         val solidity = originalContourArea / hullArea
+        // 🌟 완화된 컷오프 유지 (모니터 화질 대응)
         if (solidity < 0.60) {
             hullMat.release()
             hullMat2f.release()
