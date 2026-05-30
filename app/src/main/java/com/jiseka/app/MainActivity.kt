@@ -354,13 +354,11 @@ class MainActivity : AppCompatActivity() {
         var bestPolygon: List<ImmutablePoint>? = null
         var maxScore = -1.0
         
-        // 🌟 스코어링 공식에 필요한 이미지 전체 면적을 여기서 한 번만 계산하여 파라미터로 전달
         val safeBitmapArea = synchronized(bitmapLock) { lastCapturedBitmap?.let { it.width * it.height.toDouble() } ?: 1.0 }
 
         for (candidate in candidatesSnapshot) {
             if (candidate.bounds.contains(bitmapX, bitmapY)) {
                 if (isPointInPolygon(bitmapX, bitmapY, candidate.points)) {
-                    // 🌟 수정된 스코어링 함수 호출 (imageArea 매개변수 전달)
                     val currentScore = PlateDetectionEngine.calculatePolygonScore(candidate.points, safeBitmapArea)
                     
                     if (currentScore > maxScore) {
