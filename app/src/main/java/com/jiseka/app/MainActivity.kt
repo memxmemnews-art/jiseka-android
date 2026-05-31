@@ -1,8 +1,6 @@
 package com.jiseka.app
 
-import android.Manifest
 import android.content.ContentValues
-import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
@@ -35,9 +33,7 @@ import androidx.camera.core.UseCaseGroup
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.camera.view.TransformExperimental
-import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
 import org.opencv.core.Core
 import org.opencv.core.CvType
@@ -94,8 +90,6 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        if (!OpenCVLoader.initDebug()) Log.e("CAMERA_DEBUG", "OpenCV initialization failed.")
-
         viewFinder = findViewById(R.id.viewFinder)
         viewFinder?.implementationMode = PreviewView.ImplementationMode.COMPATIBLE
         viewFinder?.scaleType = PreviewView.ScaleType.FILL_CENTER
@@ -116,13 +110,14 @@ class MainActivity : AppCompatActivity() {
         setupUIListeners()
         resetToLiveMode()
 
-        if (allPermissionsGranted()) viewFinder?.post { startCamera() }
-        else ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
+        // SplashActivity에서 이미 권한과 OpenCV 초기화를 보장하므로 바로 카메라 실행
+        viewFinder?.post { startCamera() }
     }
 
     private fun setupUIListeners() {
         btnCapture?.setOnClickListener { takePhoto() }
         findViewById<Button>(R.id.btnRetry).setOnClickListener { resetToLiveMode() }
+  
         findViewById<Button>(R.id.btnSave).setOnClickListener {
             displayedBitmap?.let { bmp -> saveBitmapToGallery(bmp) } 
                 ?: Toast.makeText(this, "저장할 이미지가 없습니다.", Toast.LENGTH_SHORT).show()
@@ -131,6 +126,7 @@ class MainActivity : AppCompatActivity() {
         nativeGuideView?.onCrosshairMoveListener = { uiPoint -> handleCrosshairMove(uiPoint) }
         
         nativeGuideView?.onDwellTriggeredListener = { currentLevel ->
+            
             val anchorSnapshot = currentlyHoveredBitmapPolygon?.toList()
             val currentSession = captureSessionId.get()
             val targetLevel = currentLevel + 1
@@ -142,7 +138,8 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
                 
                 precomputeExecutor.execute {
-                   if (captureSessionId.get() != currentSession) { 
+                  
+                    if (captureSessionId.get() != currentSession) { 
                         isRefining = false
                         return@execute 
                     }
@@ -155,10 +152,11 @@ class MainActivity : AppCompatActivity() {
 
                         runOnUiThread {
                             if (tightenedPolygon != null && tightenedPolygon.isNotEmpty() && captureSessionId.get() == currentSession) {
+                
                                 currentlyHoveredBitmapPolygon = tightenedPolygon
                                 val xCoords = tightenedPolygon.map { it.x }
                                 val yCoords = tightenedPolygon.map { it.y }
-                                
+      
                                 val newBounds = RectF(
                                     xCoords.minOrNull() ?: 0f,
                                     yCoords.minOrNull() ?: 0f,
@@ -173,10 +171,11 @@ class MainActivity : AppCompatActivity() {
                                 val uiTightPolygon = tightenedPolygon.map { pt ->
                                     matrixMappingBuffer[0] = pt.x
                                     matrixMappingBuffer[1] = pt.y
+                    
                                     viewMatrix.mapPoints(matrixMappingBuffer)
                                     PointF(matrixMappingBuffer[0], matrixMappingBuffer[1])
                                 }.toTypedArray()
-                              
+               
                                 nativeGuideView?.setHoveredPolygon(uiTightPolygon)
                                 nativeGuideView?.notifyRefinementCompleted(true)
                             } else {
@@ -184,6 +183,7 @@ class MainActivity : AppCompatActivity() {
                             }
 
                             isRefining = false
+ 
                             if (pendingMaskRequest) {
                                 pendingMaskRequest = false
                                 val target = currentlyHoveredBitmapPolygon?.toList()
@@ -240,6 +240,7 @@ class MainActivity : AppCompatActivity() {
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
+          
             val cameraProvider = cameraProviderFuture.get()
             
             val preview = Preview.Builder().build().also { it.setSurfaceProvider(viewFinder?.surfaceProvider) }
@@ -247,6 +248,7 @@ class MainActivity : AppCompatActivity() {
             
             try {
                 cameraProvider.unbindAll()
+          
                 val viewPort = viewFinder?.viewPort
                 if (viewPort != null) {
                     val useCaseGroup = UseCaseGroup.Builder()
@@ -266,21 +268,24 @@ class MainActivity : AppCompatActivity() {
         btnCapture?.isEnabled = false
         progressBar?.visibility = View.VISIBLE
         btnCapture?.visibility = View.GONE
-         
+ 
         val currentSessionId = captureSessionId.incrementAndGet()
         imageCapture?.takePicture(cameraExecutor, object : ImageCapture.OnImageCapturedCallback() {
             override fun onCaptureSuccess(imageProxy: ImageProxy) {
                 try {
                     val uprightBitmap = imageProxy.toUprightBitmap()
+             
                     synchronized(bitmapLock) { 
                         lastCapturedBitmap?.recycle() 
                         lastCapturedBitmap = uprightBitmap 
                     }
+                   
                     runOnUiThread {
                         if (isFinishing || isDestroyed || captureSessionId.get() != currentSessionId) return@runOnUiThread
                         viewFinder?.visibility = View.GONE
                         nativeBackgroundView?.setImageBitmap(uprightBitmap)
                         nativeBackgroundView?.visibility = View.VISIBLE
+                   
                         progressBar?.visibility = View.GONE 
                         setupMatrixAndPrecalculate(currentSessionId)
                     }
@@ -302,6 +307,7 @@ class MainActivity : AppCompatActivity() {
         
         bgView.viewTreeObserver.addOnPreDrawListener(object : ViewTreeObserver.OnPreDrawListener {
             override fun onPreDraw(): Boolean {
+  
                 bgView.viewTreeObserver.removeOnPreDrawListener(this)
                 
                 val viewW = bgView.width.toFloat()
@@ -312,21 +318,23 @@ class MainActivity : AppCompatActivity() {
                 val scale = max(viewW / imgW, viewH / imgH)
                 val offsetX = (viewW - (imgW * scale)) / 2f
                 val offsetY = (viewH - (imgH * scale)) / 2f
-                
+    
                 viewMatrix.reset()
                 viewMatrix.postScale(scale, scale)
                 viewMatrix.postTranslate(offsetX, offsetY)
          
                 isMatrixReady = viewMatrix.invert(inverseMatrix)
-                
+           
                 nativeGuideView?.visibility = View.VISIBLE
                 
                 precomputeExecutor.execute {
                     if (captureSessionId.get() != sessionId) return@execute
+                    
                     val bitmapCopy = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) }
                     if (bitmapCopy != null) {
                         val candidates = PlateDetectionEngine.precalculateGeometryCandidates(bitmapCopy)
                         bitmapCopy.recycle()
+                  
                         if (captureSessionId.get() == sessionId) precalculatedCandidates = candidates
                     }
                 }
@@ -346,6 +354,7 @@ class MainActivity : AppCompatActivity() {
         
         matrixMappingBuffer[0] = uiPoint.x
         matrixMappingBuffer[1] = uiPoint.y
+      
         inverseMatrix.mapPoints(matrixMappingBuffer)
         
         val bitmapX = matrixMappingBuffer[0]
@@ -359,6 +368,7 @@ class MainActivity : AppCompatActivity() {
         for (candidate in candidatesSnapshot) {
             if (candidate.bounds.contains(bitmapX, bitmapY)) {
                 if (isPointInPolygon(bitmapX, bitmapY, candidate.points)) {
+            
                     val currentScore = PlateDetectionEngine.calculatePolygonScore(candidate.points, safeBitmapArea)
                     
                     if (currentScore > maxScore) {
@@ -407,6 +417,7 @@ class MainActivity : AppCompatActivity() {
                     val resultMat = Mat()
                     Utils.bitmapToMat(safeTargetBitmap, resultMat)
                     applyMaskToMat(resultMat, orderedCorners)
+                  
                     val resultBitmap = Bitmap.createBitmap(resultMat.cols(), resultMat.rows(), Bitmap.Config.ARGB_8888)
                      
                     Utils.matToBitmap(resultMat, resultBitmap)
@@ -425,7 +436,7 @@ class MainActivity : AppCompatActivity() {
                         oldBitmap?.let { bmp -> 
                             nativeBackgroundView?.post { if (!bmp.isRecycled) bmp.recycle() } 
                         }
-                        
+              
                         progressBar?.visibility = View.GONE
                         resultActionLayout?.visibility = View.VISIBLE
                     }
@@ -439,6 +450,7 @@ class MainActivity : AppCompatActivity() {
     private fun isPointInPolygon(px: Float, py: Float, polygon: List<ImmutablePoint>): Boolean {
         var result = false
         var j = polygon.size - 1
+ 
         for (i in polygon.indices) {
             if ((polygon[i].y > py) != (polygon[j].y > py) && (px < (polygon[j].x - polygon[i].x) * (py - polygon[i].y) / (polygon[j].y - polygon[i].y) + polygon[i].x)) result = !result
             j = i
@@ -491,12 +503,12 @@ class MainActivity : AppCompatActivity() {
                     mcF = Mat()
                     ccF = Mat()
                     matChannels[i].convertTo(mcF, CvType.CV_32F)
-                     
+                 
                     coloredChannels[i].convertTo(ccF, CvType.CV_32F)
                     
                     blendedF = Mat()
                     Core.multiply(ccF, alphaMat, ccF)
-                    
+           
                     invAlpha = Mat()
                     scalarMat = Mat(alphaMat.size(), alphaMat.type(), Scalar(1.0))
                     
@@ -542,13 +554,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 1001 && allPermissionsGranted()) viewFinder?.post { startCamera() }
-    }
-    
-    private fun allPermissionsGranted() = arrayOf(Manifest.permission.CAMERA).all { ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED }
-    
     override fun onDestroy() {
         synchronized(bitmapLock) { 
              lastCapturedBitmap?.recycle()
@@ -561,10 +566,5 @@ class MainActivity : AppCompatActivity() {
         precomputeExecutor.shutdownNow()
         maskExecutor.shutdownNow()
         super.onDestroy()
-    }
-
-    companion object { 
-         private const val REQUEST_CODE_PERMISSIONS = 1001
-        private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA) 
     }
 }
