@@ -177,7 +177,7 @@ class MainActivity : AppCompatActivity() {
                                 currentlyHoveredBitmapPolygon = tightenedPolygon
                                 val xCoords = tightenedPolygon.map { it.x }
                                 val yCoords = tightenedPolygon.map { it.y }
-      
+       
                                 val newBounds = RectF(
                                     xCoords.minOrNull() ?: 0f,
                                     yCoords.minOrNull() ?: 0f,
@@ -350,13 +350,13 @@ class MainActivity : AppCompatActivity() {
                             lastCapturedBitmap?.recycle() 
                             lastCapturedBitmap = uprightBitmap 
                         }
-                       
+                        
                         runOnUiThread {
                             if (isFinishing || isDestroyed || captureSessionId.get() != currentSessionId) return@runOnUiThread
                             viewFinder?.visibility = View.GONE
                             nativeBackgroundView?.setImageBitmap(uprightBitmap)
                             nativeBackgroundView?.visibility = View.VISIBLE
-                       
+                        
                             progressBar?.visibility = View.GONE 
                             setupMatrixAndPrecalculate(currentSessionId)
                         }
@@ -407,7 +407,7 @@ class MainActivity : AppCompatActivity() {
                 viewMatrix.postTranslate(offsetX, offsetY)
          
                 isMatrixReady = viewMatrix.invert(inverseMatrix)
-           
+            
                 nativeGuideView?.visibility = View.VISIBLE
                 guideText?.visibility = View.VISIBLE 
                 
@@ -682,6 +682,11 @@ class MainActivity : AppCompatActivity() {
         precomputeExecutor.shutdownNow()
         maskExecutor.shutdownNow()
         super.onDestroy()
+    }
+
+    // 🔥 추가된 함수: 권한 체크 로직
+    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
+        ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
     }
 
     companion object { 
