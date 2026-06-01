@@ -16,30 +16,35 @@ import java.util.concurrent.Executors
 
 class SplashActivity : AppCompatActivity() {
 
-    private val splashDelay = 2000L // 최소 스플래시 대기 시간 (2초)
+    private val splashDelay = 2000L
     private val startTime = System.currentTimeMillis()
+    
+    // 💡 Race Condition 방지용 플래그 추가
+    private var alreadyProceeding = false 
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_splash)
 
-        // 1. 백그라운드 스레드에서 OpenCV 미리 초기화
         Executors.newSingleThreadExecutor().execute {
+            // 💡 OpenCV 초기화 실패 시 즉시 종료되도록 수정
             if (OpenCVLoader.initDebug()) {
                 Log.d("SPLASH_DEBUG", "OpenCV initialization succeeded.")
+                
+                runOnUiThread {
+                    if (checkCameraPermission()) {
+                        proceedToMainWithDelay()
+                    }
+                }
             } else {
                 Log.e("SPLASH_DEBUG", "OpenCV initialization failed.")
-            }
-            
-            // 2. 초기화 완료 후 메인 스레드에서 권한 확인
-            runOnUiThread {
-                if (checkCameraPermission()) {
-                    proceedToMainWithDelay()
+                runOnUiThread {
+                    Toast.makeText(this@SplashActivity, "핵심 모듈(OpenCV) 초기화에 실패하여 앱을 종료합니다.", Toast.LENGTH_LONG).show()
+                    finish()
                 }
             }
         }
 
-        // 3. 카메라 권한이 없다면 요청
         if (!checkCameraPermission()) {
             ActivityCompat.requestPermissions(
                 this,
@@ -57,6 +62,10 @@ class SplashActivity : AppCompatActivity() {
     }
 
     private fun proceedToMainWithDelay() {
+        // 💡 중복 실행 방지 방어 코드 적용
+        if (alreadyProceeding) return
+        alreadyProceeding = true
+
         val elapsedTime = System.currentTimeMillis() - startTime
         val remainingTime = splashDelay - elapsedTime
 
