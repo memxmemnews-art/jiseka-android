@@ -19,7 +19,6 @@ class SplashActivity : AppCompatActivity() {
     private val splashDelay = 2000L
     private val startTime = System.currentTimeMillis()
     
-    // 💡 Race Condition 방지용 플래그 추가
     private var alreadyProceeding = false 
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -27,10 +26,8 @@ class SplashActivity : AppCompatActivity() {
         setContentView(R.layout.activity_splash)
 
         Executors.newSingleThreadExecutor().execute {
-            // 💡 OpenCV 초기화 실패 시 즉시 종료되도록 수정
             if (OpenCVLoader.initDebug()) {
                 Log.d("SPLASH_DEBUG", "OpenCV initialization succeeded.")
-                
                 runOnUiThread {
                     if (checkCameraPermission()) {
                         proceedToMainWithDelay()
@@ -62,7 +59,6 @@ class SplashActivity : AppCompatActivity() {
     }
 
     private fun proceedToMainWithDelay() {
-        // 💡 중복 실행 방지 방어 코드 적용
         if (alreadyProceeding) return
         alreadyProceeding = true
 
