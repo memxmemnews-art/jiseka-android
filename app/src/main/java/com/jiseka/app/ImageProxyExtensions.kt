@@ -16,7 +16,9 @@ fun ImageProxy.toUprightBitmap(): Bitmap {
         val buffer = planes[0].buffer
         val bytes = ByteArray(buffer.remaining())
         buffer.get(bytes)
+        // 💡 널(null) 데이터로 인한 크래시를 방어
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            ?: throw IllegalStateException("사진 데이터를 해독할 수 없습니다.")
     }
 
     val matrix = Matrix().apply {
@@ -59,5 +61,8 @@ private fun yuv420ToBitmap(image: ImageProxy): Bitmap {
     yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), 100, out)
     
     val imageBytes = out.toByteArray()
+    
+    // 💡 널(null) 데이터로 인한 크래시를 방어
     return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+        ?: throw IllegalStateException("YUV 데이터를 해독할 수 없습니다.")
 }
