@@ -21,7 +21,8 @@ class NativeGuideView @JvmOverloads constructor(
     var onDwellTriggeredListener: ((Int) -> Unit)? = null
 
     private val crosshairPoint = PointF()
-    private var hasCrosshair = false
+    // 💡 수정됨: 터치 전에도 처음부터 십자선이 보이도록 강제 활성화
+    private var hasCrosshair = true 
     
     private var uiPolygonBuffer = emptyArray<PointF>()
     private var hasHoveredPolygon = false
@@ -54,7 +55,9 @@ class NativeGuideView @JvmOverloads constructor(
 
     fun resetState() {
         dwellHandler.removeCallbacksAndMessages(null)
-        isDwelling = false; refinementLevel = 0; hasHoveredPolygon = false; hasCrosshair = false
+        isDwelling = false; refinementLevel = 0; hasHoveredPolygon = false
+        // 💡 수정됨: 라이브 모드로 돌아갈 때 십자선을 다시 켜둠
+        hasCrosshair = true 
         uiPolygonBuffer = emptyArray()
         postInvalidateOnAnimation()
     }
@@ -68,18 +71,10 @@ class NativeGuideView @JvmOverloads constructor(
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
-        if (w > 0 && h > 0 && !hasCrosshair) crosshairPoint.set(w / 2f, h / 2f)
-    }
-
-    fun setHoveredPolygon(points: Array<PointF>?) {
-        if (points == null || points.isEmpty()) {
-            hasHoveredPolygon = false
-            uiPolygonBuffer = emptyArray()
-        } else {
-            uiPolygonBuffer = points
-            hasHoveredPolygon = true
+        // 💡 수정됨: 화면 크기가 결정되면 즉시 화면 정중앙에 십자선을 배치
+        if (w > 0 && h > 0) {
+            crosshairPoint.set(w / 2f, h / 2f)
         }
-        postInvalidateOnAnimation()
     }
 
     override fun onDraw(canvas: Canvas) {
