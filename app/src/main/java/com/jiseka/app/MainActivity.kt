@@ -23,6 +23,7 @@ import android.widget.Button
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
+import android.widget.TextView
 import android.widget.Toast
 import androidx.annotation.OptIn
 import androidx.appcompat.app.AppCompatActivity
@@ -65,6 +66,9 @@ class MainActivity : AppCompatActivity() {
     private var resultActionLayout: LinearLayout? = null
     private var btnCapture: Button? = null
     private var progressBar: ProgressBar? = null
+    
+    // 💡 안내 문구용 텍스트뷰 추가
+    private var guideText: TextView? = null
 
     private var imageCapture: ImageCapture? = null
     private lateinit var cameraExecutor: ExecutorService
@@ -93,7 +97,6 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
-        // 💡 만약 스플래시 화면을 우회하여 앱이 복원되었을 때 OpenCV가 켜져있지 않다면 안전하게 차단
         if (!OpenCVLoader.initDebug()) {
             Log.e("CAMERA_DEBUG", "OpenCV initialization failed in MainActivity.")
             Toast.makeText(this, "엔진 초기화에 실패했습니다. 앱을 다시 실행해주세요.", Toast.LENGTH_LONG).show()
@@ -114,6 +117,9 @@ class MainActivity : AppCompatActivity() {
         resultActionLayout = findViewById(R.id.resultActionLayout)
         btnCapture = findViewById(R.id.btnCapture)
         progressBar = findViewById(R.id.progressBar)
+        
+        // 💡 XML에 추가한 가이드 텍스트뷰 연결
+        guideText = findViewById(R.id.guideText)
 
         cameraExecutor = Executors.newSingleThreadExecutor()
          
@@ -243,6 +249,8 @@ class MainActivity : AppCompatActivity() {
         nativeBackgroundView?.visibility = View.GONE
         resultActionLayout?.visibility = View.GONE
         progressBar?.visibility = View.GONE
+        // 💡 라이브 뷰(카메라) 모드에서는 안내 문구 숨김
+        guideText?.visibility = View.GONE
     }
 
     private fun startCamera() {
@@ -357,6 +365,8 @@ class MainActivity : AppCompatActivity() {
                 isMatrixReady = viewMatrix.invert(inverseMatrix)
            
                 nativeGuideView?.visibility = View.VISIBLE
+                // 💡 십자선 가이드 뷰가 나타날 때 설명 문구도 같이 띄웁니다.
+                guideText?.visibility = View.VISIBLE 
                 
                 precomputeExecutor.execute {
                     if (captureSessionId.get() != sessionId) return@execute
@@ -430,6 +440,8 @@ class MainActivity : AppCompatActivity() {
         val currentSessionId = captureSessionId.get()
         progressBar?.visibility = View.VISIBLE
         nativeGuideView?.visibility = View.GONE
+        // 💡 마스킹(잘라내기)을 시작하면 안내 문구는 이제 필요 없으므로 숨깁니다.
+        guideText?.visibility = View.GONE 
          
         try {
             maskExecutor.execute {
@@ -437,6 +449,7 @@ class MainActivity : AppCompatActivity() {
                     runOnUiThread { 
                         progressBar?.visibility = View.GONE
                         nativeGuideView?.visibility = View.VISIBLE 
+                        guideText?.visibility = View.VISIBLE
                     }
                     return@execute
                 }
@@ -476,6 +489,7 @@ class MainActivity : AppCompatActivity() {
                         runOnUiThread { 
                             progressBar?.visibility = View.GONE
                             nativeGuideView?.visibility = View.VISIBLE 
+                            guideText?.visibility = View.VISIBLE
                         }
                     } finally { 
                         safeTargetBitmap.recycle() 
@@ -484,6 +498,7 @@ class MainActivity : AppCompatActivity() {
                     runOnUiThread { 
                         progressBar?.visibility = View.GONE
                         nativeGuideView?.visibility = View.VISIBLE 
+                        guideText?.visibility = View.VISIBLE
                         Toast.makeText(this@MainActivity, "이미지 데이터를 불러올 수 없습니다.", Toast.LENGTH_SHORT).show()
                     }
                 }
@@ -492,10 +507,12 @@ class MainActivity : AppCompatActivity() {
             Log.w("CAMERA_DEBUG", "Mask execution rejected due to rapid interactions")
             progressBar?.visibility = View.GONE
             nativeGuideView?.visibility = View.VISIBLE
+            guideText?.visibility = View.VISIBLE
         } catch (e: Exception) {
             Log.e("CAMERA_DEBUG", "Failed to execute masking task", e)
             progressBar?.visibility = View.GONE
             nativeGuideView?.visibility = View.VISIBLE
+            guideText?.visibility = View.VISIBLE
         }
     }
 
