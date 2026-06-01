@@ -43,9 +43,9 @@
         android:layout_marginTop="60dp"
         android:background="#80000000"
         android:padding="16dp"
-        android:text="👆 십자선을 드래그하여 번호판 위치로 옮겨주세요."
+        android:text="십자선을 번호판 위로 옮겨주세요"
         android:textColor="#FFFFFF"
-        android:textSize="16sp"
+        android:textSize="20sp"
         android:textStyle="bold"
         android:visibility="gone"
         app:layout_constraintEnd_toEndOf="parent"
@@ -73,10 +73,15 @@
 
         <Button
             android:id="@+id/btnCapture"
-            android:layout_width="80dp"
-            android:layout_height="80dp"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:minWidth="120dp"
+            android:minHeight="60dp"
+            android:background="@drawable/bg_round_button"
             android:text="촬영"
-            android:textSize="16sp"
+            android:textColor="#FFFFFF"
+            android:textSize="22sp"
+            android:textStyle="bold"
             app:layout_constraintTop_toTopOf="parent"
             app:layout_constraintBottom_toBottomOf="parent"
             app:layout_constraintStart_toStartOf="parent"
@@ -98,16 +103,26 @@
                 android:id="@+id/btnRetry"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_marginEnd="32dp"
+                android:minWidth="130dp"
+                android:minHeight="60dp"
+                android:layout_marginEnd="24dp"
+                android:background="@drawable/bg_round_button"
                 android:text="다시 촬영"
-                android:textSize="16sp" />
+                android:textColor="#FFFFFF"
+                android:textSize="22sp"
+                android:textStyle="bold" />
 
             <Button
                 android:id="@+id/btnSave"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
+                android:minWidth="130dp"
+                android:minHeight="60dp"
+                android:background="@drawable/bg_round_button"
                 android:text="저장"
-                android:textSize="16sp" />
+                android:textColor="#FFFFFF"
+                android:textSize="22sp"
+                android:textStyle="bold" />
 
         </LinearLayout>
 
