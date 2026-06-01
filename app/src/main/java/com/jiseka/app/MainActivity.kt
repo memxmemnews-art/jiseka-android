@@ -17,6 +17,7 @@ import android.os.Bundle
 import android.os.Looper
 import android.provider.MediaStore
 import android.util.Log
+import android.view.OrientationEventListener
 import android.view.View
 import android.view.ViewTreeObserver
 import android.widget.Button
@@ -65,10 +66,15 @@ class MainActivity : AppCompatActivity() {
     private var nativeGuideView: NativeGuideView? = null
     private var resultActionLayout: LinearLayout? = null
     private var btnCapture: Button? = null
+    private var btnRetry: Button? = null
+    private var btnSave: Button? = null
     private var progressBar: ProgressBar? = null
-    
-    // 💡 안내 문구용 텍스트뷰 추가
     private var guideText: TextView? = null
+
+    // 💡 센서 및 회전 상태 캐싱 변수
+    private var orientationEventListener: OrientationEventListener? = null
+    private var currentLogicalRotation = 0f
+    private var accumulatedRotation = 0f
 
     private var imageCapture: ImageCapture? = null
     private lateinit var cameraExecutor: ExecutorService
@@ -116,9 +122,9 @@ class MainActivity : AppCompatActivity() {
         nativeGuideView = findViewById(R.id.nativeGuideView)
         resultActionLayout = findViewById(R.id.resultActionLayout)
         btnCapture = findViewById(R.id.btnCapture)
+        btnRetry = findViewById(R.id.btnRetry)
+        btnSave = findViewById(R.id.btnSave)
         progressBar = findViewById(R.id.progressBar)
-        
-        // 💡 XML에 추가한 가이드 텍스트뷰 연결
         guideText = findViewById(R.id.guideText)
 
         cameraExecutor = Executors.newSingleThreadExecutor()
@@ -127,6 +133,7 @@ class MainActivity : AppCompatActivity() {
         maskExecutor = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(1), ThreadPoolExecutor.AbortPolicy())
 
         setupUIListeners()
+        setupOrientationListener() // 💡 기울기 센서 가동
         resetToLiveMode()
 
         if (allPermissionsGranted()) viewFinder?.post { startCamera() }
@@ -135,9 +142,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun setupUIListeners() {
         btnCapture?.setOnClickListener { takePhoto() }
-        findViewById<Button>(R.id.btnRetry).setOnClickListener { resetToLiveMode() }
-  
-        findViewById<Button>(R.id.btnSave).setOnClickListener {
+        btnRetry?.setOnClickListener { resetToLiveMode() }
+        btnSave?.setOnClickListener {
             displayedBitmap?.let { bmp -> saveBitmapToGallery(bmp) } 
                 ?: Toast.makeText(this, "저장할 이미지가 없습니다.", Toast.LENGTH_SHORT).show()
         }
@@ -221,6 +227,45 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // 💡 최단 경로 및 캐싱이 적용된 UI 회전 로직
+    private fun setupOrientationListener() {
+        orientationEventListener = object : OrientationEventListener(this) {
+            override fun onOrientationChanged(orientation: Int) {
+                if (orientation == ORIENTATION_UNKNOWN) return
+
+                val targetRotation = when (orientation) {
+                    in 45..134 -> 270f
+                    in 135..224 -> 180f
+                    in 225..314 -> 90f
+                    else -> 0f
+                }
+
+                // 💡 불필요한 애니메이션 중복 호출 방지 (캐싱)
+                if (targetRotation != currentLogicalRotation) {
+                    var diff = targetRotation - currentLogicalRotation
+                    
+                    // 💡 0° ↔ 270° 최단 경로 회전 보정
+                    if (diff > 180f) diff -= 360f
+                    if (diff < -180f) diff += 360f
+
+                    accumulatedRotation += diff
+                    currentLogicalRotation = targetRotation
+
+                    // 💡 NativeGuideView는 행렬 붕괴를 막기 위해 회전에서 제외
+                    val uiElements = listOf(guideText, btnCapture, btnRetry, btnSave)
+                    
+                    uiElements.forEach { view ->
+                        view?.animate()?.rotation(accumulatedRotation)?.setDuration(200)?.start()
+                    }
+                }
+            }
+        }
+
+        if (orientationEventListener?.canDetectOrientation() == true) {
+            orientationEventListener?.enable()
+        }
+    }
+
     private fun resetToLiveMode() {
         captureSessionId.incrementAndGet()
         isRefining = false
@@ -249,7 +294,6 @@ class MainActivity : AppCompatActivity() {
         nativeBackgroundView?.visibility = View.GONE
         resultActionLayout?.visibility = View.GONE
         progressBar?.visibility = View.GONE
-        // 💡 라이브 뷰(카메라) 모드에서는 안내 문구 숨김
         guideText?.visibility = View.GONE
     }
 
@@ -365,7 +409,6 @@ class MainActivity : AppCompatActivity() {
                 isMatrixReady = viewMatrix.invert(inverseMatrix)
            
                 nativeGuideView?.visibility = View.VISIBLE
-                // 💡 십자선 가이드 뷰가 나타날 때 설명 문구도 같이 띄웁니다.
                 guideText?.visibility = View.VISIBLE 
                 
                 precomputeExecutor.execute {
@@ -440,7 +483,6 @@ class MainActivity : AppCompatActivity() {
         val currentSessionId = captureSessionId.get()
         progressBar?.visibility = View.VISIBLE
         nativeGuideView?.visibility = View.GONE
-        // 💡 마스킹(잘라내기)을 시작하면 안내 문구는 이제 필요 없으므로 숨깁니다.
         guideText?.visibility = View.GONE 
          
         try {
@@ -625,9 +667,10 @@ class MainActivity : AppCompatActivity() {
         if (requestCode == 1001 && allPermissionsGranted()) viewFinder?.post { startCamera() }
     }
     
-    private fun allPermissionsGranted() = arrayOf(Manifest.permission.CAMERA).all { ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED }
-    
     override fun onDestroy() {
+        // 💡 뷰가 파괴될 때 센서리스너 해제 (메모리 누수 방지)
+        orientationEventListener?.disable()
+        
         synchronized(bitmapLock) { 
              lastCapturedBitmap?.recycle()
             lastCapturedBitmap = null 
