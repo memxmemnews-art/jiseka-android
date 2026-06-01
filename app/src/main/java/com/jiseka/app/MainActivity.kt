@@ -100,6 +100,14 @@ class MainActivity : AppCompatActivity() {
 
     private val matrixMappingBuffer = FloatArray(2)
 
+    // 🌟 [UI 추가] 2초 뒤 문구 숨김 처리를 위한 핸들러와 애니메이션
+    private val uiHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val hideGuideTextRunnable = Runnable {
+        guideText?.animate()?.alpha(0f)?.setDuration(300)?.withEndAction {
+            guideText?.visibility = View.GONE
+        }?.start()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
@@ -177,7 +185,7 @@ class MainActivity : AppCompatActivity() {
                                 currentlyHoveredBitmapPolygon = tightenedPolygon
                                 val xCoords = tightenedPolygon.map { it.x }
                                 val yCoords = tightenedPolygon.map { it.y }
-       
+                                
                                 val newBounds = RectF(
                                     xCoords.minOrNull() ?: 0f,
                                     yCoords.minOrNull() ?: 0f,
@@ -186,7 +194,7 @@ class MainActivity : AppCompatActivity() {
                                 )
          
                                 precalculatedCandidates = precalculatedCandidates.map { 
-                                   if (it.points == anchorSnapshot) CandidatePolygon(tightenedPolygon, newBounds) else it 
+                                    if (it.points == anchorSnapshot) CandidatePolygon(tightenedPolygon, newBounds) else it 
                                 }
 
                                 val uiTightPolygon = tightenedPolygon.map { pt ->
@@ -289,11 +297,15 @@ class MainActivity : AppCompatActivity() {
         
         viewFinder?.visibility = View.VISIBLE
         btnCapture?.visibility = View.VISIBLE
-         
+        
         nativeGuideView?.visibility = View.GONE
         nativeBackgroundView?.visibility = View.GONE
         resultActionLayout?.visibility = View.GONE
         progressBar?.visibility = View.GONE
+        
+        // 🌟 [UI 추가] 라이브 모드로 돌아갈 때 타이머 초기화 및 텍스트 숨김
+        uiHandler.removeCallbacks(hideGuideTextRunnable) 
+        guideText?.alpha = 1f
         guideText?.visibility = View.GONE
     }
 
@@ -356,7 +368,7 @@ class MainActivity : AppCompatActivity() {
                             viewFinder?.visibility = View.GONE
                             nativeBackgroundView?.setImageBitmap(uprightBitmap)
                             nativeBackgroundView?.visibility = View.VISIBLE
-                        
+       
                             progressBar?.visibility = View.GONE 
                             setupMatrixAndPrecalculate(currentSessionId)
                         }
@@ -409,7 +421,16 @@ class MainActivity : AppCompatActivity() {
                 isMatrixReady = viewMatrix.invert(inverseMatrix)
             
                 nativeGuideView?.visibility = View.VISIBLE
-                guideText?.visibility = View.VISIBLE 
+                
+                // 🌟 [UI 추가] 안내 문구 변경, 크기 및 굵기 적용, 그리고 2초 타이머 실행
+                guideText?.text = "십자선을 번호판 위로 옮겨주세요"
+                guideText?.paint?.isFakeBoldText = true 
+                guideText?.textSize = 20f 
+                guideText?.alpha = 1f
+                guideText?.visibility = View.VISIBLE
+                
+                uiHandler.removeCallbacks(hideGuideTextRunnable) 
+                uiHandler.postDelayed(hideGuideTextRunnable, 2000) 
                 
                 precomputeExecutor.execute {
                     if (captureSessionId.get() != sessionId) return@execute
@@ -484,14 +505,14 @@ class MainActivity : AppCompatActivity() {
         progressBar?.visibility = View.VISIBLE
         nativeGuideView?.visibility = View.GONE
         guideText?.visibility = View.GONE 
-         
+        
         try {
             maskExecutor.execute {
                 if (captureSessionId.get() != currentSessionId) {
                     runOnUiThread { 
                         progressBar?.visibility = View.GONE
                         nativeGuideView?.visibility = View.VISIBLE 
-                        guideText?.visibility = View.VISIBLE
+                        // 마스킹 취소 시 안내문구 띄우지 않음 (타이머와 꼬임 방지)
                     }
                     return@execute
                 }
@@ -531,7 +552,6 @@ class MainActivity : AppCompatActivity() {
                         runOnUiThread { 
                             progressBar?.visibility = View.GONE
                             nativeGuideView?.visibility = View.VISIBLE 
-                            guideText?.visibility = View.VISIBLE
                         }
                     } finally { 
                         safeTargetBitmap.recycle() 
@@ -540,7 +560,6 @@ class MainActivity : AppCompatActivity() {
                     runOnUiThread { 
                         progressBar?.visibility = View.GONE
                         nativeGuideView?.visibility = View.VISIBLE 
-                        guideText?.visibility = View.VISIBLE
                         Toast.makeText(this@MainActivity, "이미지 데이터를 불러올 수 없습니다.", Toast.LENGTH_SHORT).show()
                     }
                 }
@@ -549,12 +568,10 @@ class MainActivity : AppCompatActivity() {
             Log.w("CAMERA_DEBUG", "Mask execution rejected due to rapid interactions")
             progressBar?.visibility = View.GONE
             nativeGuideView?.visibility = View.VISIBLE
-            guideText?.visibility = View.VISIBLE
         } catch (e: Exception) {
             Log.e("CAMERA_DEBUG", "Failed to execute masking task", e)
             progressBar?.visibility = View.GONE
             nativeGuideView?.visibility = View.VISIBLE
-            guideText?.visibility = View.VISIBLE
         }
     }
 
@@ -634,7 +651,7 @@ class MainActivity : AppCompatActivity() {
                     scalarMat?.release()
                 }
             }
-             
+              
             Core.merge(matChannels, mat)
 
             // 💡 2. 마스킹 영역 겉면에 묵직한 회색 테두리를 둘러서 패널 같은 '두께감' 형성
@@ -677,9 +694,12 @@ class MainActivity : AppCompatActivity() {
         // 💡 뷰가 파괴될 때 센서리스너 해제 (메모리 누수 방지)
         orientationEventListener?.disable()
         
+        // 🌟 [UI 추가] 핸들러 초기화 (메모리 누수 방지)
+        uiHandler.removeCallbacksAndMessages(null)
+        
         synchronized(bitmapLock) { 
              lastCapturedBitmap?.recycle()
-            lastCapturedBitmap = null 
+             lastCapturedBitmap = null 
         }
         nativeBackgroundView?.setImageDrawable(null)
         displayedBitmap?.recycle()
@@ -690,7 +710,7 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
-    // 🔥 추가된 함수: 권한 체크 로직
+    // 🔥 권한 체크 로직
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
         ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
     }
