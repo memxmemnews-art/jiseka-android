@@ -595,7 +595,8 @@ class MainActivity : AppCompatActivity() {
             blurredMask = Mat()
             Imgproc.GaussianBlur(maskMat, blurredMask, Size(15.0, 15.0), 5.0)
             
-            coloredMask = Mat(mat.size(), mat.type(), Scalar(0.0, 255.0, 0.0, 255.0))
+            // 💡 1. 쨍한 녹색 대신 '대리석 톤의 고급스러운 아이보리 화이트' 적용 (RGBA)
+            coloredMask = Mat(mat.size(), mat.type(), Scalar(245.0, 245.0, 240.0, 255.0))
             alphaMat = Mat()
              
             blurredMask.convertTo(alphaMat, CvType.CV_32F, 1.0 / 255.0)
@@ -635,6 +636,11 @@ class MainActivity : AppCompatActivity() {
             }
              
             Core.merge(matChannels, mat)
+
+            // 💡 2. 마스킹 영역 겉면에 묵직한 회색 테두리를 둘러서 패널 같은 '두께감' 형성
+            val edgeColor = Scalar(180.0, 180.0, 180.0, 255.0) 
+            Imgproc.polylines(mat, listOf(contour), true, edgeColor, 8, Imgproc.LINE_AA)
+
         } finally {
             maskMat?.release()
             contour?.release()
