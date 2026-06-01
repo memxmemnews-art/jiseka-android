@@ -6,36 +6,15 @@
     android:layout_height="match_parent"
     android:background="#FFFFFF">
 
+    <!-- 💡 scaleType을 fitCenter로 변경하여 이미지가 잘리지 않게 쏙 들어가도록 수정 -->
+    <!-- 💡 기존에 있던 alpha(투명도) 속성도 지워서 이미지가 선명하게 보이도록 수정 -->
     <ImageView
         android:id="@+id/splashPhoto"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:scaleType="centerCrop"
-        android:src="@drawable/zisecar_mainpage" 
-        android:alpha="0.8" />
+        android:scaleType="fitCenter"
+        android:src="@drawable/zisecar_mainpage" />
 
-    <ImageView
-        android:id="@+id/splashLogo"
-        android:layout_width="100dp"
-        android:layout_height="100dp"
-        android:layout_marginBottom="16dp"
-        app:layout_constraintBottom_toTopOf="@+id/splashTitle"
-        app:layout_constraintEnd_toEndOf="parent"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintTop_toTopOf="parent"
-        app:layout_constraintVertical_chainStyle="packed" />
-
-    <TextView
-        android:id="@+id/splashTitle"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="JiSeKa"
-        android:textColor="#FFFFFF"
-        android:textSize="36sp"
-        android:textStyle="bold"
-        app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintEnd_toEndOf="parent"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintTop_toBottomOf="@+id/splashLogo" />
+    <!-- 💡 가운데 있던 JiSeKa TextView는 완전히 삭제했습니다 -->
 
 </androidx.constraintlayout.widget.ConstraintLayout>
