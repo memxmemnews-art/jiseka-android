@@ -37,6 +37,7 @@ import androidx.camera.view.PreviewView
 import androidx.camera.view.TransformExperimental
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
 import org.opencv.core.Core
 import org.opencv.core.CvType
@@ -91,9 +92,16 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
+        
+        // 💡 만약 스플래시 화면을 우회하여 앱이 복원되었을 때 OpenCV가 켜져있지 않다면 안전하게 차단
+        if (!OpenCVLoader.initDebug()) {
+            Log.e("CAMERA_DEBUG", "OpenCV initialization failed in MainActivity.")
+            Toast.makeText(this, "엔진 초기화에 실패했습니다. 앱을 다시 실행해주세요.", Toast.LENGTH_LONG).show()
+            finish()
+            return
+        }
 
-        // 💡 수정됨: SplashActivity에서 OpenCV 초기화를 보장하므로 중복 코드 제거
+        setContentView(R.layout.activity_main)
 
         viewFinder = findViewById(R.id.viewFinder)
         viewFinder?.implementationMode = PreviewView.ImplementationMode.COMPATIBLE
@@ -137,7 +145,6 @@ class MainActivity : AppCompatActivity() {
             
             if (anchorSnapshot != null) {
                 isRefining = true 
-                
                 val msg = if (targetLevel == 1) "🔍 1차 정밀 밀착 중..." else "🔬 2차 초정밀 밀착 중..."
                 Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
                 
@@ -241,7 +248,6 @@ class MainActivity : AppCompatActivity() {
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
-            // 💡 수정됨: cameraProviderFuture.get()을 try-catch 내부로 이동
             try {
                 val cameraProvider = cameraProviderFuture.get()
                 
@@ -262,7 +268,6 @@ class MainActivity : AppCompatActivity() {
                 }
             } catch (e: Exception) { 
                 Log.e("CAMERA_DEBUG", "Camera binding failed", e) 
-                
                 runOnUiThread {
                     Toast.makeText(this, "카메라를 실행할 수 없습니다.", Toast.LENGTH_LONG).show()
                     btnCapture?.isEnabled = false
@@ -283,7 +288,6 @@ class MainActivity : AppCompatActivity() {
  
         val currentSessionId = captureSessionId.incrementAndGet()
         
-        // 💡 수정됨: takePicture 자체의 동기적 예외 발생 시 무한 로딩 방어
         try {
             imageCapture?.takePicture(cameraExecutor, object : ImageCapture.OnImageCapturedCallback() {
                 override fun onCaptureSuccess(imageProxy: ImageProxy) {
@@ -427,7 +431,6 @@ class MainActivity : AppCompatActivity() {
         progressBar?.visibility = View.VISIBLE
         nativeGuideView?.visibility = View.GONE
          
-        // 💡 수정됨: 스레드 풀 가득 참(AbortPolicy)으로 인한 RejectedExecutionException 방어
         try {
             maskExecutor.execute {
                 if (captureSessionId.get() != currentSessionId) {
@@ -440,7 +443,6 @@ class MainActivity : AppCompatActivity() {
                 
                 val safeTargetBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) }
                 
-                // 💡 수정됨: null일 경우 영원히 로딩바가 안 꺼지는 버그 수정
                 if (safeTargetBitmap != null) {
                     try {
                         val orderedCorners = orderCorners(targetCandidate)
