@@ -62,6 +62,18 @@ class NativeGuideView @JvmOverloads constructor(
         postInvalidateOnAnimation()
     }
 
+    // 🔥 추가된 함수: 메인 액티비티에서 전달해주는 다각형을 받아서 화면에 그릴 준비를 함
+    fun setHoveredPolygon(polygon: Array<PointF>?) {
+        if (polygon != null && polygon.isNotEmpty()) {
+            uiPolygonBuffer = polygon
+            hasHoveredPolygon = true
+        } else {
+            uiPolygonBuffer = emptyArray()
+            hasHoveredPolygon = false
+        }
+        postInvalidateOnAnimation()
+    }
+
     private val crosshairBackPaint = Paint().apply { color = Color.BLACK; style = Paint.Style.STROKE; strokeWidth = 9f; isAntiAlias = true }
     private val crosshairFrontPaint = Paint().apply { color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = 5f; isAntiAlias = true }
     private val centerDotPaint = Paint().apply { color = Color.RED; style = Paint.Style.FILL; isAntiAlias = true }
