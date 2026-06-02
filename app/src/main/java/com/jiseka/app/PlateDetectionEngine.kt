@@ -42,8 +42,7 @@ object PlateDetectionEngine {
             val upperThresh = min(255.0, 1.5 * meanVal)
             Imgproc.Canny(bilateralMat, edgeMat, lowerThresh, upperThresh)
             
-            // 🌟 [핵심 변경 1] 빛 번짐 및 그릴 떡짐 방지: 가로 커널(Horizontal Kernel)
-            // 커널의 세로 높이를 극단적으로 줄여 위아래 구조물과 엉겨 붙는 현상을 차단합니다.
+            // 🌟 그릴 떡짐 방지를 위한 가로 커널(Horizontal Kernel) 유지
             val kernelWidth = (fullBitmap.width * 0.01).coerceIn(15.0, 50.0)
             val kernelHeight = 2.0 
             morphKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(kernelWidth, kernelHeight))
@@ -222,8 +221,8 @@ object PlateDetectionEngine {
         approxPointMat.release()
         hullIndices.release()
 
-        // 🌟 [핵심 변경 2] 꼭짓점 개수 커트라인 완화 (10개 -> 15개)
-        if (hullPoints.size in 4..15) {
+        // 🌟 꼭짓점 개수 10개 커트라인 유지
+        if (hullPoints.size in 4..10) {
             val sortedHull = sortPolygonPoints(hullPoints)
             return MatOfPoint2f(*sortedHull.toTypedArray())
         }
@@ -303,8 +302,7 @@ object PlateDetectionEngine {
         referenceImageHeight: Double,
         isRoi: Boolean
     ): Boolean {
-        // 🌟 [핵심 변경 2 연계] 여기서도 꼭짓점 15개까지 통과
-        if (hullPoints.size !in 4..15) return false
+        if (hullPoints.size !in 4..10) return false
 
         val hullMat = MatOfPoint(*hullPoints)
         val hullArea = Imgproc.contourArea(hullMat)
@@ -318,9 +316,8 @@ object PlateDetectionEngine {
                 return false
             }
         } else {
-            // 🌟 [핵심 변경 3] 최소 면적 커트라인 완화 (0.1% -> 0.02%)
-            // 원거리에서 촬영되어 번호판이 작아도 1차 합격시킵니다.
-            if (normalizedArea < 0.0002 || normalizedArea > 0.05) {
+            // 🌟 [수정] 면적 0.3% ~ 1.0% 로 정밀 타겟팅 설정
+            if (normalizedArea < 0.003 || normalizedArea > 0.01) {
                 hullMat.release()
                 return false
             }
@@ -358,9 +355,8 @@ object PlateDetectionEngine {
         hullMat.release()
         hullMat2f.release()
 
-        // 🌟 [핵심 변경 4] 직사각형 비율 커트라인 완화 (55% -> 35%)
-        // 측면 왜곡으로 사다리꼴 형태가 되어도 1차 합격시킵니다.
-        if (rectangularity < 0.35) return false
+        // 🌟 직사각형 비율 55% 유지
+        if (rectangularity < 0.55) return false
 
         if (h < 1e-6) return false
         val ratio = w / h
