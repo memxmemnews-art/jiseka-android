@@ -4,15 +4,9 @@ import android.Manifest
 import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.Color
-import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.PointF
-import android.graphics.Rect
 import android.graphics.RectF
-import android.graphics.YuvImage
-import android.os.Build
 import android.os.Bundle
 import android.os.Looper
 import android.provider.MediaStore
@@ -44,12 +38,10 @@ import org.opencv.android.Utils
 import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
-import org.opencv.core.MatOfPoint
 import org.opencv.core.Point
 import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
-import java.io.ByteArrayOutputStream
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -71,7 +63,6 @@ class MainActivity : AppCompatActivity() {
     private var progressBar: ProgressBar? = null
     private var guideText: TextView? = null
 
-    // 💡 센서 및 회전 상태 캐싱 변수
     private var orientationEventListener: OrientationEventListener? = null
     private var currentLogicalRotation = 0f
     private var accumulatedRotation = 0f
@@ -100,7 +91,6 @@ class MainActivity : AppCompatActivity() {
 
     private val matrixMappingBuffer = FloatArray(2)
 
-    // 🌟 [UI 추가] 2초 뒤 문구 숨김 처리를 위한 핸들러와 애니메이션
     private val uiHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private val hideGuideTextRunnable = Runnable {
         guideText?.animate()?.alpha(0f)?.setDuration(300)?.withEndAction {
@@ -141,7 +131,7 @@ class MainActivity : AppCompatActivity() {
         maskExecutor = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(1), ThreadPoolExecutor.AbortPolicy())
 
         setupUIListeners()
-        setupOrientationListener() // 💡 기울기 센서 가동
+        setupOrientationListener()
         resetToLiveMode()
 
         if (allPermissionsGranted()) viewFinder?.post { startCamera() }
@@ -158,69 +148,75 @@ class MainActivity : AppCompatActivity() {
 
         nativeGuideView?.onCrosshairMoveListener = { uiPoint -> handleCrosshairMove(uiPoint) }
         
-        nativeGuideView?.onDwellTriggeredListener = { currentLevel ->
-            val anchorSnapshot = currentlyHoveredBitmapPolygon?.toList()
+        // 🌟 단일 구조대 모드 트리거 리스너
+        nativeGuideView?.onDwellTriggeredListener = { uiPoint ->
             val currentSession = captureSessionId.get()
-            val targetLevel = currentLevel + 1
+            isRefining = true 
             
-            if (anchorSnapshot != null) {
-                isRefining = true 
-                val msg = if (targetLevel == 1) "🔍 1차 정밀 밀착 중..." else "🔬 2차 초정밀 밀착 중..."
-                Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "🔍 정밀 검사 중...", Toast.LENGTH_SHORT).show()
+            
+            precomputeExecutor.execute {
+                if (captureSessionId.get() != currentSession) { 
+                    isRefining = false
+                    return@execute 
+                }
                 
-                precomputeExecutor.execute {
-                    if (captureSessionId.get() != currentSession) { 
-                        isRefining = false
-                        return@execute 
-                    }
+                val safeBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) }
+                
+                if (safeBitmap != null) {
+                    val bitmapCoords = FloatArray(2)
+                    bitmapCoords[0] = uiPoint.x
+                    bitmapCoords[1] = uiPoint.y
+                    inverseMatrix.mapPoints(bitmapCoords)
                     
-                    val safeBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) }
-                    
-                    if (safeBitmap != null) {
-                        val tightenedPolygon = PlateDetectionEngine.refineAnchoredPolygon(safeBitmap, anchorSnapshot, targetLevel)
-                        safeBitmap.recycle()
+                    val bitmapX = bitmapCoords[0]
+                    val bitmapY = bitmapCoords[1]
 
-                        runOnUiThread {
-                            if (tightenedPolygon != null && tightenedPolygon.isNotEmpty() && captureSessionId.get() == currentSession) {
-                                currentlyHoveredBitmapPolygon = tightenedPolygon
-                                val xCoords = tightenedPolygon.map { it.x }
-                                val yCoords = tightenedPolygon.map { it.y }
-                                
-                                val newBounds = RectF(
-                                    xCoords.minOrNull() ?: 0f,
-                                    yCoords.minOrNull() ?: 0f,
-                                    xCoords.maxOrNull() ?: 0f,
-                                    yCoords.maxOrNull() ?: 0f
-                                )
-         
-                                precalculatedCandidates = precalculatedCandidates.map { 
-                                    if (it.points == anchorSnapshot) CandidatePolygon(tightenedPolygon, newBounds) else it 
-                                }
+                    // 백지상태에서 3% ROI를 뜯어 구조대 엔진 가동
+                    val tightenedPolygon = PlateDetectionEngine.rescuePlateFromCrosshair(safeBitmap, bitmapX, bitmapY)
+                    safeBitmap.recycle()
 
-                                val uiTightPolygon = tightenedPolygon.map { pt ->
-                                    matrixMappingBuffer[0] = pt.x
-                                    matrixMappingBuffer[1] = pt.y
-                                    viewMatrix.mapPoints(matrixMappingBuffer)
-                                    PointF(matrixMappingBuffer[0], matrixMappingBuffer[1])
-                                }.toTypedArray()
-               
-                                nativeGuideView?.setHoveredPolygon(uiTightPolygon)
-                                nativeGuideView?.notifyRefinementCompleted(true)
-                            } else {
-                                nativeGuideView?.notifyRefinementCompleted(false)
-                            }
+                    runOnUiThread {
+                        if (isFinishing || isDestroyed) return@runOnUiThread
+                        
+                        if (tightenedPolygon != null && tightenedPolygon.isNotEmpty() && captureSessionId.get() == currentSession) {
+                            currentlyHoveredBitmapPolygon = tightenedPolygon
+                            
+                            val xCoords = tightenedPolygon.map { it.x }
+                            val yCoords = tightenedPolygon.map { it.y }
+                            
+                            val newBounds = RectF(
+                                xCoords.minOrNull() ?: 0f, yCoords.minOrNull() ?: 0f,
+                                xCoords.maxOrNull() ?: 0f, yCoords.maxOrNull() ?: 0f
+                            )
+                            
+                            precalculatedCandidates = listOf(CandidatePolygon(tightenedPolygon, newBounds))
 
-                            isRefining = false
- 
-                            if (pendingMaskRequest) {
-                                pendingMaskRequest = false
-                                val target = currentlyHoveredBitmapPolygon?.toList()
-                                if (target != null) triggerInstantMasking(target)
-                            }
+                            val uiTightPolygon = tightenedPolygon.map { pt ->
+                                val renderCoords = FloatArray(2)
+                                renderCoords[0] = pt.x
+                                renderCoords[1] = pt.y
+                                viewMatrix.mapPoints(renderCoords)
+                                PointF(renderCoords[0], renderCoords[1])
+                            }.toTypedArray()
+                            
+                            nativeGuideView?.setHoveredPolygon(uiTightPolygon)
+                            nativeGuideView?.notifyRefinementCompleted(true)
+                        } else {
+                            nativeGuideView?.setHoveredPolygon(null)
+                            nativeGuideView?.notifyRefinementCompleted(false)
                         }
-                    } else {
-                        runOnUiThread { isRefining = false }
+
+                        isRefining = false
+
+                        if (pendingMaskRequest) {
+                            pendingMaskRequest = false
+                            val target = currentlyHoveredBitmapPolygon?.toList()
+                            if (target != null) triggerInstantMasking(target)
+                        }
                     }
+                } else {
+                    runOnUiThread { isRefining = false }
                 }
             }
         }
@@ -235,7 +231,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 💡 최단 경로 및 캐싱이 적용된 UI 회전 로직
     private fun setupOrientationListener() {
         orientationEventListener = object : OrientationEventListener(this) {
             override fun onOrientationChanged(orientation: Int) {
@@ -248,18 +243,18 @@ class MainActivity : AppCompatActivity() {
                     else -> 0f
                 }
 
-                // 💡 불필요한 애니메이션 중복 호출 방지 (캐싱)
                 if (targetRotation != currentLogicalRotation) {
                     var diff = targetRotation - currentLogicalRotation
                     
-                    // 💡 0° ↔ 270° 최단 경로 회전 보정
                     if (diff > 180f) diff -= 360f
                     if (diff < -180f) diff += 360f
 
                     accumulatedRotation += diff
                     currentLogicalRotation = targetRotation
 
-                    // 💡 NativeGuideView는 행렬 붕괴를 막기 위해 회전에서 제외
+                    // 🌟 NativeGuideView에 현재 회전 상태를 알려줌 (팻핑거 방향 계산용)
+                    nativeGuideView?.currentDeviceRotation = targetRotation
+
                     val uiElements = listOf(guideText, btnCapture, btnRetry, btnSave)
                     
                     uiElements.forEach { view ->
@@ -303,7 +298,6 @@ class MainActivity : AppCompatActivity() {
         resultActionLayout?.visibility = View.GONE
         progressBar?.visibility = View.GONE
         
-        // 🌟 [UI 추가] 라이브 모드로 돌아갈 때 타이머 초기화 및 텍스트 숨김
         uiHandler.removeCallbacks(hideGuideTextRunnable) 
         guideText?.alpha = 1f
         guideText?.visibility = View.GONE
@@ -422,7 +416,6 @@ class MainActivity : AppCompatActivity() {
             
                 nativeGuideView?.visibility = View.VISIBLE
                 
-                // 🌟 [UI 추가] 안내 문구 변경, 크기 및 굵기 적용, 그리고 2초 타이머 실행
                 guideText?.text = "십자선을 번호판 위로 옮겨주세요"
                 guideText?.paint?.isFakeBoldText = true 
                 guideText?.textSize = 20f 
@@ -505,14 +498,13 @@ class MainActivity : AppCompatActivity() {
         progressBar?.visibility = View.VISIBLE
         nativeGuideView?.visibility = View.GONE
         guideText?.visibility = View.GONE 
-        
+       
         try {
             maskExecutor.execute {
                 if (captureSessionId.get() != currentSessionId) {
                     runOnUiThread { 
                         progressBar?.visibility = View.GONE
                         nativeGuideView?.visibility = View.VISIBLE 
-                        // 마스킹 취소 시 안내문구 띄우지 않음 (타이머와 꼬임 방지)
                     }
                     return@execute
                 }
@@ -612,7 +604,6 @@ class MainActivity : AppCompatActivity() {
             blurredMask = Mat()
             Imgproc.GaussianBlur(maskMat, blurredMask, Size(15.0, 15.0), 5.0)
             
-            // 💡 1. 쨍한 녹색 대신 '대리석 톤의 고급스러운 아이보리 화이트' 적용 (RGBA)
             coloredMask = Mat(mat.size(), mat.type(), Scalar(245.0, 245.0, 240.0, 255.0))
             alphaMat = Mat()
              
@@ -651,10 +642,9 @@ class MainActivity : AppCompatActivity() {
                     scalarMat?.release()
                 }
             }
-              
+               
             Core.merge(matChannels, mat)
 
-            // 💡 2. 마스킹 영역 겉면에 묵직한 회색 테두리를 둘러서 패널 같은 '두께감' 형성
             val edgeColor = Scalar(180.0, 180.0, 180.0, 255.0) 
             Imgproc.polylines(mat, listOf(contour), true, edgeColor, 8, Imgproc.LINE_AA)
 
@@ -691,10 +681,7 @@ class MainActivity : AppCompatActivity() {
     }
     
     override fun onDestroy() {
-        // 💡 뷰가 파괴될 때 센서리스너 해제 (메모리 누수 방지)
         orientationEventListener?.disable()
-        
-        // 🌟 [UI 추가] 핸들러 초기화 (메모리 누수 방지)
         uiHandler.removeCallbacksAndMessages(null)
         
         synchronized(bitmapLock) { 
@@ -710,7 +697,6 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
-    // 🔥 권한 체크 로직
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
         ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
     }
