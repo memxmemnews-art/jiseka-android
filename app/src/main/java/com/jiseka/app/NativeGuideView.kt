@@ -18,10 +18,12 @@ class NativeGuideView @JvmOverloads constructor(
 
     var onCrosshairMoveListener: ((PointF) -> Unit)? = null
     var onCrosshairDropListener: (() -> Unit)? = null
-    var onDwellTriggeredListener: ((Int) -> Unit)? = null
+    var onDwellTriggeredListener: ((PointF) -> Unit)? = null // 십자선 좌표를 직접 전달
+
+    // MainActivity로부터 기기의 현재 회전 상태(0, 90, 180, 270)를 전달받음
+    var currentDeviceRotation = 0f
 
     private val crosshairPoint = PointF()
-    // 💡 수정됨: 터치 전에도 처음부터 십자선이 보이도록 강제 활성화
     private var hasCrosshair = true 
     
     private var uiPolygonBuffer = emptyArray<PointF>()
@@ -29,40 +31,35 @@ class NativeGuideView @JvmOverloads constructor(
 
     private val dwellHandler = Handler(Looper.getMainLooper())
     private var isDwelling = false
-    private var refinementLevel = 0
-    private val MAX_REFINEMENT_LEVEL = 2
     
     private var lastMoveX = 0f; private var lastMoveY = 0f
     private val touchSlop = 15f 
 
-    private fun getCurrentDwellTime() = if (refinementLevel == 0) 1500L else 1000L
+    // 단일 1.5초 타이머 고정
+    private val DWELL_TIME = 1500L 
 
     private val dwellRunnable = Runnable {
-        if (!isDwelling && refinementLevel < MAX_REFINEMENT_LEVEL) {
-            isDwelling = true; onDwellTriggeredListener?.invoke(refinementLevel); postInvalidateOnAnimation()
+        if (!isDwelling) {
+            isDwelling = true
+            onDwellTriggeredListener?.invoke(PointF(crosshairPoint.x, crosshairPoint.y))
+            postInvalidateOnAnimation()
         }
     }
 
     fun notifyRefinementCompleted(success: Boolean) {
-        if (success && refinementLevel < MAX_REFINEMENT_LEVEL) refinementLevel++
         isDwelling = false 
-        if (refinementLevel < MAX_REFINEMENT_LEVEL) {
-            dwellHandler.removeCallbacks(dwellRunnable)
-            dwellHandler.postDelayed(dwellRunnable, getCurrentDwellTime())
-        }
         postInvalidateOnAnimation()
     }
 
     fun resetState() {
         dwellHandler.removeCallbacksAndMessages(null)
-        isDwelling = false; refinementLevel = 0; hasHoveredPolygon = false
-        // 💡 수정됨: 라이브 모드로 돌아갈 때 십자선을 다시 켜둠
+        isDwelling = false
+        hasHoveredPolygon = false
         hasCrosshair = true 
         uiPolygonBuffer = emptyArray()
         postInvalidateOnAnimation()
     }
 
-    // 🔥 추가된 함수: 메인 액티비티에서 전달해주는 다각형을 받아서 화면에 그릴 준비를 함
     fun setHoveredPolygon(polygon: Array<PointF>?) {
         if (polygon != null && polygon.isNotEmpty()) {
             uiPolygonBuffer = polygon
@@ -83,7 +80,6 @@ class NativeGuideView @JvmOverloads constructor(
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
-        // 💡 수정됨: 화면 크기가 결정되면 즉시 화면 정중앙에 십자선을 배치
         if (w > 0 && h > 0) {
             crosshairPoint.set(w / 2f, h / 2f)
         }
@@ -100,7 +96,7 @@ class NativeGuideView @JvmOverloads constructor(
             }
             polygonPath.close()
 
-            hoverStrokePaint.color = when (refinementLevel) { 0 -> Color.GREEN; 1 -> Color.CYAN; else -> Color.YELLOW }
+            hoverStrokePaint.color = Color.GREEN 
             hoverStrokePaint.alpha = if (isDwelling) 128 else 255
 
             canvas.drawPath(polygonPath, hoverFillPaint)
@@ -120,25 +116,38 @@ class NativeGuideView @JvmOverloads constructor(
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        val x = event.x
-        val fatFingerOffsetY = -150f 
-        val y = event.y + fatFingerOffsetY
+        var x = event.x
+        var y = event.y
+        val offset = 150f 
+
+        // 🌟 기기 회전 방향에 맞춰 사용자의 '시각적 위쪽'으로 십자선 오프셋 적용 (팻핑거 방지)
+        when (currentDeviceRotation) {
+            0f -> y -= offset    // 세로 정방향
+            90f -> x += offset   // 가로 (상단이 왼쪽)
+            180f -> y += offset  // 세로 (뒤집힘)
+            270f -> x -= offset  // 가로 (상단이 오른쪽)
+            else -> y -= offset
+        }
 
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
                 hasCrosshair = true; crosshairPoint.set(x, y)
-                lastMoveX = x; lastMoveY = y; refinementLevel = 0; isDwelling = false
-                dwellHandler.removeCallbacks(dwellRunnable); dwellHandler.postDelayed(dwellRunnable, getCurrentDwellTime())
-                onCrosshairMoveListener?.invoke(PointF(x, y)); postInvalidateOnAnimation()
+                lastMoveX = x; lastMoveY = y; isDwelling = false
+                dwellHandler.removeCallbacks(dwellRunnable)
+                dwellHandler.postDelayed(dwellRunnable, DWELL_TIME)
+                onCrosshairMoveListener?.invoke(PointF(x, y))
+                postInvalidateOnAnimation()
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
                 crosshairPoint.set(x, y)
                 if (Math.abs(x - lastMoveX) > touchSlop || Math.abs(y - lastMoveY) > touchSlop) {
-                    refinementLevel = 0; isDwelling = false; lastMoveX = x; lastMoveY = y
-                    dwellHandler.removeCallbacks(dwellRunnable); dwellHandler.postDelayed(dwellRunnable, getCurrentDwellTime())
+                    isDwelling = false; lastMoveX = x; lastMoveY = y
+                    dwellHandler.removeCallbacks(dwellRunnable)
+                    dwellHandler.postDelayed(dwellRunnable, DWELL_TIME)
                 }
-                onCrosshairMoveListener?.invoke(PointF(x, y)); postInvalidateOnAnimation()
+                onCrosshairMoveListener?.invoke(PointF(x, y))
+                postInvalidateOnAnimation()
                 return true
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
