@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.graphics.PointF
 import android.graphics.RectF
@@ -38,6 +39,7 @@ import org.opencv.android.Utils
 import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
+import org.opencv.core.MatOfPoint2f
 import org.opencv.core.Point
 import org.opencv.core.Scalar
 import org.opencv.core.Size
@@ -77,6 +79,9 @@ class MainActivity : AppCompatActivity() {
     private var lastCapturedBitmap: Bitmap? = null 
     private var displayedBitmap: Bitmap? = null    
 
+    // 🌟 텍스처를 메모리에 한 번만 캐싱하여 재사용 및 I/O 병목 방지
+    private var cachedTextureMat: Mat? = null
+
     private val captureSessionId = AtomicInteger(0)
     
     @Volatile private var isRefining = false
@@ -91,7 +96,7 @@ class MainActivity : AppCompatActivity() {
 
     private val matrixMappingBuffer = FloatArray(2)
 
-    private val uiHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val uiHandler = android.os.Handler(Looper.getMainLooper())
     private val hideGuideTextRunnable = Runnable {
         guideText?.animate()?.alpha(0f)?.setDuration(300)?.withEndAction {
             guideText?.visibility = View.GONE
@@ -107,6 +112,9 @@ class MainActivity : AppCompatActivity() {
             finish()
             return
         }
+
+        // 🌟 앱 시작 시 텍스처 파일 1회 로드 및 예외 처리 (Crash 방지)
+        loadTextureSafely()
 
         setContentView(R.layout.activity_main)
 
@@ -132,10 +140,31 @@ class MainActivity : AppCompatActivity() {
 
         setupUIListeners()
         setupOrientationListener()
+    
         resetToLiveMode()
 
         if (allPermissionsGranted()) viewFinder?.post { startCamera() }
         else ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
+    }
+
+    // 🌟 안전한 텍스처 로드 함수
+    private fun loadTextureSafely() {
+        val rawBitmap = BitmapFactory.decodeResource(resources, R.drawable.plate_texture)
+        if (rawBitmap != null) {
+            cachedTextureMat = Mat()
+            Utils.bitmapToMat(rawBitmap, cachedTextureMat!!)
+            
+            // 캐싱할 때부터 안전한 3채널(RGB)로 변환해 둠
+            if (cachedTextureMat!!.channels() == 4) {
+                Imgproc.cvtColor(cachedTextureMat!!, cachedTextureMat!!, Imgproc.COLOR_RGBA2RGB)
+            }
+            rawBitmap.recycle()
+        } else {
+            Log.e("MASK_INIT", "plate_texture 로드 실패. 파일명 오타 또는 누락 확인 요망.")
+            Toast.makeText(this, "경고: 텍스처를 찾을 수 없어 기본 색상으로 대체됩니다.", Toast.LENGTH_LONG).show()
+            // Null 처리 대신 기본 어두운 회색 텍스처를 생성하여 메모리에 올림 (Crash 절대 방어)
+            cachedTextureMat = Mat(100, 300, CvType.CV_8UC3, Scalar(70.0, 70.0, 70.0))
+        }
     }
 
     private fun setupUIListeners() {
@@ -143,16 +172,15 @@ class MainActivity : AppCompatActivity() {
         btnRetry?.setOnClickListener { resetToLiveMode() }
         btnSave?.setOnClickListener {
             displayedBitmap?.let { bmp -> saveBitmapToGallery(bmp) } 
-                ?: Toast.makeText(this, "저장할 이미지가 없습니다.", Toast.LENGTH_SHORT).show()
+            ?: Toast.makeText(this, "저장할 이미지가 없습니다.", Toast.LENGTH_SHORT).show()
         }
 
         nativeGuideView?.onCrosshairMoveListener = { uiPoint -> handleCrosshairMove(uiPoint) }
         
-        // 🌟 단일 구조대 모드 트리거 리스너
         nativeGuideView?.onDwellTriggeredListener = { uiPoint ->
             val currentSession = captureSessionId.get()
             isRefining = true 
-            
+     
             Toast.makeText(this, "🔍 정밀 검사 중...", Toast.LENGTH_SHORT).show()
             
             precomputeExecutor.execute {
@@ -168,11 +196,10 @@ class MainActivity : AppCompatActivity() {
                     bitmapCoords[0] = uiPoint.x
                     bitmapCoords[1] = uiPoint.y
                     inverseMatrix.mapPoints(bitmapCoords)
-                    
+         
                     val bitmapX = bitmapCoords[0]
                     val bitmapY = bitmapCoords[1]
 
-                    // 백지상태에서 3% ROI를 뜯어 구조대 엔진 가동
                     val tightenedPolygon = PlateDetectionEngine.rescuePlateFromCrosshair(safeBitmap, bitmapX, bitmapY)
                     safeBitmap.recycle()
 
@@ -181,10 +208,10 @@ class MainActivity : AppCompatActivity() {
                         
                         if (tightenedPolygon != null && tightenedPolygon.isNotEmpty() && captureSessionId.get() == currentSession) {
                             currentlyHoveredBitmapPolygon = tightenedPolygon
-                            
+           
                             val xCoords = tightenedPolygon.map { it.x }
                             val yCoords = tightenedPolygon.map { it.y }
-                            
+               
                             val newBounds = RectF(
                                 xCoords.minOrNull() ?: 0f, yCoords.minOrNull() ?: 0f,
                                 xCoords.maxOrNull() ?: 0f, yCoords.maxOrNull() ?: 0f
@@ -252,7 +279,6 @@ class MainActivity : AppCompatActivity() {
                     accumulatedRotation += diff
                     currentLogicalRotation = targetRotation
 
-                    // 🌟 NativeGuideView에 현재 회전 상태를 알려줌 (팻핑거 방향 계산용)
                     nativeGuideView?.currentDeviceRotation = targetRotation
 
                     val uiElements = listOf(guideText, btnCapture, btnRetry, btnSave)
@@ -305,13 +331,14 @@ class MainActivity : AppCompatActivity() {
 
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+ 
         cameraProviderFuture.addListener({
             try {
                 val cameraProvider = cameraProviderFuture.get()
                 
                 val preview = Preview.Builder().build().also { it.setSurfaceProvider(viewFinder?.surfaceProvider) }
                 imageCapture = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY).build()
-                
+     
                 cameraProvider.unbindAll()
                 val viewPort = viewFinder?.viewPort
                 if (viewPort != null) {
@@ -411,7 +438,7 @@ class MainActivity : AppCompatActivity() {
                 viewMatrix.reset()
                 viewMatrix.postScale(scale, scale)
                 viewMatrix.postTranslate(offsetX, offsetY)
-         
+  
                 isMatrixReady = viewMatrix.invert(inverseMatrix)
             
                 nativeGuideView?.visibility = View.VISIBLE
@@ -431,6 +458,7 @@ class MainActivity : AppCompatActivity() {
                     if (bitmapCopy != null) {
                         val candidates = PlateDetectionEngine.precalculateGeometryCandidates(bitmapCopy)
                         bitmapCopy.recycle()
+                        
                         if (captureSessionId.get() == sessionId) precalculatedCandidates = candidates
                     }
                 }
@@ -516,7 +544,12 @@ class MainActivity : AppCompatActivity() {
                         val orderedCorners = orderCorners(targetCandidate)
                         val resultMat = Mat()
                         Utils.bitmapToMat(safeTargetBitmap, resultMat)
-                        applyMaskToMat(resultMat, orderedCorners)
+
+                        // 🌟 메모리에 올려둔 텍스처를 사용하여 마스킹 로직 실행 (I/O 비용 제로)
+                        cachedTextureMat?.let { texture ->
+                            applyMaskToMat(resultMat, orderedCorners, texture)
+                        }
+
                         val resultBitmap = Bitmap.createBitmap(resultMat.cols(), resultMat.rows(), Bitmap.Config.ARGB_8888)
                          
                         Utils.matToBitmap(resultMat, resultBitmap)
@@ -582,47 +615,121 @@ class MainActivity : AppCompatActivity() {
         return corners.map { PointF(it.x, it.y) }
     }
 
-    private fun applyMaskToMat(mat: Mat, corners: List<PointF>) {
+    // 🌟 투시 변환(Warp) + LAB 밝기 이식 + 알파/색상 채널 안정성 확보 로직
+    private fun applyMaskToMat(mat: Mat, corners: List<PointF>, textureInput: Mat) {
         if (corners.isEmpty()) return
          
-        var maskMat: Mat? = null
-        var contour: org.opencv.core.MatOfPoint? = null
-        var blurredMask: Mat? = null
-        var coloredMask: Mat? = null
-        var alphaMat: Mat? = null
+        var maskMat: Mat? = null; var contour: org.opencv.core.MatOfPoint? = null
+        var blurredMask: Mat? = null; var alphaMat: Mat? = null
+        var warpedTexture: Mat? = null; var perspectiveMat: Mat? = null
+        var preparedTexture: Mat? = null
         
         val matChannels = ArrayList<Mat>()
-        val coloredChannels = ArrayList<Mat>()
+        val textureChannels = ArrayList<Mat>()
+
+        // 🌟 Alpha 버그 원천 차단: 원본 mat이 4채널(RGBA)인지 기록해두고 RGB로 강제 변환
+        var originalWasRgba = false
+        if (mat.channels() == 4) {
+            originalWasRgba = true
+            Imgproc.cvtColor(mat, mat, Imgproc.COLOR_RGBA2RGB)
+        }
         
         try {
             val pts = corners.map { Point(it.x.toDouble(), it.y.toDouble()) }
-            maskMat = Mat.zeros(mat.size(), CvType.CV_8UC1)
             
+            // 1. 다각형 마스크 생성
+            maskMat = Mat.zeros(mat.size(), CvType.CV_8UC1)
             contour = org.opencv.core.MatOfPoint(*pts.toTypedArray())
             Imgproc.fillPoly(maskMat, listOf(contour), Scalar(255.0))
             
             blurredMask = Mat()
             Imgproc.GaussianBlur(maskMat, blurredMask, Size(15.0, 15.0), 5.0)
             
-            coloredMask = Mat(mat.size(), mat.type(), Scalar(245.0, 245.0, 240.0, 255.0))
             alphaMat = Mat()
-             
             blurredMask.convertTo(alphaMat, CvType.CV_32F, 1.0 / 255.0)
+
+            // 2. 4개 대표 코너 추출 (minAreaRect)
+            val hullMat2f = MatOfPoint2f(*pts.toTypedArray())
+            val minRect = Imgproc.minAreaRect(hullMat2f)
+            val rectPts = arrayOf(Point(), Point(), Point(), Point())
+            minRect.points(rectPts)
+            hullMat2f.release()
+
+            val sortedByY = rectPts.sortedBy { it.y }
+            val topTwo = sortedByY.take(2).sortedBy { it.x }
+            val bottomTwo = sortedByY.takeLast(2).sortedBy { it.x }
             
+            val dstPts = MatOfPoint2f(topTwo[0], topTwo[1], bottomTwo[1], bottomTwo[0])
+            val srcPts = MatOfPoint2f(
+                Point(0.0, 0.0),
+                Point(textureInput.cols().toDouble(), 0.0),
+                Point(textureInput.cols().toDouble(), textureInput.rows().toDouble()),
+                Point(0.0, textureInput.rows().toDouble())
+            )
+
+            // 3. warpPerspective 적용
+            perspectiveMat = Imgproc.getPerspectiveTransform(srcPts, dstPts)
+            warpedTexture = Mat(mat.size(), mat.type()) 
+            preparedTexture = Mat()
+            
+            // 캐싱된 텍스처도 안전하게 3채널(RGB)로 맞춰서 변환
+            if (textureInput.channels() != mat.channels()) {
+                if (mat.channels() == 3 && textureInput.channels() == 4) Imgproc.cvtColor(textureInput, preparedTexture, Imgproc.COLOR_RGBA2RGB)
+                else textureInput.copyTo(preparedTexture)
+            } else {
+                textureInput.copyTo(preparedTexture)
+            }
+
+            Imgproc.warpPerspective(preparedTexture, warpedTexture, perspectiveMat, mat.size(), Imgproc.INTER_LINEAR)
+
+            // 4. LAB 밝기 이식
+            val rect = Imgproc.boundingRect(contour)
+            val safeRect = org.opencv.core.Rect(
+                Math.max(0, rect.x), Math.max(0, rect.y),
+                Math.min(rect.width, mat.cols() - rect.x), Math.min(rect.height, mat.rows() - rect.y)
+            )
+            
+            val origRoi = mat.submat(safeRect)
+            val warpRoi = warpedTexture.submat(safeRect)
+            
+            val origLab = Mat(); val warpLab = Mat()
+            
+            try {
+                // 이 시점에서 origRoi와 warpRoi는 모두 3채널(RGB)이므로 안전하게 연산 가능
+                Imgproc.cvtColor(origRoi, origLab, Imgproc.COLOR_RGB2Lab)
+                Imgproc.cvtColor(warpRoi, warpLab, Imgproc.COLOR_RGB2Lab)
+                
+                val origChannels = ArrayList<Mat>(); val warpChannels = ArrayList<Mat>()
+                Core.split(origLab, origChannels)
+                Core.split(warpLab, warpChannels)
+                
+                // 밝기 정보(L채널) 이식
+                origChannels[0].copyTo(warpChannels[0])
+                
+                Core.merge(warpChannels, warpLab)
+                
+                // 다시 RGB로 변환하여 덮어쓰기
+                val finalWarpRgb = Mat()
+                Imgproc.cvtColor(warpLab, finalWarpRgb, Imgproc.COLOR_Lab2RGB)
+                finalWarpRgb.copyTo(warpRoi)
+                
+                finalWarpRgb.release()
+                origChannels.forEach { it.release() }; warpChannels.forEach { it.release() }
+            } finally {
+                origLab.release(); warpLab.release()
+            }
+
+            // 5. 최종 마스킹 (다각형 크롭 + 3채널 기반 알파 블렌딩)
             Core.split(mat, matChannels)
-            Core.split(coloredMask, coloredChannels)
+            Core.split(warpedTexture, textureChannels)
             
             for (i in 0 until 3) {
-                var mcF: Mat? = null
-                var ccF: Mat? = null
-                var blendedF: Mat? = null
-                var invAlpha: Mat? = null
-                var scalarMat: Mat? = null
+                var mcF: Mat? = null; var ccF: Mat? = null; var blendedF: Mat? = null
+                var invAlpha: Mat? = null; var scalarMat: Mat? = null
                 try {
-                    mcF = Mat()
-                    ccF = Mat()
+                    mcF = Mat(); ccF = Mat()
                     matChannels[i].convertTo(mcF, CvType.CV_32F)
-                    coloredChannels[i].convertTo(ccF, CvType.CV_32F)
+                    textureChannels[i].convertTo(ccF, CvType.CV_32F)
                     
                     blendedF = Mat()
                     Core.multiply(ccF, alphaMat, ccF)
@@ -635,27 +742,22 @@ class MainActivity : AppCompatActivity() {
                     Core.add(ccF, mcF, blendedF)
                     blendedF.convertTo(matChannels[i], CvType.CV_8U)
                 } finally { 
-                    mcF?.release()
-                    ccF?.release()
-                    blendedF?.release()
-                    invAlpha?.release()
-                    scalarMat?.release()
+                    mcF?.release(); ccF?.release(); blendedF?.release()
+                    invAlpha?.release(); scalarMat?.release()
                 }
             }
-               
             Core.merge(matChannels, mat)
 
-            val edgeColor = Scalar(180.0, 180.0, 180.0, 255.0) 
-            Imgproc.polylines(mat, listOf(contour), true, edgeColor, 8, Imgproc.LINE_AA)
-
         } finally {
-            maskMat?.release()
-            contour?.release()
-            blurredMask?.release()
-            coloredMask?.release()
-            alphaMat?.release()
-            matChannels.forEach { it.release() }
-            coloredChannels.forEach { it.release() }
+            maskMat?.release(); contour?.release(); blurredMask?.release()
+            alphaMat?.release(); warpedTexture?.release(); perspectiveMat?.release()
+            preparedTexture?.release()
+            matChannels.forEach { it.release() }; textureChannels.forEach { it.release() }
+            
+            // 🌟 모든 작업이 완료된 후 원본이 RGBA였다면 다시 RGBA로 복구하여 반환 (에지 그림자 버그 해결)
+            if (originalWasRgba) {
+                Imgproc.cvtColor(mat, mat, Imgproc.COLOR_RGB2RGBA)
+            }
         }
     }
 
@@ -691,6 +793,11 @@ class MainActivity : AppCompatActivity() {
         nativeBackgroundView?.setImageDrawable(null)
         displayedBitmap?.recycle()
         displayedBitmap = null
+        
+        // 🌟 캐싱된 텍스처 메모리 해제
+        cachedTextureMat?.release()
+        cachedTextureMat = null
+
         cameraExecutor.shutdownNow()
         precomputeExecutor.shutdownNow()
         maskExecutor.shutdownNow()
