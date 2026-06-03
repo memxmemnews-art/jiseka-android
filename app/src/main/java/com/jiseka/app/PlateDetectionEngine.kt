@@ -19,9 +19,6 @@ object PlateDetectionEngine {
         Imgproc.createCLAHE(3.0, Size(4.0, 4.0)) 
     }
 
-    // ========================================================================
-    // 1단계: 라이브 모드 (전체 이미지 고속 탐색)
-    // ========================================================================
     fun precalculateGeometryCandidates(fullBitmap: Bitmap): List<CandidatePolygon> {
         val candidates = mutableListOf<CandidatePolygon>()
         val mat = Mat(); val grayMat = Mat(); val bilateralMat = Mat()
@@ -88,9 +85,6 @@ object PlateDetectionEngine {
         }
     }
 
-    // ========================================================================
-    // 2단계: 구조대 모드 (십자선 기반 3% ROI + 다방향 커널 + 강력한 필터)
-    // ========================================================================
     fun rescuePlateFromCrosshair(fullBitmap: Bitmap, crosshairX: Float, crosshairY: Float): List<ImmutablePoint>? {
         val imageArea = fullBitmap.width * fullBitmap.height.toDouble()
         val targetRoiArea = imageArea * 0.03
@@ -165,13 +159,10 @@ object PlateDetectionEngine {
             }
 
             bestApprox2f?.let { approx ->
-                val finalMat2f = MatOfPoint2f(*approx.toArray())
-                val rect = Imgproc.minAreaRect(finalMat2f)
-                val corners = arrayOf(Point(), Point(), Point(), Point())
-                rect.points(corners)
-                finalMat2f.release()
+                // 🌟 다각형을 강제로 4각 박스로 변환하지 않고 유지합니다.
+                val polygonPoints = approx.toArray()
 
-                bestGlobalPoints = corners.map { 
+                bestGlobalPoints = polygonPoints.map { 
                     ImmutablePoint((it.x + safeRect.left).toFloat(), (it.y + safeRect.top).toFloat()) 
                 }
                 approx.release()
@@ -225,9 +216,6 @@ object PlateDetectionEngine {
         return null
     }
 
-    // ========================================================================
-    // [핵심 방어막] 라이브 모드 기하학 검사
-    // ========================================================================
     private fun isValidLicensePlateGeometry(
         originalContourArea: Double, hullPoints: Array<Point>, 
         referenceImageArea: Double, referenceImageHeight: Double
@@ -236,11 +224,9 @@ object PlateDetectionEngine {
         val hullMat = MatOfPoint(*hullPoints)
         val hullArea = Imgproc.contourArea(hullMat)
         
-        // 🌟 방어막 1: Solidity (그릴 떡짐 원천 차단)
         val solidity = originalContourArea / hullArea
         if (solidity < 0.80) { hullMat.release(); return false }
 
-        // 🌟 방어막 1.5: Normalized Area (화면 대비 0.2% ~ 3.0% 크기 필터링)
         val normalizedArea = originalContourArea / referenceImageArea
         if (normalizedArea < 0.002 || normalizedArea > 0.03) { hullMat.release(); return false }
         
@@ -251,7 +237,6 @@ object PlateDetectionEngine {
         
         if (h < referenceImageHeight * 0.01) { hullMat.release(); hullMat2f.release(); return false }
         
-        // 🌟 방어막 2 & 3: Extent & Rectangularity (알맹이 면적 기준)
         val extent = originalContourArea / (Imgproc.boundingRect(hullMat).area())
         if (extent < 0.40) { hullMat.release(); hullMat2f.release(); return false }
         
@@ -261,22 +246,18 @@ object PlateDetectionEngine {
 
         if (h < 1e-6) { hullMat.release(); hullMat2f.release(); return false }
         
-        // 🌟 방어막 4: 가로세로 비율 (신형 번호판 520x110 기준 3.5 ~ 6.0 배)
+        // 🌟 원근 왜곡을 수용하기 위해 하한선 2.5로 완화
         val ratio = w / h
-        if (ratio < 3.5 || ratio > 6.0) { hullMat.release(); hullMat2f.release(); return false }
+        if (ratio < 2.5 || ratio > 6.0) { hullMat.release(); hullMat2f.release(); return false }
 
         hullMat.release(); hullMat2f.release()
         return true
     }
 
-    // ========================================================================
-    // [핵심 방어막] 구조대 모드 기하학 검사 (느슨한 비율, 깐깐한 Solidity)
-    // ========================================================================
     private fun isValidRescueGeometry(originalContourArea: Double, hullPoints: Array<Point>, roiArea: Double): Boolean {
         val hullMat = MatOfPoint(*hullPoints)
         val hullArea = Imgproc.contourArea(hullMat)
         
-        // 🌟 방어막 1: Solidity (구조대 모드에서도 떡짐 절대 허용 안 함)
         val solidity = originalContourArea / hullArea
         if (solidity < 0.85) { hullMat.release(); return false }
 
@@ -286,7 +267,6 @@ object PlateDetectionEngine {
         val hullMat2f = MatOfPoint2f(*hullPoints)
         val minAreaRect = Imgproc.minAreaRect(hullMat2f)
         
-        // 🌟 방어막 2 & 3: Extent & Rectangularity (커트라인 하향하되, 알맹이 면적 기준)
         val extent = originalContourArea / (Imgproc.boundingRect(hullMat).area().toDouble())
         if (extent < 0.25) { hullMat.release(); hullMat2f.release(); return false }
         
@@ -294,10 +274,10 @@ object PlateDetectionEngine {
         val rectangularity = if (rectArea > 0) originalContourArea / rectArea else 0.0
         if (rectangularity < 0.35) { hullMat.release(); hullMat2f.release(); return false }
 
-        // 🌟 구조대 모드 비율 검사 (신형 번호판 기준 3.5 ~ 6.0 배 적용)
+        // 🌟 원근 왜곡을 수용하기 위해 구조대 모드에서도 하한선 2.5로 완화
         var w = minAreaRect.size.width; var h = minAreaRect.size.height
         if (w < h) { val temp = w; w = h; h = temp }
-        if (h < 1e-6 || w / h !in 3.5..6.0) { hullMat.release(); hullMat2f.release(); return false }
+        if (h < 1e-6 || w / h !in 2.5..6.0) { hullMat.release(); hullMat2f.release(); return false }
 
         hullMat.release(); hullMat2f.release()
         return true
