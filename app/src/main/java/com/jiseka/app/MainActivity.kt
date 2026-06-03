@@ -150,6 +150,7 @@ class MainActivity : AppCompatActivity() {
     // 🌟 안전한 텍스처 로드 함수
     private fun loadTextureSafely() {
         val rawBitmap = BitmapFactory.decodeResource(resources, R.drawable.plate_texture)
+       
         if (rawBitmap != null) {
             cachedTextureMat = Mat()
             Utils.bitmapToMat(rawBitmap, cachedTextureMat!!)
@@ -190,17 +191,19 @@ class MainActivity : AppCompatActivity() {
                 }
                 
                 val safeBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) }
-                
+       
                 if (safeBitmap != null) {
                     val bitmapCoords = FloatArray(2)
                     bitmapCoords[0] = uiPoint.x
                     bitmapCoords[1] = uiPoint.y
+    
                     inverseMatrix.mapPoints(bitmapCoords)
          
                     val bitmapX = bitmapCoords[0]
                     val bitmapY = bitmapCoords[1]
 
                     val tightenedPolygon = PlateDetectionEngine.rescuePlateFromCrosshair(safeBitmap, bitmapX, bitmapY)
+    
                     safeBitmap.recycle()
 
                     runOnUiThread {
@@ -302,6 +305,7 @@ class MainActivity : AppCompatActivity() {
         
         btnCapture?.isEnabled = true
         nativeBackgroundView?.setImageDrawable(null)
+    
         displayedBitmap?.recycle()
         displayedBitmap = null
 
@@ -432,6 +436,7 @@ class MainActivity : AppCompatActivity() {
                 val imgH = safeBitmap.height.toFloat()
                 
                 val scale = max(viewW / imgW, viewH / imgH)
+    
                 val offsetX = (viewW - (imgW * scale)) / 2f
                 val offsetY = (viewH - (imgH * scale)) / 2f
     
@@ -455,6 +460,7 @@ class MainActivity : AppCompatActivity() {
                 precomputeExecutor.execute {
                     if (captureSessionId.get() != sessionId) return@execute
                     val bitmapCopy = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) }
+    
                     if (bitmapCopy != null) {
                         val candidates = PlateDetectionEngine.precalculateGeometryCandidates(bitmapCopy)
                         bitmapCopy.recycle()
@@ -477,7 +483,7 @@ class MainActivity : AppCompatActivity() {
         matrixMappingBuffer[0] = uiPoint.x
         matrixMappingBuffer[1] = uiPoint.y
         inverseMatrix.mapPoints(matrixMappingBuffer)
-        
+     
         val bitmapX = matrixMappingBuffer[0]
         val bitmapY = matrixMappingBuffer[1]
         
@@ -551,7 +557,6 @@ class MainActivity : AppCompatActivity() {
                         }
 
                         val resultBitmap = Bitmap.createBitmap(resultMat.cols(), resultMat.rows(), Bitmap.Config.ARGB_8888)
-                         
                         Utils.matToBitmap(resultMat, resultBitmap)
                         resultMat.release()
                         
@@ -560,7 +565,7 @@ class MainActivity : AppCompatActivity() {
                                 resultBitmap.recycle()
                                 return@runOnUiThread 
                             }
-               
+ 
                             val oldBitmap = displayedBitmap
                             nativeBackgroundView?.setImageBitmap(resultBitmap)
                             displayedBitmap = resultBitmap
@@ -615,7 +620,7 @@ class MainActivity : AppCompatActivity() {
         return corners.map { PointF(it.x, it.y) }
     }
 
-    // 🌟 투시 변환(Warp) + LAB 밝기 이식 + 알파/색상 채널 안정성 확보 로직
+    // 🌟 투시 변환(Warp) + 알파/색상 채널 안정성 확보 로직 (LAB 밝기 이식 제거됨)
     private fun applyMaskToMat(mat: Mat, corners: List<PointF>, textureInput: Mat) {
         if (corners.isEmpty()) return
          
@@ -674,7 +679,8 @@ class MainActivity : AppCompatActivity() {
             
             // 캐싱된 텍스처도 안전하게 3채널(RGB)로 맞춰서 변환
             if (textureInput.channels() != mat.channels()) {
-                if (mat.channels() == 3 && textureInput.channels() == 4) Imgproc.cvtColor(textureInput, preparedTexture, Imgproc.COLOR_RGBA2RGB)
+                if (mat.channels() == 3 && textureInput.channels() == 4) 
+                    Imgproc.cvtColor(textureInput, preparedTexture, Imgproc.COLOR_RGBA2RGB)
                 else textureInput.copyTo(preparedTexture)
             } else {
                 textureInput.copyTo(preparedTexture)
@@ -682,42 +688,7 @@ class MainActivity : AppCompatActivity() {
 
             Imgproc.warpPerspective(preparedTexture, warpedTexture, perspectiveMat, mat.size(), Imgproc.INTER_LINEAR)
 
-            // 4. LAB 밝기 이식
-            val rect = Imgproc.boundingRect(contour)
-            val safeRect = org.opencv.core.Rect(
-                Math.max(0, rect.x), Math.max(0, rect.y),
-                Math.min(rect.width, mat.cols() - rect.x), Math.min(rect.height, mat.rows() - rect.y)
-            )
-            
-            val origRoi = mat.submat(safeRect)
-            val warpRoi = warpedTexture.submat(safeRect)
-            
-            val origLab = Mat(); val warpLab = Mat()
-            
-            try {
-                // 이 시점에서 origRoi와 warpRoi는 모두 3채널(RGB)이므로 안전하게 연산 가능
-                Imgproc.cvtColor(origRoi, origLab, Imgproc.COLOR_RGB2Lab)
-                Imgproc.cvtColor(warpRoi, warpLab, Imgproc.COLOR_RGB2Lab)
-                
-                val origChannels = ArrayList<Mat>(); val warpChannels = ArrayList<Mat>()
-                Core.split(origLab, origChannels)
-                Core.split(warpLab, warpChannels)
-                
-                // 밝기 정보(L채널) 이식
-                origChannels[0].copyTo(warpChannels[0])
-                
-                Core.merge(warpChannels, warpLab)
-                
-                // 다시 RGB로 변환하여 덮어쓰기
-                val finalWarpRgb = Mat()
-                Imgproc.cvtColor(warpLab, finalWarpRgb, Imgproc.COLOR_Lab2RGB)
-                finalWarpRgb.copyTo(warpRoi)
-                
-                finalWarpRgb.release()
-                origChannels.forEach { it.release() }; warpChannels.forEach { it.release() }
-            } finally {
-                origLab.release(); warpLab.release()
-            }
+            // 4. (삭제됨) LAB 밝기 이식 로직 제거 완료
 
             // 5. 최종 마스킹 (다각형 크롭 + 3채널 기반 알파 블렌딩)
             Core.split(mat, matChannels)
@@ -727,7 +698,8 @@ class MainActivity : AppCompatActivity() {
                 var mcF: Mat? = null; var ccF: Mat? = null; var blendedF: Mat? = null
                 var invAlpha: Mat? = null; var scalarMat: Mat? = null
                 try {
-                    mcF = Mat(); ccF = Mat()
+                    mcF = Mat()
+                    ccF = Mat()
                     matChannels[i].convertTo(mcF, CvType.CV_32F)
                     textureChannels[i].convertTo(ccF, CvType.CV_32F)
                     
