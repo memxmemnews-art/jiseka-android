@@ -7,7 +7,6 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.graphics.PointF
-import android.graphics.RectF
 import android.os.Bundle
 import android.os.Looper
 import android.provider.MediaStore
@@ -51,6 +50,8 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.hypot
 
 @OptIn(TransformExperimental::class)
 class MainActivity : AppCompatActivity() {
@@ -79,22 +80,12 @@ class MainActivity : AppCompatActivity() {
     private var lastCapturedBitmap: Bitmap? = null 
     private var displayedBitmap: Bitmap? = null    
 
-    // 🌟 텍스처를 메모리에 한 번만 캐싱하여 재사용 및 I/O 병목 방지
     private var cachedTextureMat: Mat? = null
-
     private val captureSessionId = AtomicInteger(0)
-    
-    @Volatile private var isRefining = false
-    @Volatile private var pendingMaskRequest = false
-
-    @Volatile private var precalculatedCandidates: List<CandidatePolygon> = emptyList()
-    @Volatile private var currentlyHoveredBitmapPolygon: List<ImmutablePoint>? = null
 
     private val viewMatrix = Matrix()
     private val inverseMatrix = Matrix()
     private var isMatrixReady = false
-
-    private val matrixMappingBuffer = FloatArray(2)
 
     private val uiHandler = android.os.Handler(Looper.getMainLooper())
     private val hideGuideTextRunnable = Runnable {
@@ -107,15 +98,12 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         
         if (!OpenCVLoader.initDebug()) {
-            Log.e("CAMERA_DEBUG", "OpenCV initialization failed in MainActivity.")
             Toast.makeText(this, "엔진 초기화에 실패했습니다. 앱을 다시 실행해주세요.", Toast.LENGTH_LONG).show()
             finish()
             return
         }
 
-        // 🌟 앱 시작 시 텍스처 파일 1회 로드 및 예외 처리 (Crash 방지)
         loadTextureSafely()
-
         setContentView(R.layout.activity_main)
 
         viewFinder = findViewById(R.id.viewFinder)
@@ -134,36 +122,28 @@ class MainActivity : AppCompatActivity() {
         guideText = findViewById(R.id.guideText)
 
         cameraExecutor = Executors.newSingleThreadExecutor()
-         
         precomputeExecutor = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(1), ThreadPoolExecutor.DiscardOldestPolicy())
         maskExecutor = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(1), ThreadPoolExecutor.AbortPolicy())
 
         setupUIListeners()
         setupOrientationListener()
-    
         resetToLiveMode()
 
         if (allPermissionsGranted()) viewFinder?.post { startCamera() }
         else ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
     }
 
-    // 🌟 안전한 텍스처 로드 함수
     private fun loadTextureSafely() {
         val rawBitmap = BitmapFactory.decodeResource(resources, R.drawable.plate_texture)
-       
         if (rawBitmap != null) {
             cachedTextureMat = Mat()
             Utils.bitmapToMat(rawBitmap, cachedTextureMat!!)
-            
-            // 캐싱할 때부터 안전한 3채널(RGB)로 변환해 둠
             if (cachedTextureMat!!.channels() == 4) {
                 Imgproc.cvtColor(cachedTextureMat!!, cachedTextureMat!!, Imgproc.COLOR_RGBA2RGB)
             }
             rawBitmap.recycle()
         } else {
-            Log.e("MASK_INIT", "plate_texture 로드 실패. 파일명 오타 또는 누락 확인 요망.")
             Toast.makeText(this, "경고: 텍스처를 찾을 수 없어 기본 색상으로 대체됩니다.", Toast.LENGTH_LONG).show()
-            // Null 처리 대신 기본 어두운 회색 텍스처를 생성하여 메모리에 올림 (Crash 절대 방어)
             cachedTextureMat = Mat(100, 300, CvType.CV_8UC3, Scalar(70.0, 70.0, 70.0))
         }
     }
@@ -176,19 +156,16 @@ class MainActivity : AppCompatActivity() {
             ?: Toast.makeText(this, "저장할 이미지가 없습니다.", Toast.LENGTH_SHORT).show()
         }
 
-        nativeGuideView?.onCrosshairMoveListener = { uiPoint -> handleCrosshairMove(uiPoint) }
-        
-        nativeGuideView?.onDwellTriggeredListener = { uiPoint ->
+        nativeGuideView?.onCrosshairDropListener = { uiPoint ->
+            if (!isMatrixReady) return@onCrosshairDropListener
+
             val currentSession = captureSessionId.get()
-            isRefining = true 
-     
-            Toast.makeText(this, "🔍 정밀 검사 중...", Toast.LENGTH_SHORT).show()
+            progressBar?.visibility = View.VISIBLE
+            nativeGuideView?.visibility = View.GONE
+            guideText?.visibility = View.GONE
             
             precomputeExecutor.execute {
-                if (captureSessionId.get() != currentSession) { 
-                    isRefining = false
-                    return@execute 
-                }
+                if (captureSessionId.get() != currentSession) return@execute 
                 
                 val safeBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) }
        
@@ -196,67 +173,25 @@ class MainActivity : AppCompatActivity() {
                     val bitmapCoords = FloatArray(2)
                     bitmapCoords[0] = uiPoint.x
                     bitmapCoords[1] = uiPoint.y
-    
                     inverseMatrix.mapPoints(bitmapCoords)
          
-                    val bitmapX = bitmapCoords[0]
-                    val bitmapY = bitmapCoords[1]
-
-                    val tightenedPolygon = PlateDetectionEngine.rescuePlateFromCrosshair(safeBitmap, bitmapX, bitmapY)
-    
+                    val targetPolygon = PlateDetectionEngine.rescuePlateFromCrosshair(safeBitmap, bitmapCoords[0], bitmapCoords[1])
                     safeBitmap.recycle()
 
                     runOnUiThread {
-                        if (isFinishing || isDestroyed) return@runOnUiThread
+                        if (isFinishing || isDestroyed || captureSessionId.get() != currentSession) return@runOnUiThread
                         
-                        if (tightenedPolygon != null && tightenedPolygon.isNotEmpty() && captureSessionId.get() == currentSession) {
-                            currentlyHoveredBitmapPolygon = tightenedPolygon
-           
-                            val xCoords = tightenedPolygon.map { it.x }
-                            val yCoords = tightenedPolygon.map { it.y }
-               
-                            val newBounds = RectF(
-                                xCoords.minOrNull() ?: 0f, yCoords.minOrNull() ?: 0f,
-                                xCoords.maxOrNull() ?: 0f, yCoords.maxOrNull() ?: 0f
-                            )
-                            
-                            precalculatedCandidates = listOf(CandidatePolygon(tightenedPolygon, newBounds))
-
-                            val uiTightPolygon = tightenedPolygon.map { pt ->
-                                val renderCoords = FloatArray(2)
-                                renderCoords[0] = pt.x
-                                renderCoords[1] = pt.y
-                                viewMatrix.mapPoints(renderCoords)
-                                PointF(renderCoords[0], renderCoords[1])
-                            }.toTypedArray()
-                            
-                            nativeGuideView?.setHoveredPolygon(uiTightPolygon)
-                            nativeGuideView?.notifyRefinementCompleted(true)
+                        if (targetPolygon != null && targetPolygon.isNotEmpty()) {
+                            triggerInstantMasking(targetPolygon)
                         } else {
-                            nativeGuideView?.setHoveredPolygon(null)
-                            nativeGuideView?.notifyRefinementCompleted(false)
-                        }
-
-                        isRefining = false
-
-                        if (pendingMaskRequest) {
-                            pendingMaskRequest = false
-                            val target = currentlyHoveredBitmapPolygon?.toList()
-                            if (target != null) triggerInstantMasking(target)
+                            progressBar?.visibility = View.GONE
+                            nativeGuideView?.visibility = View.VISIBLE
+                            Toast.makeText(this@MainActivity, "번호판을 찾을 수 없습니다. 다시 조준해주세요.", Toast.LENGTH_SHORT).show()
                         }
                     }
                 } else {
-                    runOnUiThread { isRefining = false }
+                    runOnUiThread { progressBar?.visibility = View.GONE }
                 }
-            }
-        }
-
-        nativeGuideView?.onCrosshairDropListener = {
-            if (isRefining) {
-                pendingMaskRequest = true
-            } else {
-                val targetSnapshot = currentlyHoveredBitmapPolygon?.toList() 
-                if (targetSnapshot != null) triggerInstantMasking(targetSnapshot)
             }
         }
     }
@@ -275,17 +210,14 @@ class MainActivity : AppCompatActivity() {
 
                 if (targetRotation != currentLogicalRotation) {
                     var diff = targetRotation - currentLogicalRotation
-                    
                     if (diff > 180f) diff -= 360f
                     if (diff < -180f) diff += 360f
 
                     accumulatedRotation += diff
                     currentLogicalRotation = targetRotation
-
                     nativeGuideView?.currentDeviceRotation = targetRotation
 
                     val uiElements = listOf(guideText, btnCapture, btnRetry, btnSave)
-                    
                     uiElements.forEach { view ->
                         view?.animate()?.rotation(accumulatedRotation)?.setDuration(200)?.start()
                     }
@@ -300,8 +232,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun resetToLiveMode() {
         captureSessionId.incrementAndGet()
-        isRefining = false
-        pendingMaskRequest = false
         
         btnCapture?.isEnabled = true
         nativeBackgroundView?.setImageDrawable(null)
@@ -314,10 +244,7 @@ class MainActivity : AppCompatActivity() {
             lastCapturedBitmap = null 
         }
         
-        precalculatedCandidates = emptyList()
-        currentlyHoveredBitmapPolygon = null
         isMatrixReady = false
-
         nativeGuideView?.resetState()
         
         viewFinder?.visibility = View.VISIBLE
@@ -339,7 +266,6 @@ class MainActivity : AppCompatActivity() {
         cameraProviderFuture.addListener({
             try {
                 val cameraProvider = cameraProviderFuture.get()
-                
                 val preview = Preview.Builder().build().also { it.setSurfaceProvider(viewFinder?.surfaceProvider) }
                 imageCapture = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY).build()
      
@@ -393,7 +319,6 @@ class MainActivity : AppCompatActivity() {
                             viewFinder?.visibility = View.GONE
                             nativeBackgroundView?.setImageBitmap(uprightBitmap)
                             nativeBackgroundView?.visibility = View.VISIBLE
-       
                             progressBar?.visibility = View.GONE 
                             setupMatrixAndPrecalculate(currentSessionId)
                         }
@@ -436,90 +361,28 @@ class MainActivity : AppCompatActivity() {
                 val imgH = safeBitmap.height.toFloat()
                 
                 val scale = max(viewW / imgW, viewH / imgH)
-    
                 val offsetX = (viewW - (imgW * scale)) / 2f
                 val offsetY = (viewH - (imgH * scale)) / 2f
     
                 viewMatrix.reset()
                 viewMatrix.postScale(scale, scale)
                 viewMatrix.postTranslate(offsetX, offsetY)
-  
                 isMatrixReady = viewMatrix.invert(inverseMatrix)
             
                 nativeGuideView?.visibility = View.VISIBLE
                 
-                guideText?.text = "십자선을 번호판 위로 옮겨주세요"
+                guideText?.text = "십자선을 번호판 위에 놓고 손을 떼주세요"
                 guideText?.paint?.isFakeBoldText = true 
                 guideText?.textSize = 20f 
                 guideText?.alpha = 1f
                 guideText?.visibility = View.VISIBLE
                 
                 uiHandler.removeCallbacks(hideGuideTextRunnable) 
-                uiHandler.postDelayed(hideGuideTextRunnable, 2000) 
-                
-                precomputeExecutor.execute {
-                    if (captureSessionId.get() != sessionId) return@execute
-                    val bitmapCopy = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) }
-    
-                    if (bitmapCopy != null) {
-                        val candidates = PlateDetectionEngine.precalculateGeometryCandidates(bitmapCopy)
-                        bitmapCopy.recycle()
-                        
-                        if (captureSessionId.get() == sessionId) precalculatedCandidates = candidates
-                    }
-                }
+                uiHandler.postDelayed(hideGuideTextRunnable, 2500) 
                 return true 
             }
         })
         bgView.invalidate() 
-    }
-
-    private fun handleCrosshairMove(uiPoint: PointF) {
-        val candidatesSnapshot = precalculatedCandidates.toList()
-        
-        if (!isMatrixReady) return
-        if (candidatesSnapshot.isEmpty()) return
-        
-        matrixMappingBuffer[0] = uiPoint.x
-        matrixMappingBuffer[1] = uiPoint.y
-        inverseMatrix.mapPoints(matrixMappingBuffer)
-     
-        val bitmapX = matrixMappingBuffer[0]
-        val bitmapY = matrixMappingBuffer[1]
-        
-        var bestPolygon: List<ImmutablePoint>? = null
-        var maxScore = -1.0
-        
-        val safeBitmapArea = synchronized(bitmapLock) { lastCapturedBitmap?.let { it.width * it.height.toDouble() } ?: 1.0 }
-
-        for (candidate in candidatesSnapshot) {
-            if (candidate.bounds.contains(bitmapX, bitmapY)) {
-                if (isPointInPolygon(bitmapX, bitmapY, candidate.points)) {
-                    val currentScore = PlateDetectionEngine.calculatePolygonScore(candidate.points, safeBitmapArea)
-                    
-                    if (currentScore > maxScore) {
-                        maxScore = currentScore
-                        bestPolygon = candidate.points.toList() 
-                    }
-                }
-            }
-        }
-        
-        currentlyHoveredBitmapPolygon = bestPolygon
-         
-        if (bestPolygon != null) {
-            val mappedPoints = Array(bestPolygon.size) { PointF() }
-            for (i in bestPolygon.indices) {
-                val pt = bestPolygon[i]
-                matrixMappingBuffer[0] = pt.x
-                matrixMappingBuffer[1] = pt.y
-                viewMatrix.mapPoints(matrixMappingBuffer)
-                mappedPoints[i] = PointF(matrixMappingBuffer[0], matrixMappingBuffer[1])
-            }
-            nativeGuideView?.setHoveredPolygon(mappedPoints)
-        } else {
-            nativeGuideView?.setHoveredPolygon(null)
-        }
     }
 
     private fun triggerInstantMasking(targetCandidate: List<ImmutablePoint>) {
@@ -547,13 +410,11 @@ class MainActivity : AppCompatActivity() {
                 
                 if (safeTargetBitmap != null) {
                     try {
-                        val orderedCorners = orderCorners(targetCandidate)
                         val resultMat = Mat()
                         Utils.bitmapToMat(safeTargetBitmap, resultMat)
 
-                        // 🌟 메모리에 올려둔 텍스처를 사용하여 마스킹 로직 실행 (I/O 비용 제로)
                         cachedTextureMat?.let { texture ->
-                            applyMaskToMat(resultMat, orderedCorners, texture)
+                            applyMaskToMat(resultMat, targetCandidate, texture)
                         }
 
                         val resultBitmap = Bitmap.createBitmap(resultMat.cols(), resultMat.rows(), Bitmap.Config.ARGB_8888)
@@ -569,9 +430,12 @@ class MainActivity : AppCompatActivity() {
                             val oldBitmap = displayedBitmap
                             nativeBackgroundView?.setImageBitmap(resultBitmap)
                             displayedBitmap = resultBitmap
-                             
+           
+                            // 🌟 렌더링 파이프라인 충돌을 막기 위한 안전한 지연 해제
                             oldBitmap?.let { bmp -> 
-                                nativeBackgroundView?.post { if (!bmp.isRecycled) bmp.recycle() } 
+                                uiHandler.postDelayed({ 
+                                    if (!bmp.isRecycled) bmp.recycle() 
+                                }, 500)
                             }
                   
                             progressBar?.visibility = View.GONE
@@ -594,10 +458,6 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             }
-        } catch (e: java.util.concurrent.RejectedExecutionException) {
-            Log.w("CAMERA_DEBUG", "Mask execution rejected due to rapid interactions")
-            progressBar?.visibility = View.GONE
-            nativeGuideView?.visibility = View.VISIBLE
         } catch (e: Exception) {
             Log.e("CAMERA_DEBUG", "Failed to execute masking task", e)
             progressBar?.visibility = View.GONE
@@ -605,34 +465,124 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun isPointInPolygon(px: Float, py: Float, polygon: List<ImmutablePoint>): Boolean {
-        var result = false
-        var j = polygon.size - 1
-        for (i in polygon.indices) {
-            if ((polygon[i].y > py) != (polygon[j].y > py) && (px < (polygon[j].x - polygon[i].x) * (py - polygon[i].y) / (polygon[j].y - polygon[i].y) + polygon[i].x)) result = !result
-            j = i
+    // 🌟 1. 완벽한 다각형 교차점 탐색 함수 (수직 스캔라인)
+    private fun findVerticalIntersections(hull: List<Point>, targetX: Double): Pair<Double, Double>? {
+        val intersections = mutableListOf<Double>()
+        for (i in hull.indices) {
+            val p1 = hull[i]
+            val p2 = hull[(i + 1) % hull.size]
+
+            val minX = min(p1.x, p2.x)
+            val maxX = max(p1.x, p2.x)
+
+            // 부동소수점 오차를 고려한 안전한 범위 검사
+            if (targetX < minX - 1e-5 || targetX > maxX + 1e-5) continue
+
+            if (Math.abs(p2.x - p1.x) < 1e-6) {
+                intersections.add(p1.y)
+                intersections.add(p2.y)
+            } else {
+                val t = (targetX - p1.x) / (p2.x - p1.x)
+                intersections.add(p1.y + t * (p2.y - p1.y))
+            }
         }
-        return result
+
+        if (intersections.size < 2) return null
+
+        intersections.sort()
+        return Pair(intersections.first(), intersections.last())
     }
 
-    private fun orderCorners(corners: List<ImmutablePoint>): List<PointF> {
-        if (corners.isEmpty()) return emptyList()
-        return corners.map { PointF(it.x, it.y) }
+    // 🌟 2. 호 길이(Arc Length) 기반 점 보간 함수
+    private fun getPointAtArcLength(chain: List<Point>, targetRatio: Double): Point {
+        if (chain.size == 1) return chain.first()
+        if (targetRatio <= 0.0) return chain.first()
+        if (targetRatio >= 1.0) return chain.last()
+
+        val segmentLengths = mutableListOf<Double>()
+        var totalLength = 0.0
+        
+        for (i in 0 until chain.size - 1) {
+            val dist = hypot(chain[i+1].x - chain[i].x, chain[i+1].y - chain[i].y)
+            segmentLengths.add(dist)
+            totalLength += dist
+        }
+
+        val targetLength = totalLength * targetRatio
+        var accumulatedLength = 0.0
+
+        for (i in 0 until chain.size - 1) {
+            val segLen = segmentLengths[i]
+            if (accumulatedLength + segLen >= targetLength) {
+                val remaining = targetLength - accumulatedLength
+                val ratio = if (segLen > 0) remaining / segLen else 0.0
+                val p1 = chain[i]
+                val p2 = chain[i+1]
+                return Point(p1.x + ratio * (p2.x - p1.x), p1.y + ratio * (p2.y - p1.y))
+            }
+            accumulatedLength += segLen
+        }
+        return chain.last()
     }
 
-    // 🌟 투시 변환(Warp) + 알파/색상 채널 안정성 확보 로직 (LAB 밝기 이식 제거됨)
-    private fun applyMaskToMat(mat: Mat, corners: List<PointF>, textureInput: Mat) {
+    // 🌟 3. Convex Hull 분리 함수 (좌우 끝점 기준)
+    private fun splitHullIntoChains(hullPts: List<Point>): Pair<List<Point>, List<Point>> {
+        var leftIdx = 0
+        var rightIdx = 0
+        for (i in hullPts.indices) {
+            if (hullPts[i].x < hullPts[leftIdx].x) leftIdx = i
+            if (hullPts[i].x > hullPts[rightIdx].x) rightIdx = i
+        }
+
+        val n = hullPts.size
+        val chain1 = mutableListOf<Point>()
+        var curr = leftIdx
+        while (curr != rightIdx) {
+            chain1.add(hullPts[curr])
+            curr = (curr + 1) % n
+        }
+        chain1.add(hullPts[rightIdx])
+
+        val chain2 = mutableListOf<Point>()
+        curr = rightIdx
+        while (curr != leftIdx) {
+            chain2.add(hullPts[curr])
+            curr = (curr + 1) % n
+        }
+        chain2.add(hullPts[leftIdx])
+        
+        val chain1AvgY = chain1.map { it.y }.average()
+        val chain2AvgY = chain2.map { it.y }.average()
+
+        return if (chain1AvgY < chain2AvgY) {
+            val topChain = if (chain1.first().x < chain1.last().x) chain1 else chain1.reversed()
+            val bottomChain = if (chain2.first().x < chain2.last().x) chain2 else chain2.reversed()
+            Pair(topChain, bottomChain)
+        } else {
+            val topChain = if (chain2.first().x < chain2.last().x) chain2 else chain2.reversed()
+            val bottomChain = if (chain1.first().x < chain1.last().x) chain1 else chain1.reversed()
+            Pair(topChain, bottomChain)
+        }
+    }
+
+    // 🌟 4. 고품질 다중 분할 변환 + 메모리 할당 방어 (JNI 최적화)
+    private fun applyMaskToMat(mat: Mat, corners: List<ImmutablePoint>, textureInput: Mat) {
         if (corners.isEmpty()) return
-         
+
         var maskMat: Mat? = null; var contour: org.opencv.core.MatOfPoint? = null
         var blurredMask: Mat? = null; var alphaMat: Mat? = null
-        var warpedTexture: Mat? = null; var perspectiveMat: Mat? = null
+        var warpedTexture: Mat? = null
         var preparedTexture: Mat? = null
+        
+        // 🌟 루프 내부 대형 객체 할당 방지용 사전 생성 변수
+        var stripWarped: Mat? = null
+        var stripMask: Mat? = null
+        val scalarZero = Scalar(0.0)
+        val scalar255 = Scalar(255.0)
         
         val matChannels = ArrayList<Mat>()
         val textureChannels = ArrayList<Mat>()
 
-        // 🌟 Alpha 버그 원천 차단: 원본 mat이 4채널(RGBA)인지 기록해두고 RGB로 강제 변환
         var originalWasRgba = false
         if (mat.channels() == 4) {
             originalWasRgba = true
@@ -642,7 +592,6 @@ class MainActivity : AppCompatActivity() {
         try {
             val pts = corners.map { Point(it.x.toDouble(), it.y.toDouble()) }
             
-            // 1. 다각형 마스크 생성
             maskMat = Mat.zeros(mat.size(), CvType.CV_8UC1)
             contour = org.opencv.core.MatOfPoint(*pts.toTypedArray())
             Imgproc.fillPoly(maskMat, listOf(contour), Scalar(255.0))
@@ -653,44 +602,71 @@ class MainActivity : AppCompatActivity() {
             alphaMat = Mat()
             blurredMask.convertTo(alphaMat, CvType.CV_32F, 1.0 / 255.0)
 
-            // 2. 4개 대표 코너 추출 (minAreaRect)
-            val hullMat2f = MatOfPoint2f(*pts.toTypedArray())
-            val minRect = Imgproc.minAreaRect(hullMat2f)
-            val rectPts = arrayOf(Point(), Point(), Point(), Point())
-            minRect.points(rectPts)
-            hullMat2f.release()
-
-            val sortedByY = rectPts.sortedBy { it.y }
-            val topTwo = sortedByY.take(2).sortedBy { it.x }
-            val bottomTwo = sortedByY.takeLast(2).sortedBy { it.x }
-            
-            val dstPts = MatOfPoint2f(topTwo[0], topTwo[1], bottomTwo[1], bottomTwo[0])
-            val srcPts = MatOfPoint2f(
-                Point(0.0, 0.0),
-                Point(textureInput.cols().toDouble(), 0.0),
-                Point(textureInput.cols().toDouble(), textureInput.rows().toDouble()),
-                Point(0.0, textureInput.rows().toDouble())
-            )
-
-            // 3. warpPerspective 적용
-            perspectiveMat = Imgproc.getPerspectiveTransform(srcPts, dstPts)
-            warpedTexture = Mat(mat.size(), mat.type()) 
             preparedTexture = Mat()
-            
-            // 캐싱된 텍스처도 안전하게 3채널(RGB)로 맞춰서 변환
             if (textureInput.channels() != mat.channels()) {
-                if (mat.channels() == 3 && textureInput.channels() == 4) 
-                    Imgproc.cvtColor(textureInput, preparedTexture, Imgproc.COLOR_RGBA2RGB)
+                if (mat.channels() == 3 && textureInput.channels() == 4) Imgproc.cvtColor(textureInput, preparedTexture, Imgproc.COLOR_RGBA2RGB)
                 else textureInput.copyTo(preparedTexture)
             } else {
                 textureInput.copyTo(preparedTexture)
             }
 
-            Imgproc.warpPerspective(preparedTexture, warpedTexture, perspectiveMat, mat.size(), Imgproc.INTER_LINEAR)
+            warpedTexture = Mat.zeros(mat.size(), mat.type()) 
+            
+            if (pts.size < 4) {
+                fallbackSingleWarp(pts, preparedTexture, warpedTexture)
+            } else {
+                val (topChain, bottomChain) = splitHullIntoChains(pts)
+                
+                val segments = 8 
+                val texWidth = preparedTexture.cols().toDouble()
+                val texHeight = preparedTexture.rows().toDouble()
 
-            // 4. (삭제됨) LAB 밝기 이식 로직 제거 완료
+                // 🌟 JNI 병목 해소: 반복문 외부에서 도화지(Mat) 1회 할당
+                stripWarped = Mat(mat.size(), mat.type())
+                stripMask = Mat.zeros(mat.size(), CvType.CV_8UC1)
 
-            // 5. 최종 마스킹 (다각형 크롭 + 3채널 기반 알파 블렌딩)
+                for (i in 0 until segments) {
+                    val progressLeft = i.toDouble() / segments
+                    val progressRight = (i + 1).toDouble() / segments
+                    
+                    val ptTopLeft = getPointAtArcLength(topChain, progressLeft)
+                    val ptTopRight = getPointAtArcLength(topChain, progressRight)
+                    val ptBottomLeft = getPointAtArcLength(bottomChain, progressLeft)
+                    val ptBottomRight = getPointAtArcLength(bottomChain, progressRight)
+
+                    val srcPts = MatOfPoint2f(
+                        Point(progressLeft * texWidth, 0.0),
+                        Point(progressRight * texWidth, 0.0),
+                        Point(progressRight * texWidth, texHeight),
+                        Point(progressLeft * texWidth, texHeight)
+                    )
+
+                    val dstPts = MatOfPoint2f(
+                        ptTopLeft,
+                        ptTopRight,
+                        ptBottomRight,
+                        ptBottomLeft
+                    )
+
+                    val perspectiveMat = Imgproc.getPerspectiveTransform(srcPts, dstPts)
+                    
+                    // 🌟 GC 최적화: 도화지를 새로 만들지 않고, 0으로 초기화하여 재사용(Reuse)
+                    stripWarped.setTo(scalarZero)
+                    stripMask.setTo(scalarZero)
+                    
+                    Imgproc.warpPerspective(preparedTexture, stripWarped, perspectiveMat, mat.size(), Imgproc.INTER_LINEAR)
+                    
+                    val stripContour = org.opencv.core.MatOfPoint(*dstPts.toArray())
+                    Imgproc.fillPoly(stripMask, listOf(stripContour), scalar255)
+                    
+                    stripWarped.copyTo(warpedTexture, stripMask)
+
+                    // 단발성 작은 객체들만 루프 내에서 정리
+                    srcPts.release(); dstPts.release(); perspectiveMat.release()
+                    stripContour.release()
+                }
+            }
+
             Core.split(mat, matChannels)
             Core.split(warpedTexture, textureChannels)
             
@@ -698,8 +674,7 @@ class MainActivity : AppCompatActivity() {
                 var mcF: Mat? = null; var ccF: Mat? = null; var blendedF: Mat? = null
                 var invAlpha: Mat? = null; var scalarMat: Mat? = null
                 try {
-                    mcF = Mat()
-                    ccF = Mat()
+                    mcF = Mat(); ccF = Mat()
                     matChannels[i].convertTo(mcF, CvType.CV_32F)
                     textureChannels[i].convertTo(ccF, CvType.CV_32F)
                     
@@ -710,7 +685,7 @@ class MainActivity : AppCompatActivity() {
                     
                     Core.subtract(scalarMat, alphaMat, invAlpha)
                     Core.multiply(mcF, invAlpha, mcF)
-                     
+                 
                     Core.add(ccF, mcF, blendedF)
                     blendedF.convertTo(matChannels[i], CvType.CV_8U)
                 } finally { 
@@ -722,15 +697,40 @@ class MainActivity : AppCompatActivity() {
 
         } finally {
             maskMat?.release(); contour?.release(); blurredMask?.release()
-            alphaMat?.release(); warpedTexture?.release(); perspectiveMat?.release()
+            alphaMat?.release(); warpedTexture?.release()
             preparedTexture?.release()
+            
+            // 대형 재사용 객체 일괄 해제
+            stripWarped?.release()
+            stripMask?.release()
+            
             matChannels.forEach { it.release() }; textureChannels.forEach { it.release() }
             
-            // 🌟 모든 작업이 완료된 후 원본이 RGBA였다면 다시 RGBA로 복구하여 반환 (에지 그림자 버그 해결)
-            if (originalWasRgba) {
-                Imgproc.cvtColor(mat, mat, Imgproc.COLOR_RGB2RGBA)
-            }
+            if (originalWasRgba) Imgproc.cvtColor(mat, mat, Imgproc.COLOR_RGB2RGBA)
         }
+    }
+
+    private fun fallbackSingleWarp(pts: List<Point>, textureInput: Mat, outputTexture: Mat) {
+        val hullMat2f = MatOfPoint2f(*pts.toTypedArray())
+        val minRect = Imgproc.minAreaRect(hullMat2f)
+        val rectPts = arrayOf(Point(), Point(), Point(), Point())
+        minRect.points(rectPts)
+        hullMat2f.release()
+
+        val sortedByY = rectPts.sortedBy { it.y }
+        val topTwo = sortedByY.take(2).sortedBy { it.x }
+        val bottomTwo = sortedByY.takeLast(2).sortedBy { it.x }
+        
+        val dstPts = MatOfPoint2f(topTwo[0], topTwo[1], bottomTwo[1], bottomTwo[0])
+        val srcPts = MatOfPoint2f(
+            Point(0.0, 0.0), Point(textureInput.cols().toDouble(), 0.0),
+            Point(textureInput.cols().toDouble(), textureInput.rows().toDouble()), Point(0.0, textureInput.rows().toDouble())
+        )
+
+        val perspectiveMat = Imgproc.getPerspectiveTransform(srcPts, dstPts)
+        Imgproc.warpPerspective(textureInput, outputTexture, perspectiveMat, outputTexture.size(), Imgproc.INTER_LINEAR)
+        
+        srcPts.release(); dstPts.release(); perspectiveMat.release()
     }
 
     private fun saveBitmapToGallery(bitmap: Bitmap) {
@@ -740,6 +740,7 @@ class MainActivity : AppCompatActivity() {
                 put(MediaStore.Images.Media.DISPLAY_NAME, filename)
                 put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg") 
              }
+     
             val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return
             contentResolver.openOutputStream(uri)?.use { bitmap.compress(Bitmap.CompressFormat.JPEG, 95, it) }
             Toast.makeText(this, "💾 저장 완료", Toast.LENGTH_SHORT).show()
@@ -766,7 +767,6 @@ class MainActivity : AppCompatActivity() {
         displayedBitmap?.recycle()
         displayedBitmap = null
         
-        // 🌟 캐싱된 텍스처 메모리 해제
         cachedTextureMat?.release()
         cachedTextureMat = null
 
