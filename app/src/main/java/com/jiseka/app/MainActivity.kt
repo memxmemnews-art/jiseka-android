@@ -156,8 +156,9 @@ class MainActivity : AppCompatActivity() {
             ?: Toast.makeText(this, "저장할 이미지가 없습니다.", Toast.LENGTH_SHORT).show()
         }
 
-        nativeGuideView?.onCrosshairDropListener = { uiPoint ->
-            if (!isMatrixReady) return@onCrosshairDropListener
+        // 🌟 명시적 라벨(drop@)을 추가하여 Kotlin 컴파일 에러 원천 차단
+        nativeGuideView?.onCrosshairDropListener = drop@{ uiPoint ->
+            if (!isMatrixReady) return@drop
 
             val currentSession = captureSessionId.get()
             progressBar?.visibility = View.VISIBLE
@@ -431,7 +432,6 @@ class MainActivity : AppCompatActivity() {
                             nativeBackgroundView?.setImageBitmap(resultBitmap)
                             displayedBitmap = resultBitmap
            
-                            // 🌟 렌더링 파이프라인 충돌을 막기 위한 안전한 지연 해제
                             oldBitmap?.let { bmp -> 
                                 uiHandler.postDelayed({ 
                                     if (!bmp.isRecycled) bmp.recycle() 
@@ -465,7 +465,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 🌟 1. 완벽한 다각형 교차점 탐색 함수 (수직 스캔라인)
     private fun findVerticalIntersections(hull: List<Point>, targetX: Double): Pair<Double, Double>? {
         val intersections = mutableListOf<Double>()
         for (i in hull.indices) {
@@ -475,7 +474,6 @@ class MainActivity : AppCompatActivity() {
             val minX = min(p1.x, p2.x)
             val maxX = max(p1.x, p2.x)
 
-            // 부동소수점 오차를 고려한 안전한 범위 검사
             if (targetX < minX - 1e-5 || targetX > maxX + 1e-5) continue
 
             if (Math.abs(p2.x - p1.x) < 1e-6) {
@@ -493,7 +491,6 @@ class MainActivity : AppCompatActivity() {
         return Pair(intersections.first(), intersections.last())
     }
 
-    // 🌟 2. 호 길이(Arc Length) 기반 점 보간 함수
     private fun getPointAtArcLength(chain: List<Point>, targetRatio: Double): Point {
         if (chain.size == 1) return chain.first()
         if (targetRatio <= 0.0) return chain.first()
@@ -525,7 +522,6 @@ class MainActivity : AppCompatActivity() {
         return chain.last()
     }
 
-    // 🌟 3. Convex Hull 분리 함수 (좌우 끝점 기준)
     private fun splitHullIntoChains(hullPts: List<Point>): Pair<List<Point>, List<Point>> {
         var leftIdx = 0
         var rightIdx = 0
@@ -565,7 +561,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 🌟 4. 고품질 다중 분할 변환 + 메모리 할당 방어 (JNI 최적화)
     private fun applyMaskToMat(mat: Mat, corners: List<ImmutablePoint>, textureInput: Mat) {
         if (corners.isEmpty()) return
 
@@ -574,7 +569,6 @@ class MainActivity : AppCompatActivity() {
         var warpedTexture: Mat? = null
         var preparedTexture: Mat? = null
         
-        // 🌟 루프 내부 대형 객체 할당 방지용 사전 생성 변수
         var stripWarped: Mat? = null
         var stripMask: Mat? = null
         val scalarZero = Scalar(0.0)
@@ -621,7 +615,6 @@ class MainActivity : AppCompatActivity() {
                 val texWidth = preparedTexture.cols().toDouble()
                 val texHeight = preparedTexture.rows().toDouble()
 
-                // 🌟 JNI 병목 해소: 반복문 외부에서 도화지(Mat) 1회 할당
                 stripWarped = Mat(mat.size(), mat.type())
                 stripMask = Mat.zeros(mat.size(), CvType.CV_8UC1)
 
@@ -650,7 +643,6 @@ class MainActivity : AppCompatActivity() {
 
                     val perspectiveMat = Imgproc.getPerspectiveTransform(srcPts, dstPts)
                     
-                    // 🌟 GC 최적화: 도화지를 새로 만들지 않고, 0으로 초기화하여 재사용(Reuse)
                     stripWarped.setTo(scalarZero)
                     stripMask.setTo(scalarZero)
                     
@@ -661,7 +653,6 @@ class MainActivity : AppCompatActivity() {
                     
                     stripWarped.copyTo(warpedTexture, stripMask)
 
-                    // 단발성 작은 객체들만 루프 내에서 정리
                     srcPts.release(); dstPts.release(); perspectiveMat.release()
                     stripContour.release()
                 }
@@ -700,7 +691,6 @@ class MainActivity : AppCompatActivity() {
             alphaMat?.release(); warpedTexture?.release()
             preparedTexture?.release()
             
-            // 대형 재사용 객체 일괄 해제
             stripWarped?.release()
             stripMask?.release()
             
