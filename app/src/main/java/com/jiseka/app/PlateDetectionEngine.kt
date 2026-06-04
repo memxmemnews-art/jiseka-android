@@ -105,7 +105,8 @@ object PlateDetectionEngine {
                         val candCy = candidateArray.map { it.y }.average()
                         val distToCenter = hypot(roiCenter.x - candCx, roiCenter.y - candCy)
 
-                        if (distToCenter < (roiBitmap.width / 3.0) && contourArea > maxArea) {
+                        // 🌟 에러 픽스: 없어진 roiBitmap 대신 safeRect.width 사용
+                        if (distToCenter < (safeRect.width / 3.0) && contourArea > maxArea) {
                             maxArea = contourArea
                             bestApprox2f?.release()
                             bestApprox2f = approx
@@ -130,7 +131,7 @@ object PlateDetectionEngine {
                 roiContours.forEach { it.release() }
                 
                 hierarchy.release()
-                clahe.release()
+                // 🌟 에러 픽스: OpenCV Java의 CLAHE는 release()가 없으므로 해당 라인 삭제
             }
             return resultPoints
         }
