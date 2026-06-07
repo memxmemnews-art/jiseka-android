@@ -5,16 +5,18 @@ import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.graphics.Matrix
-import android.graphics.PointF
 import android.os.Bundle
 import android.os.Looper
 import android.provider.MediaStore
 import android.util.Log
+import android.view.Gravity
 import android.view.OrientationEventListener
 import android.view.View
 import android.view.ViewTreeObserver
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
@@ -44,6 +46,7 @@ import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.ThreadPoolExecutor
@@ -65,6 +68,10 @@ class MainActivity : AppCompatActivity() {
     private var btnSave: Button? = null
     private var progressBar: ProgressBar? = null
     private var guideText: TextView? = null
+
+    // 🛠️ [디버그 전용] 스레드 제어 및 임시 UI 버튼
+    private var debugLatch: CountDownLatch? = null
+    private var btnDebugNext: Button? = null
 
     private var orientationEventListener: OrientationEventListener? = null
     private var currentLogicalRotation = 0f
@@ -125,12 +132,35 @@ class MainActivity : AppCompatActivity() {
         precomputeExecutor = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(1), ThreadPoolExecutor.DiscardOldestPolicy())
         maskExecutor = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(1), ThreadPoolExecutor.AbortPolicy())
 
+        setupDebugUI() // 🛠️ 디버그 버튼 초기화
         setupUIListeners()
         setupOrientationListener()
         resetToLiveMode()
 
         if (allPermissionsGranted()) viewFinder?.post { startCamera() }
         else ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
+    }
+
+    // 🛠️ [디버그 전용] 동적으로 하단에 임시 버튼 추가
+    private fun setupDebugUI() {
+        btnDebugNext = Button(this).apply {
+            text = "다음 단계 확인 ⏭️"
+            textSize = 20f
+            setBackgroundColor(Color.parseColor("#FF3333"))
+            setTextColor(Color.WHITE)
+            visibility = View.GONE
+            setOnClickListener {
+                debugLatch?.countDown() 
+            }
+        }
+        val params = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            bottomMargin = 300 
+        }
+        addContentView(btnDebugNext, params)
     }
 
     private fun loadTextureSafely() {
@@ -156,9 +186,9 @@ class MainActivity : AppCompatActivity() {
             ?: Toast.makeText(this, "저장할 이미지가 없습니다.", Toast.LENGTH_SHORT).show()
         }
 
-        // 🌟 명시적 라벨(drop@)을 추가하여 Kotlin 컴파일 에러 원천 차단
-        nativeGuideView?.onCrosshairDropListener = drop@{ uiPoint ->
-            if (!isMatrixReady) return@drop
+        // 🌟 선 긋기 리스너 매핑
+        nativeGuideView?.onLineDropListener = { startUiPoint, endUiPoint ->
+            if (!isMatrixReady) return@onLineDropListener
 
             val currentSession = captureSessionId.get()
             progressBar?.visibility = View.VISIBLE
@@ -171,12 +201,40 @@ class MainActivity : AppCompatActivity() {
                 val safeBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) }
        
                 if (safeBitmap != null) {
-                    val bitmapCoords = FloatArray(2)
-                    bitmapCoords[0] = uiPoint.x
-                    bitmapCoords[1] = uiPoint.y
-                    inverseMatrix.mapPoints(bitmapCoords)
+                    val startCoords = FloatArray(2).apply { this[0] = startUiPoint.x; this[1] = startUiPoint.y }
+                    inverseMatrix.mapPoints(startCoords)
+
+                    val endCoords = FloatArray(2).apply { this[0] = endUiPoint.x; this[1] = endUiPoint.y }
+                    inverseMatrix.mapPoints(endCoords)
          
-                    val targetPolygon = PlateDetectionEngine.rescuePlateFromCrosshair(safeBitmap, bitmapCoords[0], bitmapCoords[1])
+                    // 🛠️ [디버그 전용] 락(Lock)을 걸어 스레드를 일시정지 시키는 리스너
+                    val debugInterceptor = object : PlateDetectionEngine.DetectionDebugListener {
+                        override fun pauseAndShowStep(stageName: String, bitmap: Bitmap) {
+                            debugLatch = CountDownLatch(1)
+                            
+                            runOnUiThread {
+                                if (isFinishing || isDestroyed) return@runOnUiThread
+                                Toast.makeText(this@MainActivity, stageName, Toast.LENGTH_SHORT).show()
+                                nativeBackgroundView?.setImageBitmap(bitmap)
+                                btnDebugNext?.visibility = View.VISIBLE 
+                                progressBar?.visibility = View.GONE 
+                            }
+                            
+                            debugLatch?.await() // 버튼 누를 때까지 대기
+                            
+                            runOnUiThread { 
+                                btnDebugNext?.visibility = View.GONE 
+                                progressBar?.visibility = View.VISIBLE 
+                            }
+                        }
+                    }
+
+                    val targetPolygon = PlateDetectionEngine.rescuePlateFromLine(
+                        safeBitmap, 
+                        startCoords[0], startCoords[1], 
+                        endCoords[0], endCoords[1],
+                        debugListener = debugInterceptor
+                    )
                     safeBitmap.recycle()
 
                     runOnUiThread {
@@ -187,7 +245,7 @@ class MainActivity : AppCompatActivity() {
                         } else {
                             progressBar?.visibility = View.GONE
                             nativeGuideView?.visibility = View.VISIBLE
-                            Toast.makeText(this@MainActivity, "번호판을 찾을 수 없습니다. 다시 조준해주세요.", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(this@MainActivity, "번호판 추적 최종 실패.", Toast.LENGTH_LONG).show()
                         }
                     }
                 } else {
@@ -234,6 +292,9 @@ class MainActivity : AppCompatActivity() {
     private fun resetToLiveMode() {
         captureSessionId.incrementAndGet()
         
+        debugLatch?.countDown() // 🛠️ 진행 중 취소 시 스레드 해방
+        btnDebugNext?.visibility = View.GONE
+        
         btnCapture?.isEnabled = true
         nativeBackgroundView?.setImageDrawable(null)
     
@@ -269,7 +330,7 @@ class MainActivity : AppCompatActivity() {
                 val cameraProvider = cameraProviderFuture.get()
                 val preview = Preview.Builder().build().also { it.setSurfaceProvider(viewFinder?.surfaceProvider) }
                 imageCapture = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY).build()
-     
+   
                 cameraProvider.unbindAll()
                 val viewPort = viewFinder?.viewPort
                 if (viewPort != null) {
@@ -303,13 +364,13 @@ class MainActivity : AppCompatActivity() {
         btnCapture?.visibility = View.GONE
  
         val currentSessionId = captureSessionId.incrementAndGet()
-        
+   
         try {
             imageCapture?.takePicture(cameraExecutor, object : ImageCapture.OnImageCapturedCallback() {
                 override fun onCaptureSuccess(imageProxy: ImageProxy) {
                     try {
                         val uprightBitmap = imageProxy.toUprightBitmap()
-                 
+  
                         synchronized(bitmapLock) { 
                             lastCapturedBitmap?.recycle() 
                             lastCapturedBitmap = uprightBitmap 
@@ -320,6 +381,7 @@ class MainActivity : AppCompatActivity() {
                             viewFinder?.visibility = View.GONE
                             nativeBackgroundView?.setImageBitmap(uprightBitmap)
                             nativeBackgroundView?.visibility = View.VISIBLE
+  
                             progressBar?.visibility = View.GONE 
                             setupMatrixAndPrecalculate(currentSessionId)
                         }
@@ -372,14 +434,14 @@ class MainActivity : AppCompatActivity() {
             
                 nativeGuideView?.visibility = View.VISIBLE
                 
-                guideText?.text = "십자선을 번호판 위에 놓고 손을 떼주세요"
+                guideText?.text = "번호판 위로 선을 길게 그어주세요"
                 guideText?.paint?.isFakeBoldText = true 
                 guideText?.textSize = 20f 
                 guideText?.alpha = 1f
                 guideText?.visibility = View.VISIBLE
                 
                 uiHandler.removeCallbacks(hideGuideTextRunnable) 
-                uiHandler.postDelayed(hideGuideTextRunnable, 2500) 
+                uiHandler.postDelayed(hideGuideTextRunnable, 3500) 
                 return true 
             }
         })
@@ -729,7 +791,7 @@ class MainActivity : AppCompatActivity() {
             val values = ContentValues().apply { 
                 put(MediaStore.Images.Media.DISPLAY_NAME, filename)
                 put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg") 
-             }
+            }
      
             val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return
             contentResolver.openOutputStream(uri)?.use { bitmap.compress(Bitmap.CompressFormat.JPEG, 95, it) }
@@ -749,6 +811,8 @@ class MainActivity : AppCompatActivity() {
         orientationEventListener?.disable()
         uiHandler.removeCallbacksAndMessages(null)
         
+        debugLatch?.countDown() // 🛠️ 스레드 해방
+
         synchronized(bitmapLock) { 
              lastCapturedBitmap?.recycle()
              lastCapturedBitmap = null 
