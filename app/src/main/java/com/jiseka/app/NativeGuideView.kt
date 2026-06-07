@@ -13,7 +13,7 @@ class NativeGuideView @JvmOverloads constructor(
     context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
 ) : View(context, attrs, defStyleAttr) {
 
-    // 선 긋기 완료 리스너 (시작점, 끝점 전달)
+    // 선 긋기 완료 리스너 (시작점, 끝점 전달) - 에러 원인이었던 변수입니다.
     var onLineDropListener: ((PointF, PointF) -> Unit)? = null 
 
     var currentDeviceRotation = 0f
