@@ -258,7 +258,8 @@ object PlateDetectionEngine {
         } catch (e: Exception) {
             e.printStackTrace()
         } finally {
-            roiGray.release(); roiEdge.release(); combinedEdge.release()
+            // ✅ 에러 수정됨: roiGray.release() 제거
+            roiEdge.release(); combinedEdge.release()
             roiContours.forEach { it.release() }; hierarchy.release()
             
             rotMat.release()
