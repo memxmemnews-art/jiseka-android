@@ -186,9 +186,9 @@ class MainActivity : AppCompatActivity() {
             ?: Toast.makeText(this, "저장할 이미지가 없습니다.", Toast.LENGTH_SHORT).show()
         }
 
-        // 🌟 선 긋기 리스너 매핑
-        nativeGuideView?.onLineDropListener = { startUiPoint, endUiPoint ->
-            if (!isMatrixReady) return@onLineDropListener
+        // 🌟 선 긋기 리스너 매핑 (명시적 라벨 lineDrop@ 적용으로 컴파일 에러 완전 차단)
+        nativeGuideView?.onLineDropListener = lineDrop@{ startUiPoint, endUiPoint ->
+            if (!isMatrixReady) return@lineDrop
 
             val currentSession = captureSessionId.get()
             progressBar?.visibility = View.VISIBLE
