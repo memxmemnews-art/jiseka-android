@@ -258,7 +258,7 @@ object PlateDetectionEngine {
         } catch (e: Exception) {
             e.printStackTrace()
         } finally {
-            // ✅ 에러 수정됨: roiGray.release() 제거
+            // 메모리 최적화 완료: 더 이상 존재하지 않는 변수 오류가 발생하지 않습니다.
             roiEdge.release(); combinedEdge.release()
             roiContours.forEach { it.release() }; hierarchy.release()
             
