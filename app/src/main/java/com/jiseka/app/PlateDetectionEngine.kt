@@ -1,6 +1,9 @@
 package com.jiseka.app
 
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
 import org.opencv.android.Utils
 import org.opencv.core.*
 import org.opencv.imgproc.Imgproc
@@ -12,6 +15,44 @@ object PlateDetectionEngine {
 
     interface DetectionDebugListener {
         fun pauseAndShowStep(stageName: String, bitmap: Bitmap)
+    }
+
+    // 🌟 AI 디버그 분석용 HUD(Heads-Up Display) 스탬프 함수
+    private fun addDebugHUD(original: Bitmap, title: String, logs: List<String>): Bitmap {
+        val bmp = original.copy(Bitmap.Config.ARGB_8888, true)
+        val canvas = Canvas(bmp)
+        
+        val paint = Paint().apply {
+            color = Color.WHITE
+            textSize = 50f // 고해상도 카메라 이미지에 맞춘 텍스트 크기
+            isAntiAlias = true
+            setShadowLayer(5f, 0f, 0f, Color.BLACK)
+        }
+        val bgPaint = Paint().apply {
+            color = Color.parseColor("#99000000") // 반투명 검은색 배경 (가독성 확보)
+        }
+
+        val padding = 30f
+        val lineHeight = 60f
+        val totalHeight = padding + lineHeight + (logs.size * lineHeight) + padding
+        
+        // 반투명 배경 박스 그리기
+        canvas.drawRect(0f, 0f, bmp.width.toFloat(), totalHeight, bgPaint)
+
+        // 타이틀 그리기
+        paint.color = Color.YELLOW
+        paint.isFakeBoldText = true
+        canvas.drawText(title, padding, padding + 40f, paint)
+
+        // 내부 수치(Log) 그리기
+        paint.color = Color.WHITE
+        paint.isFakeBoldText = false
+        var currentY = padding + lineHeight + 40f
+        for (log in logs) {
+            canvas.drawText(log, padding, currentY, paint)
+            currentY += lineHeight
+        }
+        return bmp
     }
 
     fun rescuePlateFromLine(
@@ -26,7 +67,6 @@ object PlateDetectionEngine {
         Utils.bitmapToMat(fullBitmap, fullMat)
         Imgproc.cvtColor(fullMat, fullGray, Imgproc.COLOR_RGBA2GRAY)
 
-        // 방향 정규화 (무조건 좌 -> 우)
         var p1x = startX.toDouble(); var p1y = startY.toDouble()
         var p2x = endX.toDouble(); var p2y = endY.toDouble()
         if (p1x > p2x) {
@@ -42,7 +82,7 @@ object PlateDetectionEngine {
         // =====================================================================
         // [1단계] 안전 영역(Padded ROI) 1차 추출
         // =====================================================================
-        val paddedSize = lineLen * 2.0 
+        val paddedSize = lineLen * 2.5
         val paddedLeft = (cx - paddedSize / 2.0).toInt().coerceIn(0, fullMat.cols() - 1)
         val paddedTop = (cy - paddedSize / 2.0).toInt().coerceIn(0, fullMat.rows() - 1)
         val paddedRight = (cx + paddedSize / 2.0).toInt().coerceIn(1, fullMat.cols())
@@ -57,8 +97,16 @@ object PlateDetectionEngine {
             
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
-            it.pauseAndShowStep("1단계: 회전 대비 안전 영역(Padded ROI) 확보", debugBmp)
-            debugMat.release()
+            
+            // 📊 HUD 추가
+            val hudBmp = addDebugHUD(debugBmp, "Step 1: Padded ROI Set", listOf(
+                "Input Line Length: ${String.format("%.1f", lineLen)} px",
+                "Center (X,Y): (${cx.toInt()}, ${cy.toInt()})",
+                "Padded ROI Size: ${paddedRect.width} x ${paddedRect.height} (x2.5)"
+            ))
+            
+            it.pauseAndShowStep("1단계: Padded ROI 확보", hudBmp)
+            debugMat.release(); debugBmp.recycle()
         }
 
         val paddedMat = Mat(); val paddedGray = Mat()
@@ -78,125 +126,180 @@ object PlateDetectionEngine {
         Imgproc.warpAffine(paddedMat, rotatedPaddedMat, rotMat, paddedMat.size(), Imgproc.INTER_LINEAR)
         Imgproc.warpAffine(paddedGray, rotatedPaddedGray, rotMat, paddedGray.size(), Imgproc.INTER_LINEAR)
 
-        // =====================================================================
-        // [2.5단계] Edge Density 동적 탐색 (세로창 그릴 방어 및 디버그)
-        // =====================================================================
         var tightTop = 0
         var tightBottom = rotatedPaddedGray.rows()
+        var tightLeft = 0
+        var tightRight = rotatedPaddedGray.cols()
         
-        val sobelX = Mat()
-        val searchMat = Mat()
-        val projection = Mat()
+        val sobelX = Mat(); val searchMat = Mat()
+        val vProjection = Mat(); val hProjection = Mat()
         
         try {
-            // 1. 세로선(수직 엣지)만 강하게 추출
             Imgproc.Sobel(rotatedPaddedGray, sobelX, CvType.CV_32F, 1, 0, 3)
             Core.convertScaleAbs(sobelX, sobelX)
             Imgproc.threshold(sobelX, sobelX, 50.0, 255.0, Imgproc.THRESH_BINARY)
 
-            // 🛠️ [디버그 2.5-1] 수직 엣지 추출 상태 확인
             debugListener?.let {
                 val debugBmp = Bitmap.createBitmap(sobelX.cols(), sobelX.rows(), Bitmap.Config.ARGB_8888)
                 val tempRgb = Mat()
                 Imgproc.cvtColor(sobelX, tempRgb, Imgproc.COLOR_GRAY2RGBA)
                 Utils.matToBitmap(tempRgb, debugBmp)
-                it.pauseAndShowStep("2.5단계 (1/3): 수직 엣지(문자/세로그릴) 추출 및 이진화", debugBmp)
-                tempRgb.release()
+                
+                // 📊 HUD 추가
+                val hudBmp = addDebugHUD(debugBmp, "Step 2.5 (1/4): Vertical Edge Extraction", listOf(
+                    "Applied Rotation Angle: ${String.format("%.2f", -angle)} degrees",
+                    "Sobel X Threshold: 50.0 / 255.0"
+                ))
+                it.pauseAndShowStep("2.5단계 (1/4): 수직 엣지 추출", hudBmp)
+                tempRgb.release(); debugBmp.recycle()
             }
 
-            // 2. 가로 노이즈(헤드라이트 등)를 배제하기 위해 폭 제한
+            // =====================================================================
+            // [2.5단계] 세로 방향 상/하단 탐색
+            // =====================================================================
             val searchWidth = max(50.0, lineLen * 1.0).toInt()
             val searchLeft = (roiCx - searchWidth / 2.0).toInt().coerceIn(0, sobelX.cols() - 1)
             val searchRight = (roiCx + searchWidth / 2.0).toInt().coerceIn(1, sobelX.cols())
             
-            val searchRect = Rect(searchLeft, 0, searchRight - searchLeft, sobelX.rows())
-            sobelX.submat(searchRect).copyTo(searchMat)
+            val vSearchRect = Rect(searchLeft, 0, searchRight - searchLeft, sobelX.rows())
+            sobelX.submat(vSearchRect).copyTo(searchMat)
 
-            // 🛠️ [디버그 2.5-2] 좌우 탐색 범위 확인
-            debugListener?.let {
-                val debugMat = rotatedPaddedMat.clone()
-                Imgproc.rectangle(debugMat, searchRect, Scalar(255.0, 0.0, 255.0, 255.0), 6) // 마젠타색 박스
-                val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
-                Utils.matToBitmap(debugMat, debugBmp)
-                it.pauseAndShowStep("2.5단계 (2/3): 스캔 영역 제한 (가로 노이즈 배제)", debugBmp)
-                debugMat.release()
+            Core.reduce(searchMat, vProjection, 1, Core.REDUCE_SUM, CvType.CV_32S)
+            val vProfile = IntArray(vProjection.rows())
+            vProjection.get(0, 0, vProfile)
+
+            val startY = roiCy.toInt().coerceIn(0, vProfile.lastIndex)
+            var centerSum = 0L; var count = 0
+            for(i in max(0, startY - 3)..min(vProfile.lastIndex, startY + 3)) {
+                centerSum += vProfile[i]; count++
             }
+            val vCenterDensity = centerSum / count.toDouble()
+            val vThreshold = vCenterDensity * 0.25 
 
-            // 3. 가로줄 단위로 엣지 픽셀 합산 (고속 투영)
-            Core.reduce(searchMat, projection, 1, Core.REDUCE_SUM, CvType.CV_32S)
-            val profile = IntArray(projection.rows())
-            projection.get(0, 0, profile)
+            var detectedTop = startY; var detectedBottom = startY
+            for (y in startY downTo 0) { if (vProfile[y] < vThreshold) { detectedTop = y; break } }
+            for (y in startY..vProfile.lastIndex) { if (vProfile[y] < vThreshold) { detectedBottom = y; break } }
 
-            // 4. 중심 파생 탐색 (Center-Out Expansion)
-            val startY = roiCy.toInt().coerceIn(0, profile.lastIndex)
-            
-            var centerSum = 0L
-            var count = 0
-            for(i in max(0, startY - 3)..min(profile.lastIndex, startY + 3)) {
-                centerSum += profile[i]
-                count++
-            }
-            val centerDensity = centerSum / count.toDouble()
-            val threshold = centerDensity * 0.25 
-
-            var detectedTop = startY
-            for (y in startY downTo 0) {
-                if (profile[y] < threshold) { detectedTop = y; break }
-            }
-
-            var detectedBottom = startY
-            for (y in startY..profile.lastIndex) {
-                if (profile[y] < threshold) { detectedBottom = y; break }
-            }
-
-            // 5. 기하학적 퓨즈 (예외 처리)
             var dynamicHeight = (detectedBottom - detectedTop).toDouble()
             val expectedGeometricHeight = lineLen / 4.7
-            var usedFallback = false
+            var usedVerticalFallback = false
 
             if (dynamicHeight > expectedGeometricHeight * 2.5 || dynamicHeight < expectedGeometricHeight * 0.4) {
                 val fallbackHeight = expectedGeometricHeight * 2.0
                 tightTop = max(0, (roiCy - fallbackHeight / 2.0).toInt())
                 tightBottom = min(rotatedPaddedGray.rows(), (roiCy + fallbackHeight / 2.0).toInt())
-                usedFallback = true
+                usedVerticalFallback = true
             } else {
                 val padding = dynamicHeight * 0.2
                 tightTop = max(0, (detectedTop - padding).toInt())
                 tightBottom = min(rotatedPaddedGray.rows(), (detectedBottom + padding).toInt())
             }
 
-            // 🛠️ [디버그 2.5-3] 최종 판단 결과 및 롤백 여부 확인
             debugListener?.let {
                 val debugMat = rotatedPaddedMat.clone()
-                
-                // 탐색 시작점 (초록색 선)
-                Imgproc.line(debugMat, Point(0.0, startY.toDouble()), Point(debugMat.cols().toDouble(), startY.toDouble()), Scalar(0.0, 255.0, 0.0, 255.0), 3)
-                
-                // 찾아낸 타이트 ROI의 상하단 (정상: 노란색, 롤백: 빨간색)
-                val color = if(usedFallback) Scalar(255.0, 0.0, 0.0, 255.0) else Scalar(255.0, 255.0, 0.0, 255.0)
-                Imgproc.line(debugMat, Point(0.0, tightTop.toDouble()), Point(debugMat.cols().toDouble(), tightTop.toDouble()), color, 5)
-                Imgproc.line(debugMat, Point(0.0, tightBottom.toDouble()), Point(debugMat.cols().toDouble(), tightBottom.toDouble()), color, 5)
+                val color = if(usedVerticalFallback) Scalar(255.0, 0.0, 0.0, 255.0) else Scalar(255.0, 255.0, 0.0, 255.0)
+                Imgproc.rectangle(debugMat, vSearchRect, Scalar(255.0, 0.0, 255.0, 255.0), 3)
+                Imgproc.line(debugMat, Point(0.0, tightTop.toDouble()), Point(debugMat.cols().toDouble(), tightTop.toDouble()), color, 4)
+                Imgproc.line(debugMat, Point(0.0, tightBottom.toDouble()), Point(debugMat.cols().toDouble(), tightBottom.toDouble()), color, 4)
                 
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
+
+                // 📊 HUD 추가 (AI 분석용 핵심 데이터)
+                val statusText = if(usedVerticalFallback) "FAIL -> Fallback applied" else "SUCCESS -> Margin added"
+                val hudBmp = addDebugHUD(debugBmp, "Step 2.5 (2/4): Vertical Scan Result", listOf(
+                    "Search Width: $searchWidth px (1.0x LineLen)",
+                    "Center Density: ${String.format("%.1f", vCenterDensity)}",
+                    "Cutoff Threshold (25%): ${String.format("%.1f", vThreshold)}",
+                    "Dynamic Height Found: ${String.format("%.1f", dynamicHeight)} px",
+                    "Expected Target: ${String.format("%.1f", expectedGeometricHeight)} px (Tolerance: 0.4x ~ 2.5x)",
+                    "Status: $statusText"
+                ))
+                it.pauseAndShowStep("2.5단계 (2/4): 세로 탐색 결과", hudBmp)
+                debugMat.release(); debugBmp.recycle()
+            }
+
+            // =====================================================================
+            // [2.6단계] 가로 방향 동적 확장
+            // =====================================================================
+            val bandHeight = tightBottom - tightTop
+            var usedHorizontalFallback = false
+            var hCenterDensity = 0.0
+            var hThreshold = 0.0
+            var textWidth = 0.0
+            
+            if (bandHeight > 10) {
+                val hSearchRect = Rect(0, tightTop, sobelX.cols(), bandHeight)
+                val textBandSobel = sobelX.submat(hSearchRect)
+
+                Core.reduce(textBandSobel, hProjection, 0, Core.REDUCE_SUM, CvType.CV_32S)
+                val hProfile = IntArray(hProjection.cols())
+                hProjection.get(0, 0, hProfile)
+
+                val startX = roiCx.toInt().coerceIn(0, hProfile.lastIndex)
+                var hCenterSum = 0L; var hCount = 0
+                for(i in max(0, startX - 5)..min(hProfile.lastIndex, startX + 5)) {
+                    hCenterSum += hProfile[i]; hCount++
+                }
                 
-                val msg = if(usedFallback) "2.5단계 (3/3): [경고] 비정상 감지 -> 기하학적 롤백 적용" 
-                          else "2.5단계 (3/3): Edge Density 탐색 성공 -> 최종 높이 확정"
-                it.pauseAndShowStep(msg, debugBmp)
-                debugMat.release()
+                hCenterDensity = hCenterSum / hCount.toDouble()
+                hThreshold = hCenterDensity * 0.15 
+
+                var textLeft = startX; var textRight = startX
+                for (x in startX downTo 0) { if (hProfile[x] < hThreshold) { textLeft = x; break } }
+                for (x in startX..hProfile.lastIndex) { if (hProfile[x] < hThreshold) { textRight = x; break } }
+
+                textWidth = (textRight - textLeft).toDouble()
+                
+                if (textWidth < lineLen * 0.4 || textWidth > lineLen * 2.0) {
+                    val fallbackWidth = max(100.0, lineLen * 1.1)
+                    tightLeft = max(0, (roiCx - fallbackWidth / 2.0).toInt())
+                    tightRight = min(rotatedPaddedGray.cols(), (roiCx + fallbackWidth / 2.0).toInt())
+                    usedHorizontalFallback = true
+                } else {
+                    val paddingX = textWidth * 0.25
+                    tightLeft = max(0, (textLeft - paddingX).toInt())
+                    tightRight = min(rotatedPaddedGray.cols(), (textRight + paddingX).toInt())
+                }
+                textBandSobel.release()
+            } else {
+                val fallbackWidth = max(100.0, lineLen * 1.1)
+                tightLeft = max(0, (roiCx - fallbackWidth / 2.0).toInt())
+                tightRight = min(rotatedPaddedGray.cols(), (roiCx + fallbackWidth / 2.0).toInt())
+                usedHorizontalFallback = true
+            }
+
+            debugListener?.let {
+                val debugMat = rotatedPaddedMat.clone()
+                val color = if(usedHorizontalFallback) Scalar(255.0, 0.0, 0.0, 255.0) else Scalar(0.0, 255.0, 0.0, 255.0)
+                Imgproc.line(debugMat, Point(tightLeft.toDouble(), tightTop.toDouble()), Point(tightLeft.toDouble(), tightBottom.toDouble()), color, 4)
+                Imgproc.line(debugMat, Point(tightRight.toDouble(), tightTop.toDouble()), Point(tightRight.toDouble(), tightBottom.toDouble()), color, 4)
+                
+                val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+                Utils.matToBitmap(debugMat, debugBmp)
+
+                // 📊 HUD 추가 (AI 분석용 핵심 데이터)
+                val statusText = if(usedHorizontalFallback) "FAIL -> Fallback (1.1x LineLen)" else "SUCCESS -> TextWidth + 25% Margin"
+                val hudBmp = addDebugHUD(debugBmp, "Step 2.6 (4/4): Horizontal Scan Result", listOf(
+                    "Band Height Used: $bandHeight px",
+                    "Center Text Density: ${String.format("%.1f", hCenterDensity)}",
+                    "Cutoff Threshold (15%): ${String.format("%.1f", hThreshold)}",
+                    "Detected Text Block Width: ${String.format("%.1f", textWidth)} px",
+                    "Input Line Length: ${String.format("%.1f", lineLen)} px",
+                    "Status: $statusText"
+                ))
+                it.pauseAndShowStep("2.6단계 (4/4): 가로 방향 동적 스캔 결과", hudBmp)
+                debugMat.release(); debugBmp.recycle()
             }
 
         } finally {
-            sobelX.release(); searchMat.release(); projection.release()
+            sobelX.release(); searchMat.release()
+            vProjection.release(); hProjection.release()
         }
 
         // =====================================================================
         // [3단계] 최종 타이트 ROI 생성
         // =====================================================================
-        val tightWidth = max(100.0, lineLen * 1.1)
-        val tightLeft = (roiCx - tightWidth / 2.0).toInt().coerceIn(0, rotatedPaddedGray.cols() - 1)
-        val tightRight = (roiCx + tightWidth / 2.0).toInt().coerceIn(1, rotatedPaddedGray.cols())
-        
         if (tightRight - tightLeft <= 10 || tightBottom - tightTop <= 10) {
             fullMat.release(); fullGray.release(); rotMat.release()
             paddedMat.release(); paddedGray.release()
@@ -211,11 +314,18 @@ object PlateDetectionEngine {
 
         debugListener?.let {
             val debugMat = rotatedPaddedMat.clone()
-            Imgproc.rectangle(debugMat, safeTightRect, Scalar(0.0, 255.0, 0.0, 255.0), 12)
+            Imgproc.rectangle(debugMat, safeTightRect, Scalar(0.0, 255.0, 0.0, 255.0), 10)
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
-            it.pauseAndShowStep("3단계: Edge Density가 반영된 최종 타이트 크롭 확인", debugBmp)
-            debugMat.release()
+            
+            // 📊 HUD 추가
+            val hudBmp = addDebugHUD(debugBmp, "Step 3: Final Tight ROI Generation", listOf(
+                "Final ROI Width: ${safeTightRect.width} px",
+                "Final ROI Height: ${safeTightRect.height} px",
+                "Aspect Ratio: ${String.format("%.2f", safeTightRect.width.toDouble() / safeTightRect.height)}"
+            ))
+            it.pauseAndShowStep("3단계: 상하/좌우가 모두 조율된 최종 타이트 ROI", hudBmp)
+            debugMat.release(); debugBmp.recycle()
         }
 
         val roiEdge = Mat(); val combinedEdge = Mat()
@@ -223,21 +333,17 @@ object PlateDetectionEngine {
         var resultPoints: List<ImmutablePoint>? = null
 
         try {
-            // [4단계] CLAHE 적용
             val clahe = Imgproc.createCLAHE(2.0, Size(4.0, 4.0))
             clahe.apply(tightGray, tightGray)
             
-            // [5단계] Canny Edge
             val meanVal = Core.mean(tightGray).`val`[0]
             Imgproc.Canny(tightGray, roiEdge, max(0.0, 0.33 * meanVal), min(255.0, 1.33 * meanVal))
             
-            // [6단계] 모폴로지 닫기
             val kernelLen = (safeTightRect.width * 0.08).toInt().coerceIn(10, 60)
             val kernel0 = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(kernelLen.toDouble(), 2.0))
             Imgproc.morphologyEx(roiEdge, combinedEdge, Imgproc.MORPH_CLOSE, kernel0)
             kernel0.release()
 
-            // [7단계] 다각형 윤곽선 추려내기
             Imgproc.findContours(combinedEdge, roiContours, hierarchy, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE)
             
             val validPolygons = ArrayList<MatOfPoint2f>()
@@ -246,7 +352,6 @@ object PlateDetectionEngine {
                 validPolygons.add(approx)
             }
 
-            // [8단계] 깐깐한 형태 검사
             var maxArea = -1.0
             var bestApprox2f: MatOfPoint2f? = null
 
@@ -261,7 +366,6 @@ object PlateDetectionEngine {
                 }
             }
 
-            // [9단계] 이중 역변환 (타이트 ROI -> 안전 영역 -> 글로벌 원본)
             if (bestApprox2f != null) {
                 val invRotMat = Mat()
                 Imgproc.invertAffineTransform(rotMat, invRotMat)
