@@ -17,34 +17,28 @@ object PlateDetectionEngine {
         fun pauseAndShowStep(stageName: String, bitmap: Bitmap)
     }
 
-    // 🌟 AI 디버그 분석용 HUD(Heads-Up Display) 스탬프 함수
     private fun addDebugHUD(original: Bitmap, title: String, logs: List<String>): Bitmap {
         val bmp = original.copy(Bitmap.Config.ARGB_8888, true)
         val canvas = Canvas(bmp)
         
         val paint = Paint().apply {
             color = Color.WHITE
-            textSize = 50f // 고해상도 카메라 이미지에 맞춘 텍스트 크기
+            textSize = 50f
             isAntiAlias = true
             setShadowLayer(5f, 0f, 0f, Color.BLACK)
         }
-        val bgPaint = Paint().apply {
-            color = Color.parseColor("#99000000") // 반투명 검은색 배경 (가독성 확보)
-        }
+        val bgPaint = Paint().apply { color = Color.parseColor("#99000000") }
 
         val padding = 30f
         val lineHeight = 60f
         val totalHeight = padding + lineHeight + (logs.size * lineHeight) + padding
         
-        // 반투명 배경 박스 그리기
         canvas.drawRect(0f, 0f, bmp.width.toFloat(), totalHeight, bgPaint)
 
-        // 타이틀 그리기
         paint.color = Color.YELLOW
         paint.isFakeBoldText = true
         canvas.drawText(title, padding, padding + 40f, paint)
 
-        // 내부 수치(Log) 그리기
         paint.color = Color.WHITE
         paint.isFakeBoldText = false
         var currentY = padding + lineHeight + 40f
@@ -80,9 +74,9 @@ object PlateDetectionEngine {
         val cy = (p1y + p2y) / 2.0
 
         // =====================================================================
-        // [1단계] 안전 영역(Padded ROI) 1차 추출
+        // 🛠️ [1단계 수정] 안전 영역(Padded ROI) 대폭 다이어트 (2.5 -> 1.5배)
         // =====================================================================
-        val paddedSize = lineLen * 2.5
+        val paddedSize = lineLen * 1.5 
         val paddedLeft = (cx - paddedSize / 2.0).toInt().coerceIn(0, fullMat.cols() - 1)
         val paddedTop = (cy - paddedSize / 2.0).toInt().coerceIn(0, fullMat.rows() - 1)
         val paddedRight = (cx + paddedSize / 2.0).toInt().coerceIn(1, fullMat.cols())
@@ -98,14 +92,13 @@ object PlateDetectionEngine {
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
             
-            // 📊 HUD 추가
-            val hudBmp = addDebugHUD(debugBmp, "Step 1: Padded ROI Set", listOf(
+            val hudBmp = addDebugHUD(debugBmp, "Step 1: Optimized Padded ROI", listOf(
                 "Input Line Length: ${String.format("%.1f", lineLen)} px",
-                "Center (X,Y): (${cx.toInt()}, ${cy.toInt()})",
-                "Padded ROI Size: ${paddedRect.width} x ${paddedRect.height} (x2.5)"
+                "Padded ROI Size: ${paddedRect.width} x ${paddedRect.height} (x1.5 instead of x2.5)",
+                "Result: Noise (Grille/Floor) heavily reduced"
             ))
             
-            it.pauseAndShowStep("1단계: Padded ROI 확보", hudBmp)
+            it.pauseAndShowStep("1단계: 다이어트된 Padded ROI 확보", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
 
@@ -144,20 +137,18 @@ object PlateDetectionEngine {
                 val tempRgb = Mat()
                 Imgproc.cvtColor(sobelX, tempRgb, Imgproc.COLOR_GRAY2RGBA)
                 Utils.matToBitmap(tempRgb, debugBmp)
-                
-                // 📊 HUD 추가
                 val hudBmp = addDebugHUD(debugBmp, "Step 2.5 (1/4): Vertical Edge Extraction", listOf(
-                    "Applied Rotation Angle: ${String.format("%.2f", -angle)} degrees",
-                    "Sobel X Threshold: 50.0 / 255.0"
+                    "Applied Rotation: ${String.format("%.2f", -angle)} deg",
+                    "Sobel Thresh: 50.0"
                 ))
                 it.pauseAndShowStep("2.5단계 (1/4): 수직 엣지 추출", hudBmp)
                 tempRgb.release(); debugBmp.recycle()
             }
 
             // =====================================================================
-            // [2.5단계] 세로 방향 상/하단 탐색
+            // 🛠️ [2.5단계 수정] 세로 탐색: 폭을 30%로 극단적 축소 (다이아몬드 그릴 차단)
             // =====================================================================
-            val searchWidth = max(50.0, lineLen * 1.0).toInt()
+            val searchWidth = max(30.0, lineLen * 0.3).toInt() 
             val searchLeft = (roiCx - searchWidth / 2.0).toInt().coerceIn(0, sobelX.cols() - 1)
             val searchRight = (roiCx + searchWidth / 2.0).toInt().coerceIn(1, sobelX.cols())
             
@@ -184,8 +175,9 @@ object PlateDetectionEngine {
             val expectedGeometricHeight = lineLen / 4.7
             var usedVerticalFallback = false
 
+            // 🛠️ 롤백(Fallback) 발생 시 패딩 넉넉하게 2.5배로 할당 (측면 투시왜곡 방어)
             if (dynamicHeight > expectedGeometricHeight * 2.5 || dynamicHeight < expectedGeometricHeight * 0.4) {
-                val fallbackHeight = expectedGeometricHeight * 2.0
+                val fallbackHeight = expectedGeometricHeight * 2.5 
                 tightTop = max(0, (roiCy - fallbackHeight / 2.0).toInt())
                 tightBottom = min(rotatedPaddedGray.rows(), (roiCy + fallbackHeight / 2.0).toInt())
                 usedVerticalFallback = true
@@ -205,22 +197,18 @@ object PlateDetectionEngine {
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
 
-                // 📊 HUD 추가 (AI 분석용 핵심 데이터)
-                val statusText = if(usedVerticalFallback) "FAIL -> Fallback applied" else "SUCCESS -> Margin added"
-                val hudBmp = addDebugHUD(debugBmp, "Step 2.5 (2/4): Vertical Scan Result", listOf(
-                    "Search Width: $searchWidth px (1.0x LineLen)",
+                val statusText = if(usedVerticalFallback) "FAIL -> Fallback applied (2.5x)" else "SUCCESS -> Margin added"
+                val hudBmp = addDebugHUD(debugBmp, "Step 2.5 (2/4): Vertical Scan (Grille Blocked)", listOf(
+                    "Search Width: $searchWidth px (0.3x LineLen - Narrow)",
                     "Center Density: ${String.format("%.1f", vCenterDensity)}",
-                    "Cutoff Threshold (25%): ${String.format("%.1f", vThreshold)}",
-                    "Dynamic Height Found: ${String.format("%.1f", dynamicHeight)} px",
-                    "Expected Target: ${String.format("%.1f", expectedGeometricHeight)} px (Tolerance: 0.4x ~ 2.5x)",
                     "Status: $statusText"
                 ))
-                it.pauseAndShowStep("2.5단계 (2/4): 세로 탐색 결과", hudBmp)
+                it.pauseAndShowStep("2.5단계 (2/4): 세로 탐색 (그릴 노이즈 원천차단)", hudBmp)
                 debugMat.release(); debugBmp.recycle()
             }
 
             // =====================================================================
-            // [2.6단계] 가로 방향 동적 확장
+            // 🛠️ [2.6단계 유지] 가로 방향 동적 확장 (빈 공간 함정 해결 버전)
             // =====================================================================
             val bandHeight = tightBottom - tightTop
             var usedHorizontalFallback = false
@@ -237,17 +225,24 @@ object PlateDetectionEngine {
                 hProjection.get(0, 0, hProfile)
 
                 val startX = roiCx.toInt().coerceIn(0, hProfile.lastIndex)
-                var hCenterSum = 0L; var hCount = 0
-                for(i in max(0, startX - 5)..min(hProfile.lastIndex, startX + 5)) {
-                    hCenterSum += hProfile[i]; hCount++
+                
+                val searchSpan = (lineLen * 0.5).toInt()
+                val peakLeft = max(0, startX - searchSpan)
+                val peakRight = min(hProfile.lastIndex, startX + searchSpan)
+                
+                var maxDensity = 0
+                for(i in peakLeft..peakRight) {
+                    if(hProfile[i] > maxDensity) maxDensity = hProfile[i]
                 }
                 
-                hCenterDensity = hCenterSum / hCount.toDouble()
+                hCenterDensity = maxDensity.toDouble()
                 hThreshold = hCenterDensity * 0.15 
 
-                var textLeft = startX; var textRight = startX
-                for (x in startX downTo 0) { if (hProfile[x] < hThreshold) { textLeft = x; break } }
-                for (x in startX..hProfile.lastIndex) { if (hProfile[x] < hThreshold) { textRight = x; break } }
+                var textLeft = startX
+                var textRight = startX
+
+                for (x in 0..startX) { if (hProfile[x] > hThreshold) { textLeft = x; break } }
+                for (x in hProfile.lastIndex downTo startX) { if (hProfile[x] > hThreshold) { textRight = x; break } }
 
                 textWidth = (textRight - textLeft).toDouble()
                 
@@ -278,17 +273,13 @@ object PlateDetectionEngine {
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
 
-                // 📊 HUD 추가 (AI 분석용 핵심 데이터)
                 val statusText = if(usedHorizontalFallback) "FAIL -> Fallback (1.1x LineLen)" else "SUCCESS -> TextWidth + 25% Margin"
                 val hudBmp = addDebugHUD(debugBmp, "Step 2.6 (4/4): Horizontal Scan Result", listOf(
-                    "Band Height Used: $bandHeight px",
-                    "Center Text Density: ${String.format("%.1f", hCenterDensity)}",
-                    "Cutoff Threshold (15%): ${String.format("%.1f", hThreshold)}",
+                    "Center Text Peak Density: ${String.format("%.1f", hCenterDensity)}",
                     "Detected Text Block Width: ${String.format("%.1f", textWidth)} px",
-                    "Input Line Length: ${String.format("%.1f", lineLen)} px",
                     "Status: $statusText"
                 ))
-                it.pauseAndShowStep("2.6단계 (4/4): 가로 방향 동적 스캔 결과", hudBmp)
+                it.pauseAndShowStep("2.6단계 (4/4): 가로 스캔 (빈 공간 함정 해결됨)", hudBmp)
                 debugMat.release(); debugBmp.recycle()
             }
 
@@ -318,13 +309,10 @@ object PlateDetectionEngine {
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
             
-            // 📊 HUD 추가
             val hudBmp = addDebugHUD(debugBmp, "Step 3: Final Tight ROI Generation", listOf(
-                "Final ROI Width: ${safeTightRect.width} px",
-                "Final ROI Height: ${safeTightRect.height} px",
-                "Aspect Ratio: ${String.format("%.2f", safeTightRect.width.toDouble() / safeTightRect.height)}"
+                "Final ROI Size: ${safeTightRect.width} x ${safeTightRect.height} px"
             ))
-            it.pauseAndShowStep("3단계: 상하/좌우가 모두 조율된 최종 타이트 ROI", hudBmp)
+            it.pauseAndShowStep("3단계: 최종 타이트 ROI", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
 
