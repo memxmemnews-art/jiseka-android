@@ -141,6 +141,9 @@ object PlateDetectionEngine {
         val cx = (p1x + p2x) / 2.0
         val cy = (p1y + p2y) / 2.0
 
+        // =====================================================================
+        // [1단계] 넉넉한 정사각형 임시 ROI 확보 
+        // =====================================================================
         val looseSize = lineLen * 2.0 
         val looseLeft = (cx - looseSize / 2.0).toInt().coerceIn(0, fullMat.cols() - 1)
         val looseTop = (cy - looseSize / 2.0).toInt().coerceIn(0, fullMat.rows() - 1)
@@ -156,6 +159,9 @@ object PlateDetectionEngine {
         val roiCx = cx - looseLeft
         val roiCy = cy - looseTop
 
+        // =====================================================================
+        // [2단계] 수평 정렬 후 실제 선분 좌표 기반 타이트 박스 생성
+        // =====================================================================
         val angle = Math.toDegrees(Math.atan2(dy, dx))
         val rotMat = Imgproc.getRotationMatrix2D(Point(roiCx, roiCy), angle, 1.0)
 
@@ -178,7 +184,7 @@ object PlateDetectionEngine {
         val maxX = max(rotP1.x, rotP2.x)
         val rotLineLen = maxX - minX
 
-        val marginX = rotLineLen * 0.25
+        val marginX = rotLineLen * 0.10
         var tightLeft = (minX - marginX).toInt()
         var tightRight = (maxX + marginX).toInt()
         val tightWidth = tightRight - tightLeft
@@ -236,9 +242,12 @@ object PlateDetectionEngine {
             debugMat.release(); debugBmp.recycle(); invRotMat.release(); srcPts.release(); dstPts.release()
         }
 
+        // =====================================================================
+        // [3단계] OpenCV 윤곽선 탐지 (가우시안, 이진화, 모폴로지)
+        // =====================================================================
         val thresh = Mat()
-        val kernelX = max(15.0, tightRect.width * 0.12) 
-        val kernelY = max(5.0, tightRect.height * 0.10)
+        val kernelX = max(12.0, tightRect.width * 0.06) 
+        val kernelY = max(3.0, tightRect.height * 0.05)
         val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(kernelX, kernelY))
         
         val contours = ArrayList<MatOfPoint>()
@@ -246,9 +255,6 @@ object PlateDetectionEngine {
         var resultPoints: List<ImmutablePoint>? = null
 
         try {
-            // ---------------------------------------------------------
-            // 🛠️ 복구된 디버그 3-1: 가우시안 블러
-            // ---------------------------------------------------------
             Imgproc.GaussianBlur(tightGray, thresh, Size(5.0, 5.0), 0.0)
             debugListener?.let {
                 val debugBmp = Bitmap.createBitmap(thresh.cols(), thresh.rows(), Bitmap.Config.ARGB_8888)
@@ -263,9 +269,6 @@ object PlateDetectionEngine {
                 tempRgb.release(); debugBmp.recycle()
             }
 
-            // ---------------------------------------------------------
-            // 🛠️ 복구된 디버그 3-2: 적응형 이진화
-            // ---------------------------------------------------------
             Imgproc.adaptiveThreshold(thresh, thresh, 255.0, Imgproc.ADAPTIVE_THRESH_MEAN_C, Imgproc.THRESH_BINARY_INV, 15, 10.0)
             debugListener?.let {
                 val debugBmp = Bitmap.createBitmap(thresh.cols(), thresh.rows(), Bitmap.Config.ARGB_8888)
@@ -280,37 +283,83 @@ object PlateDetectionEngine {
                 tempRgb.release(); debugBmp.recycle()
             }
 
-            // ---------------------------------------------------------
-            // 🛠️ 복구된 디버그 3-3: 모폴로지 닫기
-            // ---------------------------------------------------------
             Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, kernel)
             debugListener?.let {
                 val debugBmp = Bitmap.createBitmap(thresh.cols(), thresh.rows(), Bitmap.Config.ARGB_8888)
                 val tempRgb = Mat()
                 Imgproc.cvtColor(thresh, tempRgb, Imgproc.COLOR_GRAY2RGBA)
                 Utils.matToBitmap(tempRgb, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "Step 3-3: Morphology Close (Dynamic)", listOf(
+                val hudBmp = addDebugHUD(debugBmp, "Step 3-3: Morphology Close (Reduced)", listOf(
                     "Kernel Size: ${kernelX.toInt()} x ${kernelY.toInt()}",
-                    "Status: Text blocks fully merged!"
+                    "Status: Bleeding into bumper prevented"
                 ), screenRatio)
-                it.pauseAndShowStep("3-3단계: 다이내믹 모폴로지 닫기", hudBmp)
+                it.pauseAndShowStep("3-3단계: 커널 축소 모폴로지 닫기", hudBmp)
                 tempRgb.release(); debugBmp.recycle()
             }
 
             Imgproc.findContours(thresh, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
-            var maxArea = -1.0
+            // =====================================================================
+            // 🚀 [4단계] 기하학적 스코어링 (시각적 필터링 디버깅 추가)
+            // =====================================================================
+            var bestScore = -1.0
             var bestContour: MatOfPoint? = null
+            var bestRatio = 0.0
+            var bestRectangularity = 0.0
+            
+            val rejectedRects = mutableListOf<Array<Point>>()
+            var evaluatedCount = 0
+
             for (contour in contours) {
                 val area = Imgproc.contourArea(contour)
-                if (area > maxArea) {
-                    maxArea = area
+                if (area < 500) continue 
+
+                evaluatedCount++
+
+                val contour2f = MatOfPoint2f(*contour.toArray())
+                val rect = Imgproc.minAreaRect(contour2f)
+
+                val w = rect.size.width
+                val h = rect.size.height
+                val ratio = max(w, h) / max(min(w, h), 1.0)
+                val rectArea = w * h
+                val rectangularity = area / max(rectArea, 1.0)
+
+                contour2f.release()
+
+                val pts = arrayOf(Point(), Point(), Point(), Point())
+                rect.points(pts)
+
+                // 조건 미달: 빨간 박스행
+                if (ratio !in 2.5..6.5 || rectangularity < 0.60) {
+                    rejectedRects.add(pts)
+                    continue
+                }
+
+                val score = area * 0.5 + rectangularity * 10000
+
+                if (score > bestScore) {
+                    // 기존 1등도 밀려났으므로 빨간 박스행
+                    if (bestContour != null) {
+                        val prevContour2f = MatOfPoint2f(*bestContour.toArray())
+                        val prevRect = Imgproc.minAreaRect(prevContour2f)
+                        val prevPts = arrayOf(Point(), Point(), Point(), Point())
+                        prevRect.points(prevPts)
+                        rejectedRects.add(prevPts)
+                        prevContour2f.release()
+                    }
+                    bestScore = score
                     bestContour = contour
+                    bestRatio = ratio
+                    bestRectangularity = rectangularity
+                } else {
+                    // 조건은 통과했으나 점수가 낮아 탈락
+                    rejectedRects.add(pts)
                 }
             }
 
             val rawPoints = arrayOf(Point(), Point(), Point(), Point())
-            if (bestContour != null && maxArea > tightRect.width * tightRect.height * 0.1) { 
+            if (bestContour != null) { 
                 val contour2f = MatOfPoint2f(*bestContour.toArray())
                 val minRect = Imgproc.minAreaRect(contour2f)
                 minRect.points(rawPoints)
@@ -322,26 +371,39 @@ object PlateDetectionEngine {
                 rawPoints[3] = Point(tightGray.cols().toDouble(), tightGray.rows().toDouble())
             }
 
-            // ---------------------------------------------------------
-            // 🛠️ 복구된 디버그 4: 최종 사각형 추출 확인
-            // ---------------------------------------------------------
+            // 🚀 [디버깅] 빨간색(탈락) vs 초록색(합격) 시각화
             debugListener?.let {
                 val debugMat = tightMat.clone()
-                val color = Scalar(0.0, 255.0, 0.0, 255.0)
-                for (i in 0..3) {
-                    Imgproc.line(debugMat, rawPoints[i], rawPoints[(i + 1) % 4], color, 4)
+                val colorRed = Scalar(255.0, 0.0, 0.0, 255.0)
+                val colorGreen = Scalar(0.0, 255.0, 0.0, 255.0)
+                
+                // 탈락한 덩어리들을 빨간색으로 그림
+                for (pts in rejectedRects) {
+                    for (i in 0..3) {
+                        Imgproc.line(debugMat, pts[i], pts[(i + 1) % 4], colorRed, 2)
+                    }
                 }
+                
+                // 최종 합격한 덩어리만 굵은 초록색으로 그림
+                for (i in 0..3) {
+                    Imgproc.line(debugMat, rawPoints[i], rawPoints[(i + 1) % 4], colorGreen, 6)
+                }
+
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "Step 4: Final MinAreaRect", listOf(
-                    "Detected Plate Area: ${String.format("%.1f", maxArea)} px",
-                    "Status: Raw extraction before ordering & expanding"
+                val hudBmp = addDebugHUD(debugBmp, "Step 4: Smart Scoring & Filtering", listOf(
+                    "Evaluated Contours: $evaluatedCount",
+                    "Winner Ratio: ${String.format("%.2f", bestRatio)} (Valid: 2.5~6.5)",
+                    "Winner Rectangularity: ${String.format("%.2f", bestRectangularity)} (Valid: >0.60)",
+                    "Status: Red=Rejected, Green=Selected!"
                 ), screenRatio)
-                it.pauseAndShowStep("4단계: 최종 번호판 사각형 추출", hudBmp)
+                it.pauseAndShowStep("4단계: 필터링 시각화 (Red vs Green)", hudBmp)
                 debugMat.release(); debugBmp.recycle()
             }
 
-            // [해결책 적용 1순위] 꼭짓점 TL, TR, BR, BL 순서 강제 정렬
+            // =====================================================================
+            // 🚀 [5단계] 정렬 및 미세 확장, 안전장치(Fallback) 적용
+            // =====================================================================
             val sum = rawPoints.map { it.x + it.y }
             val diff = rawPoints.map { it.x - it.y }
             val tl = rawPoints[sum.indexOf(sum.minOrNull()!!)]
@@ -350,11 +412,10 @@ object PlateDetectionEngine {
             val bl = rawPoints[diff.indexOf(diff.minOrNull()!!)]
             val orderedPoints = arrayOf(tl, tr, br, bl)
 
-            // [해결책 적용 2순위] 번호판 크기에 맞게 중심 기준 15%~35% 확장
             val rectCx = orderedPoints.map { it.x }.average()
             val rectCy = orderedPoints.map { it.y }.average()
-            val scaleX = 1.15
-            val scaleY = 1.35 
+            val scaleX = 1.03
+            val scaleY = 1.05 
             val expandedPoints = Array(4) { Point() }
             for (i in 0..3) {
                 val pt = orderedPoints[i]
@@ -375,37 +436,59 @@ object PlateDetectionEngine {
 
             val finalPts = dstMat.toArray().map { Point(it.x + looseRect.x, it.y + looseRect.y) }
 
+            val finalWidth = hypot(finalPts[1].x - finalPts[0].x, finalPts[1].y - finalPts[0].y)
+            val finalHeight = max(hypot(finalPts[3].x - finalPts[0].x, finalPts[3].y - finalPts[0].y), 1.0)
+            val finalRatio = finalWidth / finalHeight
+
+            var safeResultPts = finalPts
+            if (finalRatio < 2.0 || finalRatio > 7.0) {
+                val fallbackPts = arrayOf(
+                    Point(tightLeft.toDouble(), tightTop.toDouble()),
+                    Point(tightRight.toDouble(), tightTop.toDouble()),
+                    Point(tightRight.toDouble(), tightBottom.toDouble()),
+                    Point(tightLeft.toDouble(), tightBottom.toDouble())
+                )
+                val fallbackSrc = MatOfPoint2f(*fallbackPts)
+                val fallbackDst = MatOfPoint2f()
+                Core.transform(fallbackSrc, fallbackDst, invRotMat)
+                safeResultPts = fallbackDst.toArray().map { Point(it.x + looseRect.x, it.y + looseRect.y) }
+                fallbackSrc.release(); fallbackDst.release()
+            }
+
+            // 🚀 최종 마스킹 준비 상태 디버그 확인
             debugListener?.let {
                 val debugMat = fullMat.clone()
                 
                 val colors = arrayOf(
-                    Scalar(255.0, 0.0, 0.0, 255.0),   // TL: Red
-                    Scalar(0.0, 255.0, 0.0, 255.0),   // TR: Green
-                    Scalar(0.0, 0.0, 255.0, 255.0),   // BR: Blue
-                    Scalar(255.0, 255.0, 0.0, 255.0)  // BL: Yellow
+                    Scalar(255.0, 0.0, 0.0, 255.0),   // TL
+                    Scalar(0.0, 255.0, 0.0, 255.0),   // TR
+                    Scalar(0.0, 0.0, 255.0, 255.0),   // BR
+                    Scalar(255.0, 255.0, 0.0, 255.0)  // BL
                 )
                 val labels = arrayOf("TL", "TR", "BR", "BL")
 
                 for (i in 0..3) {
-                    Imgproc.line(debugMat, finalPts[i], finalPts[(i + 1) % 4], Scalar(255.0, 255.0, 255.0, 255.0), 4)
-                    Imgproc.circle(debugMat, finalPts[i], 15, colors[i], -1)
-                    Imgproc.putText(debugMat, labels[i], Point(finalPts[i].x - 20, finalPts[i].y - 20), Imgproc.FONT_HERSHEY_SIMPLEX, 2.0, colors[i], 4)
+                    Imgproc.line(debugMat, safeResultPts[i], safeResultPts[(i + 1) % 4], Scalar(255.0, 255.0, 255.0, 255.0), 4)
+                    Imgproc.circle(debugMat, safeResultPts[i], 15, colors[i], -1)
+                    Imgproc.putText(debugMat, labels[i], Point(safeResultPts[i].x - 20, safeResultPts[i].y - 20), Imgproc.FONT_HERSHEY_SIMPLEX, 2.0, colors[i], 4)
                 }
 
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
 
-                val hudBmp = addDebugHUD(debugBmp, "Step 5: Ordered & Expanded", listOf(
-                    "Order: TL(Red) -> TR(Grn) -> BR(Blu) -> BL(Yel)",
-                    "Expansion: Width +15%, Height +35%",
-                    "Status: Twisted warp fixed, Plate fully covered!"
+                val statusLog = if (finalRatio < 2.0 || finalRatio > 7.0) "FALLBACK: Invalid ratio ($finalRatio)" else "SUCCESS: Valid ratio secured"
+
+                val hudBmp = addDebugHUD(debugBmp, "Step 5: Final Evaluation & Output", listOf(
+                    "Order: TL -> TR -> BR -> BL",
+                    "Final Aspect Ratio: ${String.format("%.1f", finalRatio)}",
+                    statusLog
                 ), screenRatio)
                 
-                it.pauseAndShowStep("5단계: 점 순서 정렬 및 영역 확장", hudBmp)
+                it.pauseAndShowStep("5단계: 최종 비율 평가 및 마스킹 준비", hudBmp)
                 debugMat.release(); debugBmp.recycle()
             }
 
-            resultPoints = finalPts.map { ImmutablePoint(it.x.toFloat(), it.y.toFloat()) }
+            resultPoints = safeResultPts.map { ImmutablePoint(it.x.toFloat(), it.y.toFloat()) }
 
             invRotMat.release(); srcMat.release(); dstMat.release()
 
