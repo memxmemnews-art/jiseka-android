@@ -246,16 +246,19 @@ object PlateDetectionEngine {
         // [3단계] OpenCV 윤곽선 탐지 (가우시안, 이진화, 모폴로지)
         // =====================================================================
         val thresh = Mat()
-        val kernelX = max(12.0, tightRect.width * 0.06) 
-        val kernelY = max(3.0, tightRect.height * 0.05)
-        val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(kernelX, kernelY))
+        
+        // 커널 고정값으로 변경 (제안 사항 반영)
+        val openKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 3.0))
+        val closeKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(18.0, 5.0))
         
         val contours = ArrayList<MatOfPoint>()
         val hierarchy = Mat()
         var resultPoints: List<ImmutablePoint>? = null
 
         try {
+            // 3-1: 가우시안 블러
             Imgproc.GaussianBlur(tightGray, thresh, Size(5.0, 5.0), 0.0)
+            
             debugListener?.let {
                 val debugBmp = Bitmap.createBitmap(thresh.cols(), thresh.rows(), Bitmap.Config.ARGB_8888)
                 val tempRgb = Mat()
@@ -269,42 +272,42 @@ object PlateDetectionEngine {
                 tempRgb.release(); debugBmp.recycle()
             }
 
-            Imgproc.adaptiveThreshold(thresh, thresh, 255.0, Imgproc.ADAPTIVE_THRESH_MEAN_C, Imgproc.THRESH_BINARY_INV, 15, 10.0)
+            // 3-2: 적응형 이진화 (Gaussian_C, blockSize 31, C 7.0 적용)
+            Imgproc.adaptiveThreshold(
+                thresh, thresh, 255.0, 
+                Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                Imgproc.THRESH_BINARY_INV, 31, 7.0
+            )
+            
             debugListener?.let {
                 val debugBmp = Bitmap.createBitmap(thresh.cols(), thresh.rows(), Bitmap.Config.ARGB_8888)
                 val tempRgb = Mat()
                 Imgproc.cvtColor(thresh, tempRgb, Imgproc.COLOR_GRAY2RGBA)
                 Utils.matToBitmap(tempRgb, debugBmp)
                 val hudBmp = addDebugHUD(debugBmp, "Step 3-2: Adaptive Threshold", listOf(
-                    "Block Size: 15, C: 10.0",
-                    "Status: Foreground extracted"
+                    "Method: Gaussian_C, Block Size: 31, C: 7.0",
+                    "Status: Bumper reflections reduced"
                 ), screenRatio)
-                it.pauseAndShowStep("3-2단계: 적응형 이진화", hudBmp)
+                it.pauseAndShowStep("3-2단계: 적응형 이진화 (Gaussian)", hudBmp)
                 tempRgb.release(); debugBmp.recycle()
             }
 
-            Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, kernel)
+            // 3-3: 모폴로지 OPEN (노이즈 제거) -> CLOSE (문자 연결)
+            Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_OPEN, openKernel)
+            Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, closeKernel)
+            
             debugListener?.let {
                 val debugBmp = Bitmap.createBitmap(thresh.cols(), thresh.rows(), Bitmap.Config.ARGB_8888)
                 val tempRgb = Mat()
                 Imgproc.cvtColor(thresh, tempRgb, Imgproc.COLOR_GRAY2RGBA)
                 Utils.matToBitmap(tempRgb, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "Step 3-3: Morphology Close (Reduced)", listOf(
-                    "Kernel Size: ${kernelX.toInt()} x ${kernelY.toInt()}",
-                    "Status: Bleeding into bumper prevented"
+                val hudBmp = addDebugHUD(debugBmp, "Step 3-3: Morphology Open + Close", listOf(
+                    "Open Kernel: 5x3, Close Kernel: 18x5",
+                    "Status: Clean blobs without over-merging"
                 ), screenRatio)
-                it.pauseAndShowStep("3-3단계: 커널 축소 모폴로지 닫기", hudBmp)
+                it.pauseAndShowStep("3-3단계: 모폴로지 최적화", hudBmp)
                 tempRgb.release(); debugBmp.recycle()
             }
-
-            // 🚀 [추가된 부분] 가장자리 테두리를 검은색으로 칠해 거대한 바운딩 박스 생성 방지 (Border Clearing)
-            Imgproc.rectangle(
-                thresh, 
-                Point(0.0, 0.0), 
-                Point(thresh.cols().toDouble() - 1, thresh.rows().toDouble() - 1), 
-                Scalar(0.0), 
-                10 // 테두리 두께 10px 마스킹
-            )
 
             Imgproc.findContours(thresh, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
@@ -318,25 +321,14 @@ object PlateDetectionEngine {
             
             val rejectedRects = mutableListOf<Array<Point>>()
             var evaluatedCount = 0
-
-            // 🚀 [추가된 부분] ROI 전체 캔버스의 면적 계산 (이 면적의 85%를 넘으면 테두리 노이즈로 간주)
-            val imageTotalArea = tightGray.cols() * tightGray.rows().toDouble()
+            
+            // 중앙 좌표 계산 (Scoring용)
+            val centerX = tightGray.cols() / 2.0
+            val centerY = tightGray.rows() / 2.0
 
             for (contour in contours) {
                 val area = Imgproc.contourArea(contour)
                 if (area < 500) continue 
-
-                // 🚀 [추가된 부분] 거대한 윤곽선 탈락 로직 (Area Limit Filtering)
-                // 만약 윤곽선 면적이 이미지 전체 면적의 85%를 넘어간다면, 이는 화면 테두리를 둘러싼 노이즈이므로 즉시 거부(빨간 박스) 처리합니다.
-                if (area > imageTotalArea * 0.85) {
-                    val contour2f = MatOfPoint2f(*contour.toArray())
-                    val rect = Imgproc.minAreaRect(contour2f)
-                    val pts = arrayOf(Point(), Point(), Point(), Point(), Point())
-                    rect.points(pts)
-                    rejectedRects.add(pts)
-                    contour2f.release()
-                    continue
-                }
 
                 evaluatedCount++
 
@@ -354,16 +346,20 @@ object PlateDetectionEngine {
                 val pts = arrayOf(Point(), Point(), Point(), Point())
                 rect.points(pts)
 
-                // 조건 미달: 빨간 박스행
-                if (ratio !in 2.5..6.5 || rectangularity < 0.60) {
+                // 🚨 한국 번호판 규격에 맞게 1.8부터 허용하도록 수정
+                if (ratio !in 1.8..7.0 || rectangularity < 0.60) {
                     rejectedRects.add(pts)
                     continue
                 }
 
-                val score = area * 0.5 + rectangularity * 10000
+                // 중앙 중심화 스코어 추가
+                val dist = hypot(rect.center.x - centerX, rect.center.y - centerY)
+                val centerScore = 1000.0 - dist
+                
+                // 가중치 재조정 스코어
+                val score = (area * 0.3) + (rectangularity * 7000.0) + (centerScore * 3.0)
 
                 if (score > bestScore) {
-                    // 기존 1등도 밀려났으므로 빨간 박스행
                     if (bestContour != null) {
                         val prevContour2f = MatOfPoint2f(*bestContour.toArray())
                         val prevRect = Imgproc.minAreaRect(prevContour2f)
@@ -377,38 +373,42 @@ object PlateDetectionEngine {
                     bestRatio = ratio
                     bestRectangularity = rectangularity
                 } else {
-                    // 조건은 통과했으나 점수가 낮아 탈락
                     rejectedRects.add(pts)
                 }
             }
 
-            val rawPoints = arrayOf(Point(), Point(), Point(), Point())
-            if (bestContour != null) { 
-                val contour2f = MatOfPoint2f(*bestContour.toArray())
-                val minRect = Imgproc.minAreaRect(contour2f)
-                minRect.points(rawPoints)
-                contour2f.release()
-            } else {
-                rawPoints[0] = Point(0.0, tightGray.rows().toDouble())
-                rawPoints[1] = Point(0.0, 0.0)
-                rawPoints[2] = Point(tightGray.cols().toDouble(), 0.0)
-                rawPoints[3] = Point(tightGray.cols().toDouble(), tightGray.rows().toDouble())
+            // 🚨 버그 수정: ROI Fallback 로직 완전 제거. 윤곽선이 없으면 즉시 null 반환.
+            if (bestContour == null) {
+                debugListener?.let {
+                    val debugMat = tightMat.clone()
+                    val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+                    Utils.matToBitmap(debugMat, debugBmp)
+                    val hudBmp = addDebugHUD(debugBmp, "Step 4: Smart Scoring FAILED", listOf(
+                        "Evaluated Contours: $evaluatedCount",
+                        "Status: No valid plate detected (Null Returned)"
+                    ), screenRatio)
+                    it.pauseAndShowStep("4단계: 유효 윤곽선 없음 (탐지 실패)", hudBmp)
+                    debugMat.release(); debugBmp.recycle()
+                }
+                return null
             }
 
-            // 🚀 [디버깅] 빨간색(탈락) vs 초록색(합격) 시각화
+            val rawPoints = arrayOf(Point(), Point(), Point(), Point())
+            val finalContour2f = MatOfPoint2f(*bestContour.toArray())
+            val minRect = Imgproc.minAreaRect(finalContour2f)
+            minRect.points(rawPoints)
+            finalContour2f.release()
+
             debugListener?.let {
                 val debugMat = tightMat.clone()
                 val colorRed = Scalar(255.0, 0.0, 0.0, 255.0)
                 val colorGreen = Scalar(0.0, 255.0, 0.0, 255.0)
                 
-                // 탈락한 덩어리들을 빨간색으로 그림
                 for (pts in rejectedRects) {
                     for (i in 0..3) {
                         Imgproc.line(debugMat, pts[i], pts[(i + 1) % 4], colorRed, 2)
                     }
                 }
-                
-                // 최종 합격한 덩어리만 굵은 초록색으로 그림
                 for (i in 0..3) {
                     Imgproc.line(debugMat, rawPoints[i], rawPoints[(i + 1) % 4], colorGreen, 6)
                 }
@@ -417,7 +417,7 @@ object PlateDetectionEngine {
                 Utils.matToBitmap(debugMat, debugBmp)
                 val hudBmp = addDebugHUD(debugBmp, "Step 4: Smart Scoring & Filtering", listOf(
                     "Evaluated Contours: $evaluatedCount",
-                    "Winner Ratio: ${String.format("%.2f", bestRatio)} (Valid: 2.5~6.5)",
+                    "Winner Ratio: ${String.format("%.2f", bestRatio)} (Valid: 1.8~7.0)",
                     "Winner Rectangularity: ${String.format("%.2f", bestRectangularity)} (Valid: >0.60)",
                     "Status: Red=Rejected, Green=Selected!"
                 ), screenRatio)
@@ -465,7 +465,8 @@ object PlateDetectionEngine {
             val finalRatio = finalWidth / finalHeight
 
             var safeResultPts = finalPts
-            if (finalRatio < 2.0 || finalRatio > 7.0) {
+            // 마지막 Fallback 기준도 한국 번호판 규격에 맞춰 1.8 로 수정
+            if (finalRatio < 1.8 || finalRatio > 7.0) {
                 val fallbackPts = arrayOf(
                     Point(tightLeft.toDouble(), tightTop.toDouble()),
                     Point(tightRight.toDouble(), tightTop.toDouble()),
@@ -500,7 +501,7 @@ object PlateDetectionEngine {
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
 
-                val statusLog = if (finalRatio < 2.0 || finalRatio > 7.0) "FALLBACK: Invalid ratio ($finalRatio)" else "SUCCESS: Valid ratio secured"
+                val statusLog = if (finalRatio < 1.8 || finalRatio > 7.0) "FALLBACK: Invalid ratio ($finalRatio)" else "SUCCESS: Valid ratio secured"
 
                 val hudBmp = addDebugHUD(debugBmp, "Step 5: Final Evaluation & Output", listOf(
                     "Order: TL -> TR -> BR -> BL",
@@ -519,7 +520,7 @@ object PlateDetectionEngine {
         } catch (e: Exception) {
             e.printStackTrace()
         } finally {
-            thresh.release(); kernel.release()
+            thresh.release(); openKernel.release(); closeKernel.release()
             contours.forEach { it.release() }; hierarchy.release()
             
             rotMat.release()
