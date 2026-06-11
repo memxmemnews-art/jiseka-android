@@ -16,47 +16,46 @@ object PlateDetectionEngine {
         fun pauseAndShowStep(stageName: String, bitmap: Bitmap)
     }
 
+    // 🛠️ 사진은 화면 너비(1080px)에 맞춰 시원하게 확대하되, 텍스트는 45px로 깔끔하게 고정하는 HUD
     private fun addDebugHUD(original: Bitmap, title: String, logs: List<String>): Bitmap {
+        val targetWidth = 1080f
+        val scaleFactor = targetWidth / original.width.toFloat()
+        
+        val scaledImgWidth = targetWidth.toInt()
+        val scaledImgHeight = (original.height * scaleFactor).toInt()
+        val scaledImg = Bitmap.createScaledBitmap(original, scaledImgWidth, max(1, scaledImgHeight), true)
+
         val paint = Paint().apply {
             color = Color.WHITE
-            textSize = 50f
+            textSize = 45f 
             isAntiAlias = true
             setShadowLayer(5f, 0f, 0f, Color.BLACK)
         }
-        val bgPaint = Paint().apply { color = Color.parseColor("#CC000000") }
+        val bgPaint = Paint().apply { color = Color.parseColor("#E6000000") }
 
         val padding = 30f
         val lineHeight = 60f
-        val hudHeight = padding + lineHeight + (logs.size * lineHeight) + padding
+        val hudHeight = (padding + lineHeight + (logs.size * lineHeight) + padding).toInt()
 
-        var maxTextWidth = paint.measureText(title)
-        for (log in logs) {
-            val logWidth = paint.measureText(log)
-            if (logWidth > maxTextWidth) maxTextWidth = logWidth
-        }
-
-        val requiredWidth = max(original.width.toFloat(), maxTextWidth + padding * 2).toInt()
-        val requiredHeight = (original.height + hudHeight).toInt()
-
-        val combinedBmp = Bitmap.createBitmap(requiredWidth, requiredHeight, Bitmap.Config.ARGB_8888)
+        val combinedBmp = Bitmap.createBitmap(scaledImgWidth, hudHeight + scaledImgHeight, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(combinedBmp)
         
-        canvas.drawRect(0f, 0f, requiredWidth.toFloat(), hudHeight, bgPaint)
+        canvas.drawRect(0f, 0f, scaledImgWidth.toFloat(), hudHeight.toFloat(), bgPaint)
 
         paint.color = Color.YELLOW
         paint.isFakeBoldText = true
-        canvas.drawText(title, padding, padding + 40f, paint)
+        canvas.drawText(title, padding, padding + 45f, paint)
 
         paint.color = Color.WHITE
         paint.isFakeBoldText = false
-        var currentY = padding + lineHeight + 40f
+        var currentY = padding + lineHeight + 45f
         for (log in logs) {
             canvas.drawText(log, padding, currentY, paint)
             currentY += lineHeight
         }
 
-        val imageOffsetX = if (original.width < requiredWidth) (requiredWidth - original.width) / 2f else 0f
-        canvas.drawBitmap(original, imageOffsetX, hudHeight, null)
+        canvas.drawBitmap(scaledImg, 0f, hudHeight.toFloat(), null)
+        scaledImg.recycle()
 
         return combinedBmp
     }
@@ -135,7 +134,7 @@ object PlateDetectionEngine {
         Imgproc.warpAffine(paddedGray, rotatedPaddedGray, rotMat, paddedGray.size(), Imgproc.INTER_LINEAR)
 
         // =====================================================================
-        // 🚀 [3단계] OpenCV 내장 윤곽선(Contour) 탐지 알고리즘 적용
+        // 🚀 [3단계] OpenCV 내장 윤곽선(Contour) 탐지 알고리즘 (세부 디버깅 포함)
         // =====================================================================
         val thresh = Mat()
         val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(25.0, 7.0))
@@ -199,7 +198,7 @@ object PlateDetectionEngine {
             }
 
             // ---------------------------------------------------------
-            // 3-4. 윤곽선 탐지 및 최종 사각형 도출
+            // 3-4. 윤곽선 탐지 및 최종 사각형(minAreaRect) 도출
             // ---------------------------------------------------------
             Imgproc.findContours(thresh, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
@@ -213,7 +212,8 @@ object PlateDetectionEngine {
                 }
             }
 
-            val rectPoints = arrayOfNulls<Point>(4)
+            // 널(Null) 안전성을 위해 배열 초기화를 명시적으로 처리
+            val rectPoints = arrayOf(Point(), Point(), Point(), Point())
             if (bestContour != null && maxArea > 1000.0) { 
                 val contour2f = MatOfPoint2f(*bestContour.toArray())
                 val minRect = Imgproc.minAreaRect(contour2f)
@@ -230,7 +230,7 @@ object PlateDetectionEngine {
                 val debugMat = rotatedPaddedMat.clone()
                 val color = Scalar(0.0, 255.0, 0.0, 255.0)
                 for (i in 0..3) {
-                    Imgproc.line(debugMat, rectPoints[i]!!, rectPoints[(i + 1) % 4]!!, color, 4)
+                    Imgproc.line(debugMat, rectPoints[i], rectPoints[(i + 1) % 4], color, 4)
                 }
                 
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
@@ -251,7 +251,7 @@ object PlateDetectionEngine {
             val invRotMat = Mat()
             Imgproc.invertAffineTransform(rotMat, invRotMat)
 
-            val srcMat = MatOfPoint2f(*rectPoints.filterNotNull().toTypedArray())
+            val srcMat = MatOfPoint2f(*rectPoints)
             val dstMat = MatOfPoint2f()
 
             Core.transform(srcMat, dstMat, invRotMat)
