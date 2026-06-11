@@ -246,10 +246,57 @@ object PlateDetectionEngine {
         var resultPoints: List<ImmutablePoint>? = null
 
         try {
+            // ---------------------------------------------------------
+            // 🛠️ 복구된 디버그 3-1: 가우시안 블러
+            // ---------------------------------------------------------
             Imgproc.GaussianBlur(tightGray, thresh, Size(5.0, 5.0), 0.0)
+            debugListener?.let {
+                val debugBmp = Bitmap.createBitmap(thresh.cols(), thresh.rows(), Bitmap.Config.ARGB_8888)
+                val tempRgb = Mat()
+                Imgproc.cvtColor(thresh, tempRgb, Imgproc.COLOR_GRAY2RGBA)
+                Utils.matToBitmap(tempRgb, debugBmp)
+                val hudBmp = addDebugHUD(debugBmp, "Step 3-1: Gaussian Blur", listOf(
+                    "Kernel Size: 5x5",
+                    "Status: High-frequency noise reduced"
+                ), screenRatio)
+                it.pauseAndShowStep("3-1단계: 가우시안 블러", hudBmp)
+                tempRgb.release(); debugBmp.recycle()
+            }
+
+            // ---------------------------------------------------------
+            // 🛠️ 복구된 디버그 3-2: 적응형 이진화
+            // ---------------------------------------------------------
             Imgproc.adaptiveThreshold(thresh, thresh, 255.0, Imgproc.ADAPTIVE_THRESH_MEAN_C, Imgproc.THRESH_BINARY_INV, 15, 10.0)
+            debugListener?.let {
+                val debugBmp = Bitmap.createBitmap(thresh.cols(), thresh.rows(), Bitmap.Config.ARGB_8888)
+                val tempRgb = Mat()
+                Imgproc.cvtColor(thresh, tempRgb, Imgproc.COLOR_GRAY2RGBA)
+                Utils.matToBitmap(tempRgb, debugBmp)
+                val hudBmp = addDebugHUD(debugBmp, "Step 3-2: Adaptive Threshold", listOf(
+                    "Block Size: 15, C: 10.0",
+                    "Status: Foreground extracted"
+                ), screenRatio)
+                it.pauseAndShowStep("3-2단계: 적응형 이진화", hudBmp)
+                tempRgb.release(); debugBmp.recycle()
+            }
+
+            // ---------------------------------------------------------
+            // 🛠️ 복구된 디버그 3-3: 모폴로지 닫기
+            // ---------------------------------------------------------
             Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, kernel)
-            
+            debugListener?.let {
+                val debugBmp = Bitmap.createBitmap(thresh.cols(), thresh.rows(), Bitmap.Config.ARGB_8888)
+                val tempRgb = Mat()
+                Imgproc.cvtColor(thresh, tempRgb, Imgproc.COLOR_GRAY2RGBA)
+                Utils.matToBitmap(tempRgb, debugBmp)
+                val hudBmp = addDebugHUD(debugBmp, "Step 3-3: Morphology Close (Dynamic)", listOf(
+                    "Kernel Size: ${kernelX.toInt()} x ${kernelY.toInt()}",
+                    "Status: Text blocks fully merged!"
+                ), screenRatio)
+                it.pauseAndShowStep("3-3단계: 다이내믹 모폴로지 닫기", hudBmp)
+                tempRgb.release(); debugBmp.recycle()
+            }
+
             Imgproc.findContours(thresh, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
             var maxArea = -1.0
@@ -275,9 +322,26 @@ object PlateDetectionEngine {
                 rawPoints[3] = Point(tightGray.cols().toDouble(), tightGray.rows().toDouble())
             }
 
-            // =====================================================================
-            // 🚀 [해결책 적용 1순위] 꼭짓점 TL, TR, BR, BL 순서 강제 정렬
-            // =====================================================================
+            // ---------------------------------------------------------
+            // 🛠️ 복구된 디버그 4: 최종 사각형 추출 확인
+            // ---------------------------------------------------------
+            debugListener?.let {
+                val debugMat = tightMat.clone()
+                val color = Scalar(0.0, 255.0, 0.0, 255.0)
+                for (i in 0..3) {
+                    Imgproc.line(debugMat, rawPoints[i], rawPoints[(i + 1) % 4], color, 4)
+                }
+                val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+                Utils.matToBitmap(debugMat, debugBmp)
+                val hudBmp = addDebugHUD(debugBmp, "Step 4: Final MinAreaRect", listOf(
+                    "Detected Plate Area: ${String.format("%.1f", maxArea)} px",
+                    "Status: Raw extraction before ordering & expanding"
+                ), screenRatio)
+                it.pauseAndShowStep("4단계: 최종 번호판 사각형 추출", hudBmp)
+                debugMat.release(); debugBmp.recycle()
+            }
+
+            // [해결책 적용 1순위] 꼭짓점 TL, TR, BR, BL 순서 강제 정렬
             val sum = rawPoints.map { it.x + it.y }
             val diff = rawPoints.map { it.x - it.y }
             val tl = rawPoints[sum.indexOf(sum.minOrNull()!!)]
@@ -286,9 +350,7 @@ object PlateDetectionEngine {
             val bl = rawPoints[diff.indexOf(diff.minOrNull()!!)]
             val orderedPoints = arrayOf(tl, tr, br, bl)
 
-            // =====================================================================
-            // 🚀 [해결책 적용 2순위] 번호판 크기에 맞게 중심 기준 15%~35% 확장
-            // =====================================================================
+            // [해결책 적용 2순위] 번호판 크기에 맞게 중심 기준 15%~35% 확장
             val rectCx = orderedPoints.map { it.x }.average()
             val rectCy = orderedPoints.map { it.y }.average()
             val scaleX = 1.15
@@ -302,9 +364,6 @@ object PlateDetectionEngine {
                 )
             }
 
-            // =====================================================================
-            // 🚀 [4단계] 좌표 원복 (확장된 포인트를 원본 좌표계로 역연산)
-            // =====================================================================
             val invRotMat = Mat()
             Imgproc.invertAffineTransform(rotMat, invRotMat)
 
@@ -314,10 +373,8 @@ object PlateDetectionEngine {
 
             Core.transform(srcMat, dstMat, invRotMat)
 
-            // 원본 좌표계(fullMat)에서의 최종 4개 꼭짓점
             val finalPts = dstMat.toArray().map { Point(it.x + looseRect.x, it.y + looseRect.y) }
 
-            // 🚀 최종 합성 전 디버그 화면 (점 순서 및 확장 영역 확인용)
             debugListener?.let {
                 val debugMat = fullMat.clone()
                 
