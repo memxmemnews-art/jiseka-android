@@ -54,7 +54,6 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.hypot
 
 @OptIn(TransformExperimental::class)
 class MainActivity : AppCompatActivity() {
@@ -294,7 +293,7 @@ class MainActivity : AppCompatActivity() {
         
         debugLatch?.countDown() // 🛠️ 진행 중 취소 시 스레드 해방
         btnDebugNext?.visibility = View.GONE
-        
+      
         btnCapture?.isEnabled = true
         nativeBackgroundView?.setImageDrawable(null)
     
@@ -499,7 +498,7 @@ class MainActivity : AppCompatActivity() {
                                     if (!bmp.isRecycled) bmp.recycle() 
                                 }, 500)
                             }
-                  
+                            
                             progressBar?.visibility = View.GONE
                             resultActionLayout?.visibility = View.VISIBLE
                         }
@@ -527,202 +526,75 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun findVerticalIntersections(hull: List<Point>, targetX: Double): Pair<Double, Double>? {
-        val intersections = mutableListOf<Double>()
-        for (i in hull.indices) {
-            val p1 = hull[i]
-            val p2 = hull[(i + 1) % hull.size]
-
-            val minX = min(p1.x, p2.x)
-            val maxX = max(p1.x, p2.x)
-
-            if (targetX < minX - 1e-5 || targetX > maxX + 1e-5) continue
-
-            if (Math.abs(p2.x - p1.x) < 1e-6) {
-                intersections.add(p1.y)
-                intersections.add(p2.y)
-            } else {
-                val t = (targetX - p1.x) / (p2.x - p1.x)
-                intersections.add(p1.y + t * (p2.y - p1.y))
-            }
-        }
-
-        if (intersections.size < 2) return null
-
-        intersections.sort()
-        return Pair(intersections.first(), intersections.last())
-    }
-
-    private fun getPointAtArcLength(chain: List<Point>, targetRatio: Double): Point {
-        if (chain.size == 1) return chain.first()
-        if (targetRatio <= 0.0) return chain.first()
-        if (targetRatio >= 1.0) return chain.last()
-
-        val segmentLengths = mutableListOf<Double>()
-        var totalLength = 0.0
-        
-        for (i in 0 until chain.size - 1) {
-            val dist = hypot(chain[i+1].x - chain[i].x, chain[i+1].y - chain[i].y)
-            segmentLengths.add(dist)
-            totalLength += dist
-        }
-
-        val targetLength = totalLength * targetRatio
-        var accumulatedLength = 0.0
-
-        for (i in 0 until chain.size - 1) {
-            val segLen = segmentLengths[i]
-            if (accumulatedLength + segLen >= targetLength) {
-                val remaining = targetLength - accumulatedLength
-                val ratio = if (segLen > 0) remaining / segLen else 0.0
-                val p1 = chain[i]
-                val p2 = chain[i+1]
-                return Point(p1.x + ratio * (p2.x - p1.x), p1.y + ratio * (p2.y - p1.y))
-            }
-            accumulatedLength += segLen
-        }
-        return chain.last()
-    }
-
-    private fun splitHullIntoChains(hullPts: List<Point>): Pair<List<Point>, List<Point>> {
-        var leftIdx = 0
-        var rightIdx = 0
-        for (i in hullPts.indices) {
-            if (hullPts[i].x < hullPts[leftIdx].x) leftIdx = i
-            if (hullPts[i].x > hullPts[rightIdx].x) rightIdx = i
-        }
-
-        val n = hullPts.size
-        val chain1 = mutableListOf<Point>()
-        var curr = leftIdx
-        while (curr != rightIdx) {
-            chain1.add(hullPts[curr])
-            curr = (curr + 1) % n
-        }
-        chain1.add(hullPts[rightIdx])
-
-        val chain2 = mutableListOf<Point>()
-        curr = rightIdx
-        while (curr != leftIdx) {
-            chain2.add(hullPts[curr])
-            curr = (curr + 1) % n
-        }
-        chain2.add(hullPts[leftIdx])
-        
-        val chain1AvgY = chain1.map { it.y }.average()
-        val chain2AvgY = chain2.map { it.y }.average()
-
-        return if (chain1AvgY < chain2AvgY) {
-            val topChain = if (chain1.first().x < chain1.last().x) chain1 else chain1.reversed()
-            val bottomChain = if (chain2.first().x < chain2.last().x) chain2 else chain2.reversed()
-            Pair(topChain, bottomChain)
-        } else {
-            val topChain = if (chain2.first().x < chain2.last().x) chain2 else chain2.reversed()
-            val bottomChain = if (chain1.first().x < chain1.last().x) chain1 else chain1.reversed()
-            Pair(topChain, bottomChain)
-        }
-    }
-
+    // 🚀 [수정된 부분] 복잡했던 곡면 마스킹을 제거하고 4개의 점만 사용하는 단순 투시 변환으로 변경
     private fun applyMaskToMat(mat: Mat, corners: List<ImmutablePoint>, textureInput: Mat) {
-        if (corners.isEmpty()) return
+        if (corners.size != 4) return
 
-        var maskMat: Mat? = null; var contour: org.opencv.core.MatOfPoint? = null
-        var blurredMask: Mat? = null; var alphaMat: Mat? = null
-        var warpedTexture: Mat? = null
+        var maskMat: Mat? = null
+        var contour: org.opencv.core.MatOfPoint? = null
+        var blurredMask: Mat? = null
+        var alphaMat: Mat? = null
         var preparedTexture: Mat? = null
-        
-        var stripWarped: Mat? = null
-        var stripMask: Mat? = null
-        val scalarZero = Scalar(0.0)
-        val scalar255 = Scalar(255.0)
-        
-        val matChannels = ArrayList<Mat>()
-        val textureChannels = ArrayList<Mat>()
+        var warpedTexture: Mat? = null
 
         var originalWasRgba = false
         if (mat.channels() == 4) {
             originalWasRgba = true
             Imgproc.cvtColor(mat, mat, Imgproc.COLOR_RGBA2RGB)
         }
-        
+
         try {
+            // 엔진에서 넘어온 꼭짓점 4개 좌표 변환
             val pts = corners.map { Point(it.x.toDouble(), it.y.toDouble()) }
-            
+
+            // 1. 부드러운 경계를 위한 알파 마스크 (Feathering) 생성
             maskMat = Mat.zeros(mat.size(), CvType.CV_8UC1)
             contour = org.opencv.core.MatOfPoint(*pts.toTypedArray())
             Imgproc.fillPoly(maskMat, listOf(contour), Scalar(255.0))
-            
+
             blurredMask = Mat()
             Imgproc.GaussianBlur(maskMat, blurredMask, Size(15.0, 15.0), 5.0)
-            
+
             alphaMat = Mat()
             blurredMask.convertTo(alphaMat, CvType.CV_32F, 1.0 / 255.0)
 
+            // 2. 입력 텍스처와 원본 이미지 채널 맞추기
             preparedTexture = Mat()
             if (textureInput.channels() != mat.channels()) {
-                if (mat.channels() == 3 && textureInput.channels() == 4) Imgproc.cvtColor(textureInput, preparedTexture, Imgproc.COLOR_RGBA2RGB)
-                else textureInput.copyTo(preparedTexture)
+                if (mat.channels() == 3 && textureInput.channels() == 4) {
+                    Imgproc.cvtColor(textureInput, preparedTexture, Imgproc.COLOR_RGBA2RGB)
+                } else {
+                    textureInput.copyTo(preparedTexture)
+                }
             } else {
                 textureInput.copyTo(preparedTexture)
             }
 
-            warpedTexture = Mat.zeros(mat.size(), mat.type()) 
+            // 3. 단순 4점 투시 변환 (Perspective Transform)
+            warpedTexture = Mat.zeros(mat.size(), mat.type())
+            val srcPts = MatOfPoint2f(
+                Point(0.0, 0.0),
+                Point(preparedTexture.cols().toDouble(), 0.0),
+                Point(preparedTexture.cols().toDouble(), preparedTexture.rows().toDouble()),
+                Point(0.0, preparedTexture.rows().toDouble())
+            )
             
-            if (pts.size < 4) {
-                fallbackSingleWarp(pts, preparedTexture, warpedTexture)
-            } else {
-                val (topChain, bottomChain) = splitHullIntoChains(pts)
-                
-                val segments = 8 
-                val texWidth = preparedTexture.cols().toDouble()
-                val texHeight = preparedTexture.rows().toDouble()
+            // 엔진(PlateDetectionEngine)에서 정렬해준 TL, TR, BR, BL 순서 사용
+            val dstPts = MatOfPoint2f(*pts.toTypedArray())
 
-                stripWarped = Mat(mat.size(), mat.type())
-                stripMask = Mat.zeros(mat.size(), CvType.CV_8UC1)
+            val perspectiveMat = Imgproc.getPerspectiveTransform(srcPts, dstPts)
+            Imgproc.warpPerspective(preparedTexture, warpedTexture, perspectiveMat, mat.size(), Imgproc.INTER_LINEAR)
 
-                for (i in 0 until segments) {
-                    val progressLeft = i.toDouble() / segments
-                    val progressRight = (i + 1).toDouble() / segments
-                    
-                    val ptTopLeft = getPointAtArcLength(topChain, progressLeft)
-                    val ptTopRight = getPointAtArcLength(topChain, progressRight)
-                    val ptBottomLeft = getPointAtArcLength(bottomChain, progressLeft)
-                    val ptBottomRight = getPointAtArcLength(bottomChain, progressRight)
+            srcPts.release()
+            dstPts.release()
+            perspectiveMat.release()
 
-                    val srcPts = MatOfPoint2f(
-                        Point(progressLeft * texWidth, 0.0),
-                        Point(progressRight * texWidth, 0.0),
-                        Point(progressRight * texWidth, texHeight),
-                        Point(progressLeft * texWidth, texHeight)
-                    )
-
-                    val dstPts = MatOfPoint2f(
-                        ptTopLeft,
-                        ptTopRight,
-                        ptBottomRight,
-                        ptBottomLeft
-                    )
-
-                    val perspectiveMat = Imgproc.getPerspectiveTransform(srcPts, dstPts)
-                    
-                    stripWarped.setTo(scalarZero)
-                    stripMask.setTo(scalarZero)
-                    
-                    Imgproc.warpPerspective(preparedTexture, stripWarped, perspectiveMat, mat.size(), Imgproc.INTER_LINEAR)
-                    
-                    val stripContour = org.opencv.core.MatOfPoint(*dstPts.toArray())
-                    Imgproc.fillPoly(stripMask, listOf(stripContour), scalar255)
-                    
-                    stripWarped.copyTo(warpedTexture, stripMask)
-
-                    srcPts.release(); dstPts.release(); perspectiveMat.release()
-                    stripContour.release()
-                }
-            }
-
+            // 4. 알파 블렌딩 (가림막을 원본 이미지 위에 자연스럽게 합성)
+            val matChannels = ArrayList<Mat>()
+            val textureChannels = ArrayList<Mat>()
             Core.split(mat, matChannels)
             Core.split(warpedTexture, textureChannels)
-            
+
             for (i in 0 until 3) {
                 var mcF: Mat? = null; var ccF: Mat? = null; var blendedF: Mat? = null
                 var invAlpha: Mat? = null; var scalarMat: Mat? = null
@@ -730,59 +602,38 @@ class MainActivity : AppCompatActivity() {
                     mcF = Mat(); ccF = Mat()
                     matChannels[i].convertTo(mcF, CvType.CV_32F)
                     textureChannels[i].convertTo(ccF, CvType.CV_32F)
-                    
+
                     blendedF = Mat()
-                    Core.multiply(ccF, alphaMat, ccF)
+                    Core.multiply(ccF, alphaMat, ccF) // 텍스처 부분
                     invAlpha = Mat()
                     scalarMat = Mat(alphaMat.size(), alphaMat.type(), Scalar(1.0))
-                    
-                    Core.subtract(scalarMat, alphaMat, invAlpha)
-                    Core.multiply(mcF, invAlpha, mcF)
-                 
-                    Core.add(ccF, mcF, blendedF)
+
+                    Core.subtract(scalarMat, alphaMat, invAlpha) // 반전된 알파
+                    Core.multiply(mcF, invAlpha, mcF) // 원본 부분
+
+                    Core.add(ccF, mcF, blendedF) // 합성
                     blendedF.convertTo(matChannels[i], CvType.CV_8U)
-                } finally { 
+                } finally {
                     mcF?.release(); ccF?.release(); blendedF?.release()
                     invAlpha?.release(); scalarMat?.release()
                 }
             }
             Core.merge(matChannels, mat)
+            matChannels.forEach { it.release() }
+            textureChannels.forEach { it.release() }
 
         } finally {
-            maskMat?.release(); contour?.release(); blurredMask?.release()
-            alphaMat?.release(); warpedTexture?.release()
+            maskMat?.release()
+            contour?.release()
+            blurredMask?.release()
+            alphaMat?.release()
             preparedTexture?.release()
-            
-            stripWarped?.release()
-            stripMask?.release()
-            
-            matChannels.forEach { it.release() }; textureChannels.forEach { it.release() }
-            
-            if (originalWasRgba) Imgproc.cvtColor(mat, mat, Imgproc.COLOR_RGB2RGBA)
+            warpedTexture?.release()
+
+            if (originalWasRgba) {
+                Imgproc.cvtColor(mat, mat, Imgproc.COLOR_RGB2RGBA)
+            }
         }
-    }
-
-    private fun fallbackSingleWarp(pts: List<Point>, textureInput: Mat, outputTexture: Mat) {
-        val hullMat2f = MatOfPoint2f(*pts.toTypedArray())
-        val minRect = Imgproc.minAreaRect(hullMat2f)
-        val rectPts = arrayOf(Point(), Point(), Point(), Point())
-        minRect.points(rectPts)
-        hullMat2f.release()
-
-        val sortedByY = rectPts.sortedBy { it.y }
-        val topTwo = sortedByY.take(2).sortedBy { it.x }
-        val bottomTwo = sortedByY.takeLast(2).sortedBy { it.x }
-        
-        val dstPts = MatOfPoint2f(topTwo[0], topTwo[1], bottomTwo[1], bottomTwo[0])
-        val srcPts = MatOfPoint2f(
-            Point(0.0, 0.0), Point(textureInput.cols().toDouble(), 0.0),
-            Point(textureInput.cols().toDouble(), textureInput.rows().toDouble()), Point(0.0, textureInput.rows().toDouble())
-        )
-
-        val perspectiveMat = Imgproc.getPerspectiveTransform(srcPts, dstPts)
-        Imgproc.warpPerspective(textureInput, outputTexture, perspectiveMat, outputTexture.size(), Imgproc.INTER_LINEAR)
-        
-        srcPts.release(); dstPts.release(); perspectiveMat.release()
     }
 
     private fun saveBitmapToGallery(bitmap: Bitmap) {
