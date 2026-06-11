@@ -16,7 +16,6 @@ object PlateDetectionEngine {
         fun pauseAndShowStep(stageName: String, bitmap: Bitmap)
     }
 
-    // 🛠️ 사진은 화면 너비(1080px)에 맞춰 시원하게 확대하되, 텍스트는 45px로 깔끔하게 고정하는 HUD
     private fun addDebugHUD(original: Bitmap, title: String, logs: List<String>): Bitmap {
         val targetWidth = 1080f
         val scaleFactor = targetWidth / original.width.toFloat()
@@ -85,56 +84,69 @@ object PlateDetectionEngine {
         val cy = (p1y + p2y) / 2.0
 
         // =====================================================================
-        // 🚀 [1단계] 선 길이 기반 최신 번호판 비율(4.7:1) 동적 ROI 할당
+        // 🚀 [1단계] 넉넉한 정사각형 임시 ROI 확보 (회전 전 코너 잘림 방지)
         // =====================================================================
-        val expectedWidth = lineLen * 1.2 
-        val expectedHeight = expectedWidth / 4.7 
+        val looseSize = lineLen * 1.5 
+        val looseLeft = (cx - looseSize / 2.0).toInt().coerceIn(0, fullMat.cols() - 1)
+        val looseTop = (cy - looseSize / 2.0).toInt().coerceIn(0, fullMat.rows() - 1)
+        val looseRight = (cx + looseSize / 2.0).toInt().coerceIn(1, fullMat.cols())
+        val looseBottom = (cy + looseSize / 2.0).toInt().coerceIn(1, fullMat.rows())
 
-        val paddedLeft = (cx - expectedWidth / 2.0).toInt().coerceIn(0, fullMat.cols() - 1)
-        val paddedTop = (cy - expectedHeight / 2.0).toInt().coerceIn(0, fullMat.rows() - 1)
-        val paddedRight = (cx + expectedWidth / 2.0).toInt().coerceIn(1, fullMat.cols())
-        val paddedBottom = (cy + expectedHeight / 2.0).toInt().coerceIn(1, fullMat.rows())
-
-        val paddedRect = Rect(paddedLeft, paddedTop, paddedRight - paddedLeft, paddedBottom - paddedTop)
+        val looseRect = Rect(looseLeft, looseTop, looseRight - looseLeft, looseBottom - looseTop)
         
-        debugListener?.let {
-            val debugMat = fullMat.clone()
-            Imgproc.line(debugMat, Point(p1x, p1y), Point(p2x, p2y), Scalar(255.0, 255.0, 0.0, 255.0), 8)
-            Imgproc.rectangle(debugMat, paddedRect, Scalar(255.0, 0.0, 0.0, 255.0), 12)
-            
-            val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
-            Utils.matToBitmap(debugMat, debugBmp)
-            
-            val hudBmp = addDebugHUD(debugBmp, "Step 1: Ratio-Optimized ROI", listOf(
-                "Line Length: ${String.format("%.1f", lineLen)} px",
-                "Expected Width (1.2x): ${String.format("%.1f", expectedWidth)} px",
-                "Expected Height (/4.7): ${String.format("%.1f", expectedHeight)} px",
-                "Result: Tightly wrapped to modern plate ratio"
-            ))
-            
-            it.pauseAndShowStep("1단계: 번호판 비율 적용 Padded ROI", hudBmp)
-            debugMat.release(); debugBmp.recycle()
-        }
+        val looseMat = Mat(); val looseGray = Mat()
+        fullMat.submat(looseRect).copyTo(looseMat)
+        fullGray.submat(looseRect).copyTo(looseGray)
 
-        val paddedMat = Mat(); val paddedGray = Mat()
-        fullMat.submat(paddedRect).copyTo(paddedMat)
-        fullGray.submat(paddedRect).copyTo(paddedGray)
-
-        val roiCx = cx - paddedLeft
-        val roiCy = cy - paddedTop
+        val roiCx = cx - looseLeft
+        val roiCy = cy - looseTop
 
         // =====================================================================
-        // [2단계] 수평 정렬
+        // 🚀 [2단계] 수평 정렬 후 완벽한 4.7:1 비율로 타이트하게 자르기
         // =====================================================================
         val angle = Math.toDegrees(Math.atan2(dy, dx))
         val rotMat = Imgproc.getRotationMatrix2D(Point(roiCx, roiCy), -angle, 1.0)
 
-        val rotatedPaddedMat = Mat(); val rotatedPaddedGray = Mat()
-        Imgproc.warpAffine(paddedMat, rotatedPaddedMat, rotMat, paddedMat.size(), Imgproc.INTER_LINEAR)
-        Imgproc.warpAffine(paddedGray, rotatedPaddedGray, rotMat, paddedGray.size(), Imgproc.INTER_LINEAR)
+        val rotatedLooseMat = Mat(); val rotatedLooseGray = Mat()
+        Imgproc.warpAffine(looseMat, rotatedLooseMat, rotMat, looseMat.size(), Imgproc.INTER_LINEAR)
+        Imgproc.warpAffine(looseGray, rotatedLooseGray, rotMat, looseGray.size(), Imgproc.INTER_LINEAR)
+
+        // 수평으로 반듯해진 이미지 위에서 타이트한 비율을 적용!
+        val expectedWidth = lineLen * 1.2 
+        val expectedHeight = expectedWidth / 4.7 
+
+        val tightLeft = (roiCx - expectedWidth / 2.0).toInt().coerceIn(0, rotatedLooseMat.cols() - 1)
+        val tightTop = (roiCy - expectedHeight / 2.0).toInt().coerceIn(0, rotatedLooseMat.rows() - 1)
+        val tightRight = (roiCx + expectedWidth / 2.0).toInt().coerceIn(1, rotatedLooseMat.cols())
+        val tightBottom = (roiCy + expectedHeight / 2.0).toInt().coerceIn(1, rotatedLooseMat.rows())
+
+        val tightRect = Rect(tightLeft, tightTop, tightRight - tightLeft, tightBottom - tightTop)
+
+        val tightMat = Mat(); val tightGray = Mat()
+        rotatedLooseMat.submat(tightRect).copyTo(tightMat)
+        rotatedLooseGray.submat(tightRect).copyTo(tightGray)
+
+        debugListener?.let {
+            val debugMat = rotatedLooseMat.clone()
+            // 돌아간 전체 이미지 위에 타이트하게 잘린 영역을 파란색으로 표시
+            Imgproc.rectangle(debugMat, tightRect, Scalar(0.0, 150.0, 255.0, 255.0), 4)
+            
+            val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(debugMat, debugBmp)
+
+            val hudBmp = addDebugHUD(debugBmp, "Step 1 & 2: Level & Tight Ratio Crop", listOf(
+                "Rotation Angle: ${String.format("%.1f", -angle)} deg",
+                "Tight Width (1.2x): ${String.format("%.1f", expectedWidth)} px",
+                "Tight Height (/4.7): ${String.format("%.1f", expectedHeight)} px",
+                "Status: Corners perfectly preserved"
+            ))
+            
+            it.pauseAndShowStep("1~2단계: 수평 정렬 및 비율 ROI 크롭", hudBmp)
+            debugMat.release(); debugBmp.recycle()
+        }
 
         // =====================================================================
-        // 🚀 [3단계] OpenCV 내장 윤곽선(Contour) 탐지 알고리즘 (세부 디버깅 포함)
+        // 🚀 [3단계] OpenCV 내장 윤곽선(Contour) 탐지 알고리즘 (tightGray 기준)
         // =====================================================================
         val thresh = Mat()
         val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(25.0, 7.0))
@@ -143,10 +155,7 @@ object PlateDetectionEngine {
         var resultPoints: List<ImmutablePoint>? = null
 
         try {
-            // ---------------------------------------------------------
-            // 3-1. 가우시안 블러 (노이즈 제거)
-            // ---------------------------------------------------------
-            Imgproc.GaussianBlur(rotatedPaddedGray, thresh, Size(5.0, 5.0), 0.0)
+            Imgproc.GaussianBlur(tightGray, thresh, Size(5.0, 5.0), 0.0)
             
             debugListener?.let {
                 val debugBmp = Bitmap.createBitmap(thresh.cols(), thresh.rows(), Bitmap.Config.ARGB_8888)
@@ -161,9 +170,6 @@ object PlateDetectionEngine {
                 tempRgb.release(); debugBmp.recycle()
             }
 
-            // ---------------------------------------------------------
-            // 3-2. 적응형 이진화 (흑백 대비 극대화)
-            // ---------------------------------------------------------
             Imgproc.adaptiveThreshold(thresh, thresh, 255.0, Imgproc.ADAPTIVE_THRESH_MEAN_C, Imgproc.THRESH_BINARY_INV, 15, 10.0)
             
             debugListener?.let {
@@ -179,9 +185,6 @@ object PlateDetectionEngine {
                 tempRgb.release(); debugBmp.recycle()
             }
 
-            // ---------------------------------------------------------
-            // 3-3. 모폴로지 닫기 (글자와 테두리 뭉치기)
-            // ---------------------------------------------------------
             Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, kernel)
             
             debugListener?.let {
@@ -197,9 +200,6 @@ object PlateDetectionEngine {
                 tempRgb.release(); debugBmp.recycle()
             }
 
-            // ---------------------------------------------------------
-            // 3-4. 윤곽선 탐지 및 최종 사각형(minAreaRect) 도출
-            // ---------------------------------------------------------
             Imgproc.findContours(thresh, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
             var maxArea = -1.0
@@ -212,7 +212,6 @@ object PlateDetectionEngine {
                 }
             }
 
-            // 널(Null) 안전성을 위해 배열 초기화를 명시적으로 처리
             val rectPoints = arrayOf(Point(), Point(), Point(), Point())
             if (bestContour != null && maxArea > 1000.0) { 
                 val contour2f = MatOfPoint2f(*bestContour.toArray())
@@ -220,14 +219,14 @@ object PlateDetectionEngine {
                 minRect.points(rectPoints)
                 contour2f.release()
             } else {
-                rectPoints[0] = Point(0.0, rotatedPaddedGray.rows().toDouble())
+                rectPoints[0] = Point(0.0, tightGray.rows().toDouble())
                 rectPoints[1] = Point(0.0, 0.0)
-                rectPoints[2] = Point(rotatedPaddedGray.cols().toDouble(), 0.0)
-                rectPoints[3] = Point(rotatedPaddedGray.cols().toDouble(), rotatedPaddedGray.rows().toDouble())
+                rectPoints[2] = Point(tightGray.cols().toDouble(), 0.0)
+                rectPoints[3] = Point(tightGray.cols().toDouble(), tightGray.rows().toDouble())
             }
 
             debugListener?.let {
-                val debugMat = rotatedPaddedMat.clone()
+                val debugMat = tightMat.clone()
                 val color = Scalar(0.0, 255.0, 0.0, 255.0)
                 for (i in 0..3) {
                     Imgproc.line(debugMat, rectPoints[i], rectPoints[(i + 1) % 4], color, 4)
@@ -246,18 +245,22 @@ object PlateDetectionEngine {
             }
 
             // =====================================================================
-            // [4단계] 좌표 원복 (역회전 및 오프셋 더하기)
+            // 🚀 [4단계] 좌표 원복 (타이트 오프셋 -> 역회전 -> 임시 영역 오프셋)
             // =====================================================================
             val invRotMat = Mat()
             Imgproc.invertAffineTransform(rotMat, invRotMat)
 
-            val srcMat = MatOfPoint2f(*rectPoints)
+            // 1. tightRect 안의 좌표를 rotatedLooseMat 좌표계로 변환
+            val pointsInRotatedLoose = rectPoints.map { Point(it.x + tightRect.x, it.y + tightRect.y) }.toTypedArray()
+            val srcMat = MatOfPoint2f(*pointsInRotatedLoose)
             val dstMat = MatOfPoint2f()
 
+            // 2. 회전을 역으로 풀어 looseMat 좌표계로 복귀
             Core.transform(srcMat, dstMat, invRotMat)
 
+            // 3. looseRect 오프셋을 더해 원본 사진(fullMat) 좌표계로 최종 복귀
             resultPoints = dstMat.toArray().map { 
-                ImmutablePoint((it.x + paddedRect.x).toFloat(), (it.y + paddedRect.y).toFloat()) 
+                ImmutablePoint((it.x + looseRect.x).toFloat(), (it.y + looseRect.y).toFloat()) 
             }
 
             invRotMat.release(); srcMat.release(); dstMat.release()
@@ -269,8 +272,9 @@ object PlateDetectionEngine {
             contours.forEach { it.release() }; hierarchy.release()
             
             rotMat.release()
-            paddedMat.release(); paddedGray.release()
-            rotatedPaddedMat.release(); rotatedPaddedGray.release()
+            looseMat.release(); looseGray.release()
+            rotatedLooseMat.release(); rotatedLooseGray.release()
+            tightMat.release(); tightGray.release()
             fullMat.release(); fullGray.release()
         }
 
