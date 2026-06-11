@@ -297,6 +297,15 @@ object PlateDetectionEngine {
                 tempRgb.release(); debugBmp.recycle()
             }
 
+            // 🚀 [추가된 부분] 가장자리 테두리를 검은색으로 칠해 거대한 바운딩 박스 생성 방지 (Border Clearing)
+            Imgproc.rectangle(
+                thresh, 
+                Point(0.0, 0.0), 
+                Point(thresh.cols().toDouble() - 1, thresh.rows().toDouble() - 1), 
+                Scalar(0.0), 
+                10 // 테두리 두께 10px 마스킹
+            )
+
             Imgproc.findContours(thresh, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
             // =====================================================================
@@ -310,9 +319,24 @@ object PlateDetectionEngine {
             val rejectedRects = mutableListOf<Array<Point>>()
             var evaluatedCount = 0
 
+            // 🚀 [추가된 부분] ROI 전체 캔버스의 면적 계산 (이 면적의 85%를 넘으면 테두리 노이즈로 간주)
+            val imageTotalArea = tightGray.cols() * tightGray.rows().toDouble()
+
             for (contour in contours) {
                 val area = Imgproc.contourArea(contour)
                 if (area < 500) continue 
+
+                // 🚀 [추가된 부분] 거대한 윤곽선 탈락 로직 (Area Limit Filtering)
+                // 만약 윤곽선 면적이 이미지 전체 면적의 85%를 넘어간다면, 이는 화면 테두리를 둘러싼 노이즈이므로 즉시 거부(빨간 박스) 처리합니다.
+                if (area > imageTotalArea * 0.85) {
+                    val contour2f = MatOfPoint2f(*contour.toArray())
+                    val rect = Imgproc.minAreaRect(contour2f)
+                    val pts = arrayOf(Point(), Point(), Point(), Point(), Point())
+                    rect.points(pts)
+                    rejectedRects.add(pts)
+                    contour2f.release()
+                    continue
+                }
 
                 evaluatedCount++
 
