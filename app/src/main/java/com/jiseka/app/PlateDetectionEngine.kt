@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.util.Log
 import org.opencv.android.Utils
 import org.opencv.core.*
 import org.opencv.imgproc.Imgproc
@@ -247,7 +248,6 @@ object PlateDetectionEngine {
         // =====================================================================
         val thresh = Mat()
         
-        // 커널 고정값으로 변경 (제안 사항 반영)
         val openKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 3.0))
         val closeKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(18.0, 5.0))
         
@@ -272,7 +272,7 @@ object PlateDetectionEngine {
                 tempRgb.release(); debugBmp.recycle()
             }
 
-            // 3-2: 적응형 이진화 (Gaussian_C, blockSize 31, C 7.0 적용)
+            // 3-2: 적응형 이진화
             Imgproc.adaptiveThreshold(
                 thresh, thresh, 255.0, 
                 Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, 
@@ -292,7 +292,7 @@ object PlateDetectionEngine {
                 tempRgb.release(); debugBmp.recycle()
             }
 
-            // 3-3: 모폴로지 OPEN (노이즈 제거) -> CLOSE (문자 연결)
+            // 3-3: 모폴로지 OPEN -> CLOSE
             Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_OPEN, openKernel)
             Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, closeKernel)
             
@@ -322,12 +322,21 @@ object PlateDetectionEngine {
             val rejectedRects = mutableListOf<Array<Point>>()
             var evaluatedCount = 0
             
-            // 중앙 좌표 계산 (Scoring용)
             val centerX = tightGray.cols() / 2.0
             val centerY = tightGray.rows() / 2.0
 
-            for (contour in contours) {
+            for ((i, contour) in contours.withIndex()) {
                 val area = Imgproc.contourArea(contour)
+
+                // 🌟 [디버그 추가] 면적 필터링 통과 전후의 모든 윤곽선 상태 확인
+                val rectLog = Imgproc.boundingRect(contour)
+                val ratioLog = rectLog.width.toFloat() / max(rectLog.height.toFloat(), 1f) // 0 나누기 방지
+                
+                Log.d(
+                    "PLATE_DEBUG",
+                    "Contour[$i] area=$area w=${rectLog.width} h=${rectLog.height} ratio=$ratioLog"
+                )
+
                 if (area < 500) continue 
 
                 evaluatedCount++
@@ -346,17 +355,13 @@ object PlateDetectionEngine {
                 val pts = arrayOf(Point(), Point(), Point(), Point())
                 rect.points(pts)
 
-                // 🚨 한국 번호판 규격에 맞게 1.8부터 허용하도록 수정
                 if (ratio !in 1.8..7.0 || rectangularity < 0.60) {
                     rejectedRects.add(pts)
                     continue
                 }
 
-                // 중앙 중심화 스코어 추가
                 val dist = hypot(rect.center.x - centerX, rect.center.y - centerY)
                 val centerScore = 1000.0 - dist
-                
-                // 가중치 재조정 스코어
                 val score = (area * 0.3) + (rectangularity * 7000.0) + (centerScore * 3.0)
 
                 if (score > bestScore) {
@@ -377,7 +382,6 @@ object PlateDetectionEngine {
                 }
             }
 
-            // 🚨 버그 수정: ROI Fallback 로직 완전 제거. 윤곽선이 없으면 즉시 null 반환.
             if (bestContour == null) {
                 debugListener?.let {
                     val debugMat = tightMat.clone()
@@ -426,7 +430,7 @@ object PlateDetectionEngine {
             }
 
             // =====================================================================
-            // 🚀 [5단계] 정렬 및 미세 확장, 안전장치(Fallback) 적용
+            // [5단계] 정렬 및 미세 확장, 안전장치(Fallback) 적용
             // =====================================================================
             val sum = rawPoints.map { it.x + it.y }
             val diff = rawPoints.map { it.x - it.y }
@@ -465,7 +469,6 @@ object PlateDetectionEngine {
             val finalRatio = finalWidth / finalHeight
 
             var safeResultPts = finalPts
-            // 마지막 Fallback 기준도 한국 번호판 규격에 맞춰 1.8 로 수정
             if (finalRatio < 1.8 || finalRatio > 7.0) {
                 val fallbackPts = arrayOf(
                     Point(tightLeft.toDouble(), tightTop.toDouble()),
@@ -480,7 +483,6 @@ object PlateDetectionEngine {
                 fallbackSrc.release(); fallbackDst.release()
             }
 
-            // 🚀 최종 마스킹 준비 상태 디버그 확인
             debugListener?.let {
                 val debugMat = fullMat.clone()
                 
