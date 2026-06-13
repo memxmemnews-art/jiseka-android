@@ -312,7 +312,7 @@ object PlateDetectionEngine {
             Imgproc.findContours(thresh, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
             // =====================================================================
-            // 🚀 [4단계] 기하학적 스코어링 (시각적 필터링 디버깅 추가)
+            // 🚀 [4단계] 기하학적 스코어링 (시각적 필터링 디버깅 및 경계 필터링 추가)
             // =====================================================================
             var bestScore = -1.0
             var bestContour: MatOfPoint? = null
@@ -327,16 +327,25 @@ object PlateDetectionEngine {
 
             for ((i, contour) in contours.withIndex()) {
                 val area = Imgproc.contourArea(contour)
+                val boundingRect = Imgproc.boundingRect(contour)
 
-                // 🌟 [디버그 추가] 면적 필터링 통과 전후의 모든 윤곽선 상태 확인
-                val rectLog = Imgproc.boundingRect(contour)
-                val ratioLog = rectLog.width.toFloat() / max(rectLog.height.toFloat(), 1f) // 0 나누기 방지
-                
+                // 🌟 [검증 1] 경계에 붙은 가짜 껍데기(Edge Halo) 논리적 필터링
+                val touchesBorder = 
+                    boundingRect.x <= 2 || 
+                    boundingRect.y <= 2 || 
+                    boundingRect.x + boundingRect.width >= thresh.cols() - 2 || 
+                    boundingRect.y + boundingRect.height >= thresh.rows() - 2
+
+                // 🌟 [검증 2] 디버그 로그 출력 (정체 파악)
                 Log.d(
                     "PLATE_DEBUG",
-                    "Contour[$i] area=$area w=${rectLog.width} h=${rectLog.height} ratio=$ratioLog"
+                    "Contour[$i] x=${boundingRect.x} y=${boundingRect.y} w=${boundingRect.width} h=${boundingRect.height} area=$area touchesBorder=$touchesBorder"
                 )
 
+                // 경계에 닿은 껍데기는 즉시 평가 탈락 처리
+                if (touchesBorder) continue
+
+                // 너무 작은 노이즈 제거
                 if (area < 500) continue 
 
                 evaluatedCount++
