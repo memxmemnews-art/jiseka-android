@@ -208,9 +208,9 @@ object PlateDetectionEngine {
 
         srcLinePts.release(); dstLinePts.release()
 
+        // 디버그 리스너 (1~2단계 생략가능하지만 유지)
         debugListener?.let {
             val debugMat = fullMat.clone()
-            
             Imgproc.line(debugMat, Point(p1x, p1y), Point(p2x, p2y), Scalar(255.0, 255.0, 0.0, 255.0), 6)
             
             val tightRectPts = arrayOf(
@@ -244,7 +244,7 @@ object PlateDetectionEngine {
         }
 
         // =====================================================================
-        // [3단계] OpenCV 윤곽선 탐지 (가우시안, 이진화, 모폴로지)
+        // [3단계] OpenCV 윤곽선 탐지
         // =====================================================================
         val thresh = Mat()
         
@@ -259,19 +259,6 @@ object PlateDetectionEngine {
             // 3-1: 가우시안 블러
             Imgproc.GaussianBlur(tightGray, thresh, Size(5.0, 5.0), 0.0)
             
-            debugListener?.let {
-                val debugBmp = Bitmap.createBitmap(thresh.cols(), thresh.rows(), Bitmap.Config.ARGB_8888)
-                val tempRgb = Mat()
-                Imgproc.cvtColor(thresh, tempRgb, Imgproc.COLOR_GRAY2RGBA)
-                Utils.matToBitmap(tempRgb, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "Step 3-1: Gaussian Blur", listOf(
-                    "Kernel Size: 5x5",
-                    "Status: High-frequency noise reduced"
-                ), screenRatio)
-                it.pauseAndShowStep("3-1단계: 가우시안 블러", hudBmp)
-                tempRgb.release(); debugBmp.recycle()
-            }
-
             // 3-2: 적응형 이진화
             Imgproc.adaptiveThreshold(
                 thresh, thresh, 255.0, 
@@ -279,40 +266,14 @@ object PlateDetectionEngine {
                 Imgproc.THRESH_BINARY_INV, 31, 7.0
             )
             
-            debugListener?.let {
-                val debugBmp = Bitmap.createBitmap(thresh.cols(), thresh.rows(), Bitmap.Config.ARGB_8888)
-                val tempRgb = Mat()
-                Imgproc.cvtColor(thresh, tempRgb, Imgproc.COLOR_GRAY2RGBA)
-                Utils.matToBitmap(tempRgb, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "Step 3-2: Adaptive Threshold", listOf(
-                    "Method: Gaussian_C, Block Size: 31, C: 7.0",
-                    "Status: Bumper reflections reduced"
-                ), screenRatio)
-                it.pauseAndShowStep("3-2단계: 적응형 이진화 (Gaussian)", hudBmp)
-                tempRgb.release(); debugBmp.recycle()
-            }
-
             // 3-3: 모폴로지 OPEN -> CLOSE
             Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_OPEN, openKernel)
             Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, closeKernel)
             
-            debugListener?.let {
-                val debugBmp = Bitmap.createBitmap(thresh.cols(), thresh.rows(), Bitmap.Config.ARGB_8888)
-                val tempRgb = Mat()
-                Imgproc.cvtColor(thresh, tempRgb, Imgproc.COLOR_GRAY2RGBA)
-                Utils.matToBitmap(tempRgb, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "Step 3-3: Morphology Open + Close", listOf(
-                    "Open Kernel: 5x3, Close Kernel: 18x5",
-                    "Status: Clean blobs without over-merging"
-                ), screenRatio)
-                it.pauseAndShowStep("3-3단계: 모폴로지 최적화", hudBmp)
-                tempRgb.release(); debugBmp.recycle()
-            }
-
             Imgproc.findContours(thresh, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
             // =====================================================================
-            // 🚀 [4단계] 기하학적 스코어링 (시각적 필터링 디버깅 및 경계 필터링 추가)
+            // 🚀 [4단계] 모든 후보의 채점표를 투명하게 공개하는 디버그 강화판
             // =====================================================================
             var bestScore = -1.0
             var bestContour: MatOfPoint? = null
@@ -320,35 +281,20 @@ object PlateDetectionEngine {
             var bestRectangularity = 0.0
             
             val rejectedRects = mutableListOf<Array<Point>>()
+            // 🌟 디버그용: 점수 미달로 탈락한 모든 박스 저장
+            val lowScoreRects = mutableListOf<Array<Point>>() 
+            val borderTouchedRects = mutableListOf<Array<Point>>()
+            
             var evaluatedCount = 0
             
             val centerX = tightGray.cols() / 2.0
             val centerY = tightGray.rows() / 2.0
 
+            Log.d("PLATE_DEBUG", "========== STEP 4: CONTOUR EVALUATION START ==========")
+
             for ((i, contour) in contours.withIndex()) {
                 val area = Imgproc.contourArea(contour)
                 val boundingRect = Imgproc.boundingRect(contour)
-
-                // 🌟 [검증 1] 경계에 붙은 가짜 껍데기(Edge Halo) 논리적 필터링
-                val touchesBorder = 
-                    boundingRect.x <= 2 || 
-                    boundingRect.y <= 2 || 
-                    boundingRect.x + boundingRect.width >= thresh.cols() - 2 || 
-                    boundingRect.y + boundingRect.height >= thresh.rows() - 2
-
-                // 🌟 [검증 2] 디버그 로그 출력 (정체 파악)
-                Log.d(
-                    "PLATE_DEBUG",
-                    "Contour[$i] x=${boundingRect.x} y=${boundingRect.y} w=${boundingRect.width} h=${boundingRect.height} area=$area touchesBorder=$touchesBorder"
-                )
-
-                // 경계에 닿은 껍데기는 즉시 평가 탈락 처리
-                if (touchesBorder) continue
-
-                // 너무 작은 노이즈 제거
-                if (area < 500) continue 
-
-                evaluatedCount++
 
                 val contour2f = MatOfPoint2f(*contour.toArray())
                 val rect = Imgproc.minAreaRect(contour2f)
@@ -358,14 +304,38 @@ object PlateDetectionEngine {
                 val ratio = max(w, h) / max(min(w, h), 1.0)
                 val rectArea = w * h
                 val rectangularity = area / max(rectArea, 1.0)
-
-                contour2f.release()
-
+                
                 val pts = arrayOf(Point(), Point(), Point(), Point())
                 rect.points(pts)
 
+                val touchesBorder = 
+                    boundingRect.x <= 2 || 
+                    boundingRect.y <= 2 || 
+                    boundingRect.x + boundingRect.width >= thresh.cols() - 2 || 
+                    boundingRect.y + boundingRect.height >= thresh.rows() - 2
+
+                // 🌟 [상세 로그] 모든 후보의 생얼과 탈락 사유를 기록
+                Log.d("PLATE_DEBUG", "Contour[$i]: area=${String.format("%.1f", area)}, rectArea=${String.format("%.1f", rectArea)}, ratio=${String.format("%.2f", ratio)}, rectang=${String.format("%.2f", rectangularity)}, touchesBorder=$touchesBorder")
+
+                if (touchesBorder) {
+                    Log.d("PLATE_DEBUG", " -> REJECTED: Touches Border")
+                    borderTouchedRects.add(pts)
+                    contour2f.release()
+                    continue
+                }
+
+                if (area < 500) {
+                    Log.d("PLATE_DEBUG", " -> REJECTED: Area < 500")
+                    contour2f.release()
+                    continue 
+                }
+
+                evaluatedCount++
+
                 if (ratio !in 1.8..7.0 || rectangularity < 0.60) {
+                    Log.d("PLATE_DEBUG", " -> REJECTED: Ratio/Rectangularity Invalid")
                     rejectedRects.add(pts)
+                    contour2f.release()
                     continue
                 }
 
@@ -373,23 +343,30 @@ object PlateDetectionEngine {
                 val centerScore = 1000.0 - dist
                 val score = (area * 0.3) + (rectangularity * 7000.0) + (centerScore * 3.0)
 
+                Log.d("PLATE_DEBUG", " -> PASSED FILTER: Score Calculated = ${String.format("%.1f", score)}")
+
                 if (score > bestScore) {
                     if (bestContour != null) {
                         val prevContour2f = MatOfPoint2f(*bestContour.toArray())
                         val prevRect = Imgproc.minAreaRect(prevContour2f)
                         val prevPts = arrayOf(Point(), Point(), Point(), Point())
                         prevRect.points(prevPts)
-                        rejectedRects.add(prevPts)
+                        lowScoreRects.add(prevPts) // 1등에게 밀린 루저들 보관
                         prevContour2f.release()
                     }
                     bestScore = score
                     bestContour = contour
                     bestRatio = ratio
                     bestRectangularity = rectangularity
+                    Log.d("PLATE_DEBUG", " -> ✨ NEW BEST WINNER ✨")
                 } else {
-                    rejectedRects.add(pts)
+                    Log.d("PLATE_DEBUG", " -> REJECTED: Score too low (Score: $score vs Best: $bestScore)")
+                    lowScoreRects.add(pts)
                 }
+                contour2f.release()
             }
+
+            Log.d("PLATE_DEBUG", "========== STEP 4: EVALUATION END ==========")
 
             if (bestContour == null) {
                 debugListener?.let {
@@ -414,27 +391,33 @@ object PlateDetectionEngine {
 
             debugListener?.let {
                 val debugMat = tightMat.clone()
-                val colorRed = Scalar(255.0, 0.0, 0.0, 255.0)
-                val colorGreen = Scalar(0.0, 255.0, 0.0, 255.0)
-                
+                val colorRed = Scalar(255.0, 0.0, 0.0, 255.0)       // 규격 미달
+                val colorOrange = Scalar(255.0, 165.0, 0.0, 255.0) // 규격은 통과했으나 점수 미달
+                val colorBlue = Scalar(0.0, 0.0, 255.0, 255.0)     // 경계선 터치 탈락
+                val colorGreen = Scalar(0.0, 255.0, 0.0, 255.0)    // 1등 합격
+
+                // 🌟 화면에 탈락한 모든 후보들을 각기 다른 색상으로 그림
                 for (pts in rejectedRects) {
-                    for (i in 0..3) {
-                        Imgproc.line(debugMat, pts[i], pts[(i + 1) % 4], colorRed, 2)
-                    }
+                    for (i in 0..3) Imgproc.line(debugMat, pts[i], pts[(i + 1) % 4], colorRed, 1)
+                }
+                for (pts in lowScoreRects) {
+                    for (i in 0..3) Imgproc.line(debugMat, pts[i], pts[(i + 1) % 4], colorOrange, 2)
+                }
+                for (pts in borderTouchedRects) {
+                    for (i in 0..3) Imgproc.line(debugMat, pts[i], pts[(i + 1) % 4], colorBlue, 2)
                 }
                 for (i in 0..3) {
-                    Imgproc.line(debugMat, rawPoints[i], rawPoints[(i + 1) % 4], colorGreen, 6)
+                    Imgproc.line(debugMat, rawPoints[i], rawPoints[(i + 1) % 4], colorGreen, 4)
                 }
 
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "Step 4: Smart Scoring & Filtering", listOf(
-                    "Evaluated Contours: $evaluatedCount",
-                    "Winner Ratio: ${String.format("%.2f", bestRatio)} (Valid: 1.8~7.0)",
-                    "Winner Rectangularity: ${String.format("%.2f", bestRectangularity)} (Valid: >0.60)",
-                    "Status: Red=Rejected, Green=Selected!"
+                val hudBmp = addDebugHUD(debugBmp, "Step 4: FULL COMPETITION MAP", listOf(
+                    "Blue: Touched Border, Red: Invalid Ratio/Rect",
+                    "Orange: Low Score, Green: WINNER!",
+                    "Winner Score: ${String.format("%.1f", bestScore)}"
                 ), screenRatio)
-                it.pauseAndShowStep("4단계: 필터링 시각화 (Red vs Green)", hudBmp)
+                it.pauseAndShowStep("4단계: 모든 후보 평가 결과 (색상별 분석)", hudBmp)
                 debugMat.release(); debugBmp.recycle()
             }
 
