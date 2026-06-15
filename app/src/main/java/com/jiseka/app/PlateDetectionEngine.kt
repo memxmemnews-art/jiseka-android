@@ -230,8 +230,7 @@ object PlateDetectionEngine {
 
             val hudBmp = addDebugHUD(debugBmp, "Step 1 & 2: True Endpoint ROI Mapping", listOf(
                 "dx: ${dx.toInt()} px, dy: ${dy.toInt()} px",
-                "Rotation Angle: ${String.format("%.1f", angle)} deg",
-                "Status: Angle sign & swap bugs fixed!"
+                "Rotation Angle: ${String.format("%.1f", angle)} deg"
             ), screenRatio)
             
             it.pauseAndShowStep("1~2단계: 실제 선분 기반 ROI 확정", hudBmp)
@@ -253,59 +252,31 @@ object PlateDetectionEngine {
             Imgproc.medianBlur(tightGray, tightGray, 3)
             Imgproc.GaussianBlur(tightGray, thresh, Size(5.0, 5.0), 0.0)
             
-            // 🌟 Step 3-1 영구 복구
-            debugListener?.let {
-                val debugMat = Mat()
-                Imgproc.cvtColor(thresh, debugMat, Imgproc.COLOR_GRAY2RGBA)
-                val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
-                Utils.matToBitmap(debugMat, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "Step 3-1: Blurs Applied", listOf(
-                    "Method: Median (3x3) + Gaussian (5x5)",
-                    "Status: Noise reduced"
-                ), screenRatio)
-                it.pauseAndShowStep("3-1단계: 블러 처리", hudBmp)
-                debugMat.release(); debugBmp.recycle()
-            }
-
             Imgproc.adaptiveThreshold(
                 thresh, thresh, 255.0, 
                 Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, 
                 Imgproc.THRESH_BINARY_INV, 31, 7.0
             )
             
-            // 🌟 Step 3-2 영구 복구
-            debugListener?.let {
-                val debugMat = Mat()
-                Imgproc.cvtColor(thresh, debugMat, Imgproc.COLOR_GRAY2RGBA)
-                val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
-                Utils.matToBitmap(debugMat, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "Step 3-2: Adaptive Threshold", listOf(
-                    "Method: Gaussian_C, Block Size: 31, C: 7.0"
-                ), screenRatio)
-                it.pauseAndShowStep("3-2단계: 적응형 이진화", hudBmp)
-                debugMat.release(); debugBmp.recycle()
-            }
-
             Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_OPEN, openKernel)
             Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, closeKernel)
             
-            // 🌟 Step 3-3 영구 복구
             debugListener?.let {
                 val debugMat = Mat()
                 Imgproc.cvtColor(thresh, debugMat, Imgproc.COLOR_GRAY2RGBA)
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "Step 3-3: Morphology Open + Close", listOf(
-                    "Open Kernel: 5x3, Close Kernel: 24x5"
+                val hudBmp = addDebugHUD(debugBmp, "Step 3: Morphology (Open + Close)", listOf(
+                    "Adaptive Thresh -> Open (5x3) -> Close (24x5)"
                 ), screenRatio)
-                it.pauseAndShowStep("3-3단계: 모폴로지", hudBmp)
+                it.pauseAndShowStep("3단계: 모폴로지 (Threshold+Morph)", hudBmp)
                 debugMat.release(); debugBmp.recycle()
             }
 
             Imgproc.findContours(thresh, contours, hierarchy, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE)
 
             // =====================================================================
-            // 🚀 [4단계] Visual ID Tagging & Data Collection 모드 (Scoring 고도화 반영)
+            // 🚀 [4단계] Visual ID Tagging & Advanced Scoring System
             // =====================================================================
             var bestScore = -Double.MAX_VALUE
             var bestContour: MatOfPoint? = null
@@ -317,18 +288,19 @@ object PlateDetectionEngine {
             val borderTouchedRects = mutableListOf<Pair<Int, Array<Point>>>()
             val areaTooSmallRects = mutableListOf<Pair<Int, Array<Point>>>()
             
-            var evaluatedCount = 0
             val roiWidth = thresh.cols()
             val roiHeight = thresh.rows()
             val roiArea = roiWidth * roiHeight.toDouble()
 
+            // 💡 퍼포먼스 향상을 위해 모든 윤곽선의 BoundingRect 미리 캐싱
+            val allRects = contours.map { Imgproc.boundingRect(it) }
+
             Log.d("PLATE_DEBUG", "========== STEP 4: CONTOUR EVALUATION START ==========")
 
-            for ((i, contour) in contours.withIndex()) {
-                evaluatedCount++ 
-
+            for (i in contours.indices) {
+                val contour = contours[i]
+                val boundingRect = allRects[i]
                 val area = Imgproc.contourArea(contour)
-                val boundingRect = Imgproc.boundingRect(contour)
 
                 val contour2f = MatOfPoint2f(*contour.toArray())
                 val rect = Imgproc.minAreaRect(contour2f)
@@ -349,35 +321,94 @@ object PlateDetectionEngine {
                     continue 
                 }
 
-                // 2. 기본 형태(비율, 직사각형성) 미달 필터링
-                if (ratio !in 1.8..7.0 || rectangularity < 0.42) {
-                    Log.d("PLATE_DEBUG", " -> [ID: $i] REJECTED: Ratio/Rect Failed (Ratio: ${String.format("%.2f", ratio)}, Rect: ${String.format("%.2f", rectangularity)})")
+                // 2. 기본 형태(비율, 직사각형성) 미달 필터링 (측면 왜곡 대비 0.30으로 완화)
+                if (ratio !in 1.5..7.5 || rectangularity < 0.30) {
                     rejectedRects.add(Pair(i, pts))
                     contour2f.release()
                     continue
                 }
 
-                // 3. Boundary Halo 고도화 탐지 (비율 및 접촉면 기반)
-                val widthRatio = boundingRect.width.toDouble() / roiWidth
-                val heightRatio = boundingRect.height.toDouble() / roiHeight
-                
-                var borderHits = 0
-                if (boundingRect.x <= roiWidth * 0.02) borderHits++
-                if (boundingRect.y <= roiHeight * 0.05) borderHits++
-                if (boundingRect.x + boundingRect.width >= roiWidth * 0.98) borderHits++
-                if (boundingRect.y + boundingRect.height >= roiHeight * 0.95) borderHits++
+                // =====================================================================
+                // 🚀 핵심 아이디어 1 & 2: 내부 글자 밀도(Density) 및 커버리지(Coverage) 계산
+                // =====================================================================
+                var validChildCount = 0
+                var minChildX = Int.MAX_VALUE
+                var maxChildX = Int.MIN_VALUE
 
-                val isBoundaryHalo = (widthRatio > 0.90 && heightRatio > 0.80) || (borderHits >= 3)
-                
-                // 4. 면적 점수 정규화 (절대값이 아닌 ROI 대비 비율 사용)
-                val areaRatio = area / roiArea
-                val areaScore = when {
-                    areaRatio < 0.05 -> -500.0   // 너무 작음
-                    areaRatio > 0.80 -> -500.0   // 너무 큼
-                    else -> 1000.0 * areaRatio   // 적정 수준 내에서 면적당 가점 (상대적으로 낮춤)
+                for (j in allRects.indices) {
+                    if (i == j) continue
+                    val child = allRects[j]
+                    
+                    // 후보 윤곽선 내부에 포함되는지 확인 (약간의 마진 허용)
+                    if (child.x >= boundingRect.x - 2 && 
+                        child.y >= boundingRect.y - 2 && 
+                        child.x + child.width <= boundingRect.x + boundingRect.width + 2 && 
+                        child.y + child.height <= boundingRect.y + boundingRect.height + 2) {
+                        
+                        // 글자의 형태학적 특징: 후보 상자 높이의 최소 25%, 너무 넓지 않고, 전체 면적을 다 덮지 않음
+                        val isTallEnough = child.height >= boundingRect.height * 0.25
+                        val isNotTooWide = child.width <= child.height * 2.5
+                        val isNotTooLarge = child.area() <= boundingRect.area() * 0.3
+                        
+                        if (isTallEnough && isNotTooWide && isNotTooLarge) {
+                            validChildCount++
+                            minChildX = min(minChildX, child.x)
+                            maxChildX = max(maxChildX, child.x + child.width)
+                        }
+                    }
                 }
 
-                // 5. 중심성, 형태 점수 계산
+                // 밀도 점수 부여 (한국 번호판 7~8자 기준)
+                val densityScore = when (validChildCount) {
+                    in 5..12 -> 1500.0   // 번호판 확률 매우 높음
+                    in 3..4 -> 600.0     // 일부분이 가려지거나 잘린 경우
+                    in 13..25 -> 300.0   // 살짝 노이즈가 끼었지만 가능성 있음
+                    else -> 0.0          // 텅 비어있거나(0) 구멍이 너무 많음(그릴)
+                }
+
+                // 커버리지 점수 부여 (내부 글자가 넓게 퍼져있을수록 진짜 번호판)
+                var coverageScore = 0.0
+                var coverageRatio = 0.0
+                if (validChildCount >= 2) {
+                    val coverageWidth = maxChildX - minChildX
+                    coverageRatio = coverageWidth.toDouble() / boundingRect.width
+                    if (coverageRatio > 0.4) {
+                        coverageScore = coverageRatio * 1500.0
+                    }
+                }
+
+                // =====================================================================
+                // 🚀 핵심 아이디어 3: 오버플로우 기반 유연한 패널티 (Soft Penalty)
+                // =====================================================================
+                val borderMarginX = roiWidth * 0.03
+                val borderMarginY = roiHeight * 0.05
+                
+                val overflowLeft = max(0.0, borderMarginX - boundingRect.x)
+                val overflowRight = max(0.0, (boundingRect.x + boundingRect.width) - (roiWidth - borderMarginX))
+                val overflowTop = max(0.0, borderMarginY - boundingRect.y)
+                val overflowBottom = max(0.0, (boundingRect.y + boundingRect.height) - (roiHeight - borderMarginY))
+                
+                val overflowRatioX = (overflowLeft + overflowRight) / boundingRect.width
+                val overflowRatioY = (overflowTop + overflowBottom) / boundingRect.height
+                
+                // 경계 침범 정도에 따른 감점 (살짝 닿으면 조금, 많이 닿으면 크게 감점)
+                val overflowPenalty = -((overflowRatioX + overflowRatioY) * 1500.0)
+
+                // 최악의 경우: ROI 전체를 덮어버리는 가짜 껍데기(Halo)는 즉시 치명타 부여
+                val widthRatio = boundingRect.width.toDouble() / roiWidth
+                val heightRatio = boundingRect.height.toDouble() / roiHeight
+                val isBoundaryHalo = (widthRatio > 0.90 && heightRatio > 0.80)
+
+                // =====================================================================
+                // 최종 스코어링 합산
+                // =====================================================================
+                val areaRatio = area / roiArea
+                val areaScore = when {
+                    areaRatio < 0.05 -> -500.0   
+                    areaRatio > 0.80 -> -500.0   
+                    else -> 1000.0 * areaRatio   
+                }
+
                 val centerX = roiWidth / 2.0
                 val centerY = roiHeight / 2.0
                 val dist = hypot(rect.center.x - centerX, rect.center.y - centerY)
@@ -386,17 +417,15 @@ object PlateDetectionEngine {
                 val rectScore = rectangularity * 5000.0
                 val aspectScore = -abs(ratio - 3.5) * 400.0
 
-                // 6. 최종 점수 합산
-                var score = areaScore + rectScore + aspectScore + (centerScore * 3.0)
+                var score = areaScore + rectScore + aspectScore + (centerScore * 3.0) + 
+                            densityScore + coverageScore + overflowPenalty
 
-                // Halo 페널티 부여 (강제 제거 대신 점수 대폭 삭감)
                 if (isBoundaryHalo) {
-                    score -= 3000.0
-                    Log.d("PLATE_DEBUG", " -> [ID: $i] HALO PENALTY APPLIED: borderHits=$borderHits, wRatio=${String.format("%.2f", widthRatio)}, hRatio=${String.format("%.2f", heightRatio)}")
-                    borderTouchedRects.add(Pair(i, pts)) // 파란색 박스 표기용
+                    score -= 4000.0 // 절대 우승 불가
+                    borderTouchedRects.add(Pair(i, pts))
                 }
 
-                Log.d("PLATE_DEBUG", "Contour[$i]: areaRatio=${String.format("%.2f", areaRatio)} | ratio=${String.format("%.2f", ratio)} | rectang=${String.format("%.2f", rectangularity)} | Score=${String.format("%.1f", score)}")
+                Log.d("PLATE_DEBUG", "ID[$i] score:${String.format("%.0f", score)} | dens:$validChildCount(+${String.format("%.0f", densityScore)}) | cov:${String.format("%.2f", coverageRatio)}(+${String.format("%.0f", coverageScore)}) | ovfPen:${String.format("%.0f", overflowPenalty)}")
 
                 if (score > bestScore) {
                     if (bestContour != null) {
@@ -411,18 +440,16 @@ object PlateDetectionEngine {
                     bestContour = contour
                     bestRatio = ratio
                     bestRectangularity = rectangularity
-                    Log.d("PLATE_DEBUG", " -> ✨ NEW BEST WINNER ✨")
+                    Log.d("PLATE_DEBUG", " -> ✨ NEW BEST WINNER ✨ (ID: $i)")
                 } else {
-                    if (!isBoundaryHalo) { // Halo로 분류된 애들은 borderTouchedRects로 빠졌으므로 제외
-                        lowScoreRects.add(Pair(i, pts))
-                    }
+                    if (!isBoundaryHalo) lowScoreRects.add(Pair(i, pts))
                 }
                 contour2f.release()
             }
 
             Log.d("PLATE_DEBUG", "========== STEP 4: EVALUATION END ==========")
 
-            // 🌟 맵을 그릴 때 텍스트(ID)도 함께 렌더링
+            // 🌟 맵 렌더링 함수
             val drawFullMap = { bmp: Bitmap -> 
                 val canvasMat = Mat()
                 Utils.bitmapToMat(bmp, canvasMat)
@@ -438,7 +465,7 @@ object PlateDetectionEngine {
                         val id = item.first
                         val pts = item.second
                         for (i in 0..3) Imgproc.line(canvasMat, pts[i], pts[(i + 1) % 4], color, 2)
-                        if (id >= 0) { // ID 텍스트 박스 상단에 그리기
+                        if (id >= 0) { 
                             Imgproc.putText(canvasMat, "$id", Point(pts[1].x, pts[1].y - 5), Imgproc.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
                         }
                     }
@@ -455,8 +482,8 @@ object PlateDetectionEngine {
                     val minRect = Imgproc.minAreaRect(finalContour2f)
                     minRect.points(rawPts)
                     finalContour2f.release()
-                    for (i in 0..3) Imgproc.line(canvasMat, rawPts[i], rawPts[(i + 1) % 4], colorGreen, 4)
-                    Imgproc.putText(canvasMat, "WINNER", Point(rawPts[1].x, rawPts[1].y - 5), Imgproc.FONT_HERSHEY_SIMPLEX, 1.0, colorGreen, 3)
+                    for (i in 0..3) Imgproc.line(canvasMat, rawPts[i], rawPts[(i + 1) % 4], colorGreen, 5)
+                    Imgproc.putText(canvasMat, "WINNER", Point(rawPts[1].x, rawPts[1].y - 10), Imgproc.FONT_HERSHEY_SIMPLEX, 1.2, colorGreen, 4)
                 }
                 
                 Utils.matToBitmap(canvasMat, bmp)
@@ -471,12 +498,11 @@ object PlateDetectionEngine {
                     
                     drawFullMap(debugBmp)
 
-                    val hudBmp = addDebugHUD(debugBmp, "Step 4: Scoring FAILED (ID Mapped)", listOf(
-                        "Check the red/blue boxes & their IDs",
-                        "Look up the ID in Logcat (PLATE_DEBUG)",
-                        "to see EXACTLY why it failed."
+                    val hudBmp = addDebugHUD(debugBmp, "Step 4: Scoring FAILED", listOf(
+                        "No valid candidates survived.",
+                        "Check Logcat (PLATE_DEBUG) for scores."
                     ), screenRatio)
-                    it.pauseAndShowStep("4단계: 유효 윤곽선 없음 (ID 매핑 완료)", hudBmp)
+                    it.pauseAndShowStep("4단계: 유효 윤곽선 없음", hudBmp)
                     debugMat.release(); debugBmp.recycle()
                 }
                 return null
@@ -495,12 +521,12 @@ object PlateDetectionEngine {
                 
                 drawFullMap(debugBmp)
 
-                val hudBmp = addDebugHUD(debugBmp, "Step 4: COMPETITION MAP (ID Tagged)", listOf(
-                    "Match box numbers to Logcat IDs.",
-                    "Winner Ratio: ${String.format("%.2f", bestRatio)}",
-                    "Winner Rectang: ${String.format("%.2f", bestRectangularity)}"
+                val hudBmp = addDebugHUD(debugBmp, "Step 4: Density & Coverage Applied", listOf(
+                    "Masterkey Score Activated!",
+                    "Ratio: ${String.format("%.2f", bestRatio)} | Rect: ${String.format("%.2f", bestRectangularity)}",
+                    "Winner Secured."
                 ), screenRatio)
-                it.pauseAndShowStep("4단계: 데이터 수집용 맵", hudBmp)
+                it.pauseAndShowStep("4단계: 최종 스코어 맵", hudBmp)
                 debugMat.release(); debugBmp.recycle()
             }
 
@@ -544,7 +570,7 @@ object PlateDetectionEngine {
             val finalRatio = finalWidth / finalHeight
 
             var safeResultPts = finalPts
-            if (finalRatio < 1.8 || finalRatio > 7.0) {
+            if (finalRatio < 1.5 || finalRatio > 7.5) {
                 val fallbackPts = arrayOf(
                     Point(tightLeft.toDouble(), tightTop.toDouble()),
                     Point(tightRight.toDouble(), tightTop.toDouble()),
@@ -575,7 +601,7 @@ object PlateDetectionEngine {
                     Imgproc.putText(debugMat, labels[i], Point(safeResultPts[i].x - 20, safeResultPts[i].y - 20), Imgproc.FONT_HERSHEY_SIMPLEX, 2.0, colors[i], 4)
                 }
 
-                val statusLog = if (finalRatio < 1.8 || finalRatio > 7.0) "FALLBACK: Invalid ratio ($finalRatio)" else "SUCCESS: Valid ratio secured"
+                val statusLog = if (finalRatio < 1.5 || finalRatio > 7.5) "FALLBACK: Invalid ratio ($finalRatio)" else "SUCCESS: Valid ratio secured"
 
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
