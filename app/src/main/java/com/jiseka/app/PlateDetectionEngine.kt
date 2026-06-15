@@ -8,6 +8,7 @@ import android.util.Log
 import org.opencv.android.Utils
 import org.opencv.core.*
 import org.opencv.imgproc.Imgproc
+import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
@@ -202,11 +203,45 @@ object PlateDetectionEngine {
 
         srcLinePts.release(); dstLinePts.release()
 
+        // 🌟 Step 1 & 2 영구 복구
+        debugListener?.let {
+            val debugMat = fullMat.clone()
+            Imgproc.line(debugMat, Point(p1x, p1y), Point(p2x, p2y), Scalar(255.0, 255.0, 0.0, 255.0), 6)
+            
+            val tightRectPts = arrayOf(
+                Point(tightLeft.toDouble(), tightTop.toDouble()),
+                Point(tightRight.toDouble(), tightTop.toDouble()),
+                Point(tightRight.toDouble(), tightBottom.toDouble()),
+                Point(tightLeft.toDouble(), tightBottom.toDouble())
+            )
+            val invRotMat = Mat()
+            Imgproc.invertAffineTransform(rotMat, invRotMat)
+            val srcPts = MatOfPoint2f(*tightRectPts)
+            val dstPts = MatOfPoint2f()
+            Core.transform(srcPts, dstPts, invRotMat)
+            val fullPts = dstPts.toArray().map { Point(it.x + looseRect.x, it.y + looseRect.y) }
+            
+            for (i in 0..3) {
+                Imgproc.line(debugMat, fullPts[i], fullPts[(i + 1) % 4], Scalar(0.0, 200.0, 255.0, 255.0), 8)
+            }
+            
+            val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(debugMat, debugBmp)
+
+            val hudBmp = addDebugHUD(debugBmp, "Step 1 & 2: True Endpoint ROI Mapping", listOf(
+                "dx: ${dx.toInt()} px, dy: ${dy.toInt()} px",
+                "Rotation Angle: ${String.format("%.1f", angle)} deg",
+                "Status: Angle sign & swap bugs fixed!"
+            ), screenRatio)
+            
+            it.pauseAndShowStep("1~2단계: 실제 선분 기반 ROI 확정", hudBmp)
+            debugMat.release(); debugBmp.recycle(); invRotMat.release(); srcPts.release(); dstPts.release()
+        }
+
         // =====================================================================
-        // [3단계] OpenCV 윤곽선 탐지
+        // [3단계] OpenCV 윤곽선 탐지 
         // =====================================================================
         val thresh = Mat()
-        
         val openKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 3.0))
         val closeKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(18.0, 5.0))
         
@@ -215,22 +250,58 @@ object PlateDetectionEngine {
         var resultPoints: List<ImmutablePoint>? = null
 
         try {
-            // 3-1: 미디언 & 가우시안 블러
             Imgproc.medianBlur(tightGray, tightGray, 3)
             Imgproc.GaussianBlur(tightGray, thresh, Size(5.0, 5.0), 0.0)
             
-            // 3-2: 적응형 이진화
+            // 🌟 Step 3-1 영구 복구
+            debugListener?.let {
+                val debugMat = Mat()
+                Imgproc.cvtColor(thresh, debugMat, Imgproc.COLOR_GRAY2RGBA)
+                val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+                Utils.matToBitmap(debugMat, debugBmp)
+                val hudBmp = addDebugHUD(debugBmp, "Step 3-1: Blurs Applied", listOf(
+                    "Method: Median (3x3) + Gaussian (5x5)",
+                    "Status: Noise reduced"
+                ), screenRatio)
+                it.pauseAndShowStep("3-1단계: 블러 처리", hudBmp)
+                debugMat.release(); debugBmp.recycle()
+            }
+
             Imgproc.adaptiveThreshold(
                 thresh, thresh, 255.0, 
                 Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, 
                 Imgproc.THRESH_BINARY_INV, 31, 7.0
             )
             
-            // 3-3: 모폴로지 OPEN -> CLOSE
+            // 🌟 Step 3-2 영구 복구
+            debugListener?.let {
+                val debugMat = Mat()
+                Imgproc.cvtColor(thresh, debugMat, Imgproc.COLOR_GRAY2RGBA)
+                val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+                Utils.matToBitmap(debugMat, debugBmp)
+                val hudBmp = addDebugHUD(debugBmp, "Step 3-2: Adaptive Threshold", listOf(
+                    "Method: Gaussian_C, Block Size: 31, C: 7.0"
+                ), screenRatio)
+                it.pauseAndShowStep("3-2단계: 적응형 이진화", hudBmp)
+                debugMat.release(); debugBmp.recycle()
+            }
+
             Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_OPEN, openKernel)
             Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, closeKernel)
             
-            // RETR_LIST 유지 (내부/외부 모두 검출하여 데이터 수집)
+            // 🌟 Step 3-3 영구 복구
+            debugListener?.let {
+                val debugMat = Mat()
+                Imgproc.cvtColor(thresh, debugMat, Imgproc.COLOR_GRAY2RGBA)
+                val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+                Utils.matToBitmap(debugMat, debugBmp)
+                val hudBmp = addDebugHUD(debugBmp, "Step 3-3: Morphology Open + Close", listOf(
+                    "Open Kernel: 5x3, Close Kernel: 18x5"
+                ), screenRatio)
+                it.pauseAndShowStep("3-3단계: 모폴로지", hudBmp)
+                debugMat.release(); debugBmp.recycle()
+            }
+
             Imgproc.findContours(thresh, contours, hierarchy, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE)
 
             // =====================================================================
@@ -295,8 +366,6 @@ object PlateDetectionEngine {
                     continue 
                 }
 
-                // 기존의 타이트한 필터(0.60, 2.5~6.5)를 임시로 복구하거나 관대하게 둘 수 있지만, 
-                // 원인 분석이 목적이므로 사용자님 제안(0.42, 1.8~7.0)을 유지하되 점수 식은 단순화합니다.
                 if (ratio !in 1.8..7.0 || rectangularity < 0.42) {
                     Log.d("PLATE_DEBUG", " -> [ID: $i] REJECTED: Ratio/Rect Failed")
                     rejectedRects.add(Pair(i, pts))
@@ -304,8 +373,12 @@ object PlateDetectionEngine {
                     continue
                 }
 
-                // 매직 넘버 제거, 단순 Area 우선 스코어링 (원복)
-                val score = area * 0.5 + rectangularity * 1000.0
+                val centerX = tightGray.cols() / 2.0
+                val centerY = tightGray.rows() / 2.0
+                val dist = hypot(rect.center.x - centerX, rect.center.y - centerY)
+                val centerScore = 1000.0 - dist
+                
+                val score = (area * 0.3) + (rectangularity * 5000.0) - (abs(ratio - 3.5) * 400.0) + (centerScore * 3.0)
 
                 Log.d("PLATE_DEBUG", " -> [ID: $i] PASSED: Score = ${String.format("%.1f", score)}")
 
@@ -315,7 +388,7 @@ object PlateDetectionEngine {
                         val prevRect = Imgproc.minAreaRect(prevContour2f)
                         val prevPts = arrayOf(Point(), Point(), Point(), Point())
                         prevRect.points(prevPts)
-                        // 이전 승자의 인덱스는 따로 추적하지 않았으므로 -1 처리 (화면엔 그려짐)
+                        // 이전 승자의 인덱스는 추적하지 않았으므로 -1 (화면엔 ID 안 나옴, 박스만 나옴)
                         lowScoreRects.add(Pair(-1, prevPts)) 
                         prevContour2f.release()
                     }
@@ -323,6 +396,7 @@ object PlateDetectionEngine {
                     bestContour = contour
                     bestRatio = ratio
                     bestRectangularity = rectangularity
+                    Log.d("PLATE_DEBUG", " -> ✨ NEW BEST WINNER ✨")
                 } else {
                     lowScoreRects.add(Pair(i, pts))
                 }
@@ -331,7 +405,7 @@ object PlateDetectionEngine {
 
             Log.d("PLATE_DEBUG", "========== STEP 4: EVALUATION END ==========")
 
-            // 🌟 맵을 그릴 때 텍스트(ID)도 함께 렌더링하는 함수
+            // 🌟 맵을 그릴 때 텍스트(ID)도 함께 렌더링
             val drawFullMap = { bmp: Bitmap -> 
                 val canvasMat = Mat()
                 Utils.bitmapToMat(bmp, canvasMat)
@@ -484,10 +558,10 @@ object PlateDetectionEngine {
                     Imgproc.putText(debugMat, labels[i], Point(safeResultPts[i].x - 20, safeResultPts[i].y - 20), Imgproc.FONT_HERSHEY_SIMPLEX, 2.0, colors[i], 4)
                 }
 
+                val statusLog = if (finalRatio < 1.8 || finalRatio > 7.0) "FALLBACK: Invalid ratio ($finalRatio)" else "SUCCESS: Valid ratio secured"
+
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
-
-                val statusLog = if (finalRatio < 1.8 || finalRatio > 7.0) "FALLBACK: Invalid ratio ($finalRatio)" else "SUCCESS: Valid ratio secured"
 
                 val hudBmp = addDebugHUD(debugBmp, "Step 5: Final Evaluation & Output", listOf(
                     "Order: TL -> TR -> BR -> BL",
