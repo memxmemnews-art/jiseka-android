@@ -243,7 +243,7 @@ object PlateDetectionEngine {
         // =====================================================================
         val thresh = Mat()
         val openKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 3.0))
-        val closeKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(18.0, 5.0))
+        val closeKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(24.0, 5.0))
         
         val contours = ArrayList<MatOfPoint>()
         val hierarchy = Mat()
@@ -296,7 +296,7 @@ object PlateDetectionEngine {
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
                 val hudBmp = addDebugHUD(debugBmp, "Step 3-3: Morphology Open + Close", listOf(
-                    "Open Kernel: 5x3, Close Kernel: 18x5"
+                    "Open Kernel: 5x3, Close Kernel: 24x5"
                 ), screenRatio)
                 it.pauseAndShowStep("3-3단계: 모폴로지", hudBmp)
                 debugMat.release(); debugBmp.recycle()
@@ -305,20 +305,22 @@ object PlateDetectionEngine {
             Imgproc.findContours(thresh, contours, hierarchy, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE)
 
             // =====================================================================
-            // 🚀 [4단계] Visual ID Tagging & Data Collection 모드
+            // 🚀 [4단계] Visual ID Tagging & Data Collection 모드 (Scoring 고도화 반영)
             // =====================================================================
             var bestScore = -Double.MAX_VALUE
             var bestContour: MatOfPoint? = null
             var bestRatio = 0.0
             var bestRectangularity = 0.0
             
-            // 그릴 때 ID(인덱스)를 함께 그리기 위해 Pair 사용
             val rejectedRects = mutableListOf<Pair<Int, Array<Point>>>()
             val lowScoreRects = mutableListOf<Pair<Int, Array<Point>>>() 
             val borderTouchedRects = mutableListOf<Pair<Int, Array<Point>>>()
             val areaTooSmallRects = mutableListOf<Pair<Int, Array<Point>>>()
             
             var evaluatedCount = 0
+            val roiWidth = thresh.cols()
+            val roiHeight = thresh.rows()
+            val roiArea = roiWidth * roiHeight.toDouble()
 
             Log.d("PLATE_DEBUG", "========== STEP 4: CONTOUR EVALUATION START ==========")
 
@@ -340,55 +342,68 @@ object PlateDetectionEngine {
                 val pts = arrayOf(Point(), Point(), Point(), Point())
                 rect.points(pts)
 
-                val touchesBorder = 
-                    boundingRect.x <= 2 || 
-                    boundingRect.y <= 2 || 
-                    boundingRect.x + boundingRect.width >= thresh.cols() - 2 || 
-                    boundingRect.y + boundingRect.height >= thresh.rows() - 2
-
-                val isRoiBoundaryHalo = 
-                    boundingRect.width >= thresh.cols() - 10 && 
-                    boundingRect.height >= thresh.rows() - 10
-
-                // 🌟 핵심 로그: 모든 후보의 스펙을 그대로 출력
-                Log.d("PLATE_DEBUG", "Contour[$i]: area=${String.format("%.1f", area)} | rectArea=${String.format("%.1f", rectArea)} | ratio=${String.format("%.2f", ratio)} | rectang=${String.format("%.2f", rectangularity)}")
-
-                if (touchesBorder || isRoiBoundaryHalo) {
-                    Log.d("PLATE_DEBUG", " -> [ID: $i] REJECTED: Touches Border or Halo")
-                    borderTouchedRects.add(Pair(i, pts))
-                    contour2f.release()
-                    continue
-                }
-
+                // 1. 너무 작은 노이즈 1차 필터링
                 if (area < 500) {
                     areaTooSmallRects.add(Pair(i, pts))
                     contour2f.release()
                     continue 
                 }
 
+                // 2. 기본 형태(비율, 직사각형성) 미달 필터링
                 if (ratio !in 1.8..7.0 || rectangularity < 0.42) {
-                    Log.d("PLATE_DEBUG", " -> [ID: $i] REJECTED: Ratio/Rect Failed")
+                    Log.d("PLATE_DEBUG", " -> [ID: $i] REJECTED: Ratio/Rect Failed (Ratio: ${String.format("%.2f", ratio)}, Rect: ${String.format("%.2f", rectangularity)})")
                     rejectedRects.add(Pair(i, pts))
                     contour2f.release()
                     continue
                 }
 
-                val centerX = tightGray.cols() / 2.0
-                val centerY = tightGray.rows() / 2.0
+                // 3. Boundary Halo 고도화 탐지 (비율 및 접촉면 기반)
+                val widthRatio = boundingRect.width.toDouble() / roiWidth
+                val heightRatio = boundingRect.height.toDouble() / roiHeight
+                
+                var borderHits = 0
+                if (boundingRect.x <= roiWidth * 0.02) borderHits++
+                if (boundingRect.y <= roiHeight * 0.05) borderHits++
+                if (boundingRect.x + boundingRect.width >= roiWidth * 0.98) borderHits++
+                if (boundingRect.y + boundingRect.height >= roiHeight * 0.95) borderHits++
+
+                val isBoundaryHalo = (widthRatio > 0.90 && heightRatio > 0.80) || (borderHits >= 3)
+                
+                // 4. 면적 점수 정규화 (절대값이 아닌 ROI 대비 비율 사용)
+                val areaRatio = area / roiArea
+                val areaScore = when {
+                    areaRatio < 0.05 -> -500.0   // 너무 작음
+                    areaRatio > 0.80 -> -500.0   // 너무 큼
+                    else -> 1000.0 * areaRatio   // 적정 수준 내에서 면적당 가점 (상대적으로 낮춤)
+                }
+
+                // 5. 중심성, 형태 점수 계산
+                val centerX = roiWidth / 2.0
+                val centerY = roiHeight / 2.0
                 val dist = hypot(rect.center.x - centerX, rect.center.y - centerY)
                 val centerScore = 1000.0 - dist
                 
-                val score = (area * 0.3) + (rectangularity * 5000.0) - (abs(ratio - 3.5) * 400.0) + (centerScore * 3.0)
+                val rectScore = rectangularity * 5000.0
+                val aspectScore = -abs(ratio - 3.5) * 400.0
 
-                Log.d("PLATE_DEBUG", " -> [ID: $i] PASSED: Score = ${String.format("%.1f", score)}")
+                // 6. 최종 점수 합산
+                var score = areaScore + rectScore + aspectScore + (centerScore * 3.0)
+
+                // Halo 페널티 부여 (강제 제거 대신 점수 대폭 삭감)
+                if (isBoundaryHalo) {
+                    score -= 3000.0
+                    Log.d("PLATE_DEBUG", " -> [ID: $i] HALO PENALTY APPLIED: borderHits=$borderHits, wRatio=${String.format("%.2f", widthRatio)}, hRatio=${String.format("%.2f", heightRatio)}")
+                    borderTouchedRects.add(Pair(i, pts)) // 파란색 박스 표기용
+                }
+
+                Log.d("PLATE_DEBUG", "Contour[$i]: areaRatio=${String.format("%.2f", areaRatio)} | ratio=${String.format("%.2f", ratio)} | rectang=${String.format("%.2f", rectangularity)} | Score=${String.format("%.1f", score)}")
 
                 if (score > bestScore) {
                     if (bestContour != null) {
-                        val prevContour2f = MatOfPoint2f(*bestContour.toArray())
+                        val prevContour2f = MatOfPoint2f(*bestContour!!.toArray())
                         val prevRect = Imgproc.minAreaRect(prevContour2f)
                         val prevPts = arrayOf(Point(), Point(), Point(), Point())
                         prevRect.points(prevPts)
-                        // 이전 승자의 인덱스는 추적하지 않았으므로 -1 (화면엔 ID 안 나옴, 박스만 나옴)
                         lowScoreRects.add(Pair(-1, prevPts)) 
                         prevContour2f.release()
                     }
@@ -398,7 +413,9 @@ object PlateDetectionEngine {
                     bestRectangularity = rectangularity
                     Log.d("PLATE_DEBUG", " -> ✨ NEW BEST WINNER ✨")
                 } else {
-                    lowScoreRects.add(Pair(i, pts))
+                    if (!isBoundaryHalo) { // Halo로 분류된 애들은 borderTouchedRects로 빠졌으므로 제외
+                        lowScoreRects.add(Pair(i, pts))
+                    }
                 }
                 contour2f.release()
             }
@@ -466,7 +483,7 @@ object PlateDetectionEngine {
             }
 
             val rawPoints = arrayOf(Point(), Point(), Point(), Point())
-            val finalContour2f = MatOfPoint2f(*bestContour.toArray())
+            val finalContour2f = MatOfPoint2f(*bestContour!!.toArray())
             val minRect = Imgproc.minAreaRect(finalContour2f)
             minRect.points(rawPoints)
             finalContour2f.release()
