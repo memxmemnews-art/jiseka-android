@@ -62,29 +62,31 @@ object PlateDetectionEngine {
         val combinedBmp = Bitmap.createBitmap(canvasWidth, canvasHeight, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(combinedBmp)
         
-        val bgPaint = Paint().apply { color = Color.parseColor("#E6000000") }
+        val bgPaint = Paint().apply { color = Color.parseColor("#E6000000") } // 반투명 검정 배경
         canvas.drawRect(0f, 0f, canvasWidth.toFloat(), canvasHeight.toFloat(), bgPaint)
 
         val paint = Paint().apply {
             color = Color.WHITE
-            textSize = 45f
+            textSize = 38f // 많은 텍스트를 위해 폰트 사이즈 소폭 축소
             isAntiAlias = true
             setShadowLayer(5f, 0f, 0f, Color.BLACK)
         }
 
-        val paddingX = 120f
-        val lineHeight = 65f
+        val paddingX = 80f
+        val lineHeight = 55f
         val maxTextWidth = canvasWidth - (paddingX * 2)
-        var currentY = 120f 
+        var currentY = 100f 
         
         paint.color = Color.YELLOW
         paint.isFakeBoldText = true
+        paint.textSize = 45f
         currentY = drawTextWithWrap(canvas, title, paddingX, currentY, paint, maxTextWidth, lineHeight)
 
-        currentY += 15f 
+        currentY += 20f 
 
         paint.color = Color.WHITE
         paint.isFakeBoldText = false
+        paint.textSize = 35f
         for (log in logs) {
             currentY = drawTextWithWrap(canvas, log, paddingX, currentY, paint, maxTextWidth, lineHeight)
         }
@@ -108,8 +110,8 @@ object PlateDetectionEngine {
             val imgX = (canvasWidth - scaledWidth) / 2f
             val imgY = textBottom + (maxImgHeight - scaledHeight) / 2f
 
-            val borderPaint = Paint().apply { color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = 5f }
-            canvas.drawRect(imgX - 2f, imgY - 2f, imgX + scaledWidth + 2f, imgY + scaledHeight + 2f, borderPaint)
+            val borderPaint = Paint().apply { color = Color.CYAN; style = Paint.Style.STROKE; strokeWidth = 6f }
+            canvas.drawRect(imgX - 3f, imgY - 3f, imgX + scaledWidth + 3f, imgY + scaledHeight + 3f, borderPaint)
             
             canvas.drawBitmap(scaledImg, imgX, imgY, null)
             scaledImg.recycle()
@@ -118,36 +120,53 @@ object PlateDetectionEngine {
         return combinedBmp
     }
 
-    fun rescuePlateFromLine(
+    fun rescuePlateFromPoint(
         fullBitmap: Bitmap, 
-        startX: Float, startY: Float, 
-        endX: Float, endY: Float,
+        touchX: Float, touchY: Float, 
         debugListener: DetectionDebugListener? = null
     ): List<ImmutablePoint>? {
         
-        val fullMat = Mat()
-        val fullGray = Mat()
+        val fullMat = Mat(); val fullGray = Mat()
         Utils.bitmapToMat(fullBitmap, fullMat)
         Imgproc.cvtColor(fullMat, fullGray, Imgproc.COLOR_RGBA2GRAY)
 
         val screenRatio = fullMat.rows().toFloat() / fullMat.cols().toFloat()
 
-        val p1x = startX.toDouble()
-        val p1y = startY.toDouble()
-        val p2x = endX.toDouble()
-        val p2y = endY.toDouble()
+        // =====================================================================
+        // 🚀 [Step 1] 터치 좌표 확인
+        // =====================================================================
+        val cx = touchX.toDouble()
+        val cy = touchY.toDouble()
 
-        val dx = p2x - p1x
-        val dy = p2y - p1y
-        val lineLen = hypot(dx, dy)
-        val cx = (p1x + p2x) / 2.0
-        val cy = (p1y + p2y) / 2.0
+        debugListener?.let {
+            val debugMat = fullMat.clone()
+            Imgproc.circle(debugMat, Point(cx, cy), 20, Scalar(255.0, 0.0, 0.0, 255.0), -1)
+            Imgproc.circle(debugMat, Point(cx, cy), 25, Scalar(255.0, 255.0, 255.0, 255.0), 4)
+            val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(debugMat, debugBmp)
+            val hudBmp = addDebugHUD(debugBmp, "Step 1: User Touch Point", listOf(
+                "Action: 터치 좌표 수신 완료",
+                "Touch Point X: ${cx.toInt()} px", 
+                "Touch Point Y: ${cy.toInt()} px",
+                "Resolution: ${fullMat.cols()} x ${fullMat.rows()}"
+            ), screenRatio)
+            it.pauseAndShowStep("1단계: 터치 좌표 매핑", hudBmp)
+            debugMat.release(); debugBmp.recycle()
+        }
 
-        val looseSize = lineLen * 2.0 
-        val looseLeft = (cx - looseSize / 2.0).toInt().coerceIn(0, fullMat.cols() - 1)
-        val looseTop = (cy - looseSize / 2.0).toInt().coerceIn(0, fullMat.rows() - 1)
-        val looseRight = (cx + looseSize / 2.0).toInt().coerceIn(1, fullMat.cols())
-        val looseBottom = (cy + looseSize / 2.0).toInt().coerceIn(1, fullMat.rows())
+        // =====================================================================
+        // 🚀 [Step 2] 8% ROI (4:1) 영역 설정
+        // =====================================================================
+        val screenArea = fullMat.rows() * fullMat.cols()
+        val targetArea = screenArea * 0.08
+        
+        val roiHeight = Math.sqrt(targetArea / 4.0).toInt()
+        val roiWidth = roiHeight * 4
+
+        val looseLeft = (cx - roiWidth / 2.0).toInt().coerceIn(0, fullMat.cols() - 1)
+        val looseTop = (cy - roiHeight / 2.0).toInt().coerceIn(0, fullMat.rows() - 1)
+        val looseRight = (cx + roiWidth / 2.0).toInt().coerceIn(1, fullMat.cols())
+        val looseBottom = (cy + roiHeight / 2.0).toInt().coerceIn(1, fullMat.rows())
 
         val looseRect = Rect(looseLeft, looseTop, looseRight - looseLeft, looseBottom - looseTop)
         
@@ -155,40 +174,116 @@ object PlateDetectionEngine {
         fullMat.submat(looseRect).copyTo(looseMat)
         fullGray.submat(looseRect).copyTo(looseGray)
 
-        val roiCx = cx - looseLeft
-        val roiCy = cy - looseTop
+        debugListener?.let {
+            val debugMat = fullMat.clone()
+            Imgproc.rectangle(debugMat, looseRect, Scalar(0.0, 255.0, 0.0, 255.0), 8)
+            val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(debugMat, debugBmp)
+            val hudBmp = addDebugHUD(debugBmp, "Step 2: Loose ROI (8% Area)", listOf(
+                "Calculated Area: ${targetArea.toInt()} pixels",
+                "ROI Width: $roiWidth px (Ratio 4)",
+                "ROI Height: $roiHeight px (Ratio 1)",
+                "Rect Bounds: [L:$looseLeft, T:$looseTop, R:$looseRight, B:$looseBottom]"
+            ), screenRatio)
+            it.pauseAndShowStep("2단계: 8% 탐색 구역(Loose ROI) 설정", hudBmp)
+            debugMat.release(); debugBmp.recycle()
+        }
 
-        val angle = Math.toDegrees(Math.atan2(dy, dx))
-        val rotMat = Imgproc.getRotationMatrix2D(Point(roiCx, roiCy), angle, 1.0)
+        // =====================================================================
+        // 🚀 [Step 3 & 4] 글자 탐색을 위한 1차 이진화 및 모폴로지
+        // =====================================================================
+        val thresh = Mat()
+        Imgproc.medianBlur(looseGray, looseGray, 3)
+        Imgproc.GaussianBlur(looseGray, thresh, Size(5.0, 5.0), 0.0)
+        Imgproc.adaptiveThreshold(thresh, thresh, 255.0, Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, Imgproc.THRESH_BINARY_INV, 31, 7.0)
 
+        val tempOpen = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
+        val tempClose = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 5.0))
+        Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_OPEN, tempOpen)
+        Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
+        
+        // =====================================================================
+        // 🚀 [Step 5] 문자 중심점 및 기울기 도출
+        // =====================================================================
+        val tempContours = ArrayList<MatOfPoint>()
+        val tempHierarchy = Mat()
+        Imgproc.findContours(thresh, tempContours, tempHierarchy, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE)
+
+        class CharData(val center: Point, val width: Double, val height: Double, val rect: Rect)
+        val charList = mutableListOf<CharData>()
+
+        for (contour in tempContours) {
+            val rect = Imgproc.boundingRect(contour)
+            val area = rect.area()
+            val ratio = rect.height.toDouble() / max(rect.width.toDouble(), 1.0)
+
+            if (ratio in 1.1..4.5 && area > 50 && area < looseRect.area() * 0.1) {
+                val center = Point(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
+                charList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect))
+            }
+        }
+        tempContours.forEach { it.release() }; tempHierarchy.release(); tempOpen.release(); tempClose.release()
+
+        var angle = 0.0
+        var tightLeft = 0; var tightRight = looseRect.width
+        var tightTop = 0; var tightBottom = looseRect.height
+
+        if (charList.size >= 2) {
+            val pointsMat = MatOfPoint2f(*charList.map { it.center }.toTypedArray())
+            val line = Mat()
+            Imgproc.fitLine(pointsMat, line, Imgproc.DIST_L2, 0.0, 0.01, 0.01)
+            val vx = line.get(0, 0)[0]; val vy = line.get(1, 0)[0]
+            angle = Math.toDegrees(Math.atan2(vy, vx))
+            
+            val tempRotMat = Imgproc.getRotationMatrix2D(Point(looseRect.width / 2.0, looseRect.height / 2.0), angle, 1.0)
+            val dstCenterPts = MatOfPoint2f()
+            Core.transform(pointsMat, dstCenterPts, tempRotMat)
+            
+            val rotCenters = dstCenterPts.toArray()
+            val minX = rotCenters.minOf { it.x }
+            val maxX = rotCenters.maxOf { it.x }
+            val avgY = rotCenters.map { it.y }.average()
+            val avgH = charList.map { it.height }.average()
+            val textSpreadWidth = maxX - minX
+            
+            // 💡 [개선점] 번호판 외부 '하얀색 테두리'가 잘리지 않도록 Padding을 매우 넉넉하게 확보 (상하 2배, 좌우 1.5배)
+            val expectedHeight = max(avgH * 3.5, 100.0) 
+            val marginX = max(textSpreadWidth * 0.25, avgH * 2.5)
+
+            tightLeft = (minX - marginX).toInt()
+            tightRight = (maxX + marginX).toInt()
+            tightTop = (avgY - expectedHeight / 2.0).toInt()
+            tightBottom = (avgY + expectedHeight / 2.0).toInt()
+            
+            debugListener?.let {
+                val debugMat = looseMat.clone()
+                val x0 = line.get(2, 0)[0]; val y0 = line.get(3, 0)[0]
+                val pt1 = Point(x0 - vx * 1000, y0 - vy * 1000)
+                val pt2 = Point(x0 + vx * 1000, y0 + vy * 1000)
+                Imgproc.line(debugMat, pt1, pt2, Scalar(0.0, 255.0, 0.0, 255.0), 3)
+                for (charData in charList) Imgproc.circle(debugMat, charData.center, 5, Scalar(255.0, 0.0, 0.0, 255.0), -1)
+                
+                val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+                Utils.matToBitmap(debugMat, debugBmp)
+                val hudBmp = addDebugHUD(debugBmp, "Step 3~5: Text Alignment & Fitting", listOf(
+                    "Valid Characters Found: ${charList.size}",
+                    "Average Char Height: ${String.format("%.1f", avgH)} px",
+                    "Calculated Rotation Angle: ${String.format("%.2f", angle)} deg",
+                    "Padding added to preserve outer border"
+                ), screenRatio)
+                it.pauseAndShowStep("3~5단계: 문자 탐색 및 기울기 계산", hudBmp)
+                debugMat.release(); debugBmp.recycle()
+            }
+            pointsMat.release(); line.release(); tempRotMat.release(); dstCenterPts.release()
+        }
+
+        // =====================================================================
+        // 🚀 [Step 6 & 7] 회전 및 넉넉한 Tight ROI 추출
+        // =====================================================================
+        val rotMat = Imgproc.getRotationMatrix2D(Point(looseRect.width / 2.0, looseRect.height / 2.0), angle, 1.0)
         val rotatedLooseMat = Mat(); val rotatedLooseGray = Mat()
         Imgproc.warpAffine(looseMat, rotatedLooseMat, rotMat, looseMat.size(), Imgproc.INTER_LINEAR)
         Imgproc.warpAffine(looseGray, rotatedLooseGray, rotMat, looseGray.size(), Imgproc.INTER_LINEAR)
-
-        val srcLinePts = MatOfPoint2f(
-            Point(p1x - looseLeft, p1y - looseTop),
-            Point(p2x - looseLeft, p2y - looseTop)
-        )
-        val dstLinePts = MatOfPoint2f()
-        Core.transform(srcLinePts, dstLinePts, rotMat)
-
-        val rotLinePts = dstLinePts.toArray()
-        val rotP1 = rotLinePts[0]
-        val rotP2 = rotLinePts[1]
-
-        val minX = min(rotP1.x, rotP2.x)
-        val maxX = max(rotP1.x, rotP2.x)
-        val rotLineLen = maxX - minX
-
-        val marginX = rotLineLen * 0.10
-        var tightLeft = (minX - marginX).toInt()
-        var tightRight = (maxX + marginX).toInt()
-        val tightWidth = tightRight - tightLeft
-
-        val midY = (rotP1.y + rotP2.y) / 2.0
-        val expectedHeight = max(tightWidth / 3.0, 80.0) 
-        var tightTop = (midY - expectedHeight / 2.0).toInt()
-        var tightBottom = (midY + expectedHeight / 2.0).toInt()
 
         tightLeft = tightLeft.coerceIn(0, rotatedLooseMat.cols() - 1)
         tightRight = tightRight.coerceIn(1, rotatedLooseMat.cols())
@@ -196,452 +291,235 @@ object PlateDetectionEngine {
         tightBottom = tightBottom.coerceIn(1, rotatedLooseMat.rows())
 
         val tightRect = Rect(tightLeft, tightTop, tightRight - tightLeft, tightBottom - tightTop)
-
         val tightMat = Mat(); val tightGray = Mat()
         rotatedLooseMat.submat(tightRect).copyTo(tightMat)
         rotatedLooseGray.submat(tightRect).copyTo(tightGray)
 
-        srcLinePts.release(); dstLinePts.release()
-
         debugListener?.let {
-            val debugMat = fullMat.clone()
-            Imgproc.line(debugMat, Point(p1x, p1y), Point(p2x, p2y), Scalar(255.0, 255.0, 0.0, 255.0), 6)
-            
-            val tightRectPts = arrayOf(
-                Point(tightLeft.toDouble(), tightTop.toDouble()),
-                Point(tightRight.toDouble(), tightTop.toDouble()),
-                Point(tightRight.toDouble(), tightBottom.toDouble()),
-                Point(tightLeft.toDouble(), tightBottom.toDouble())
-            )
-            val invRotMat = Mat()
-            Imgproc.invertAffineTransform(rotMat, invRotMat)
-            val srcPts = MatOfPoint2f(*tightRectPts)
-            val dstPts = MatOfPoint2f()
-            Core.transform(srcPts, dstPts, invRotMat)
-            val fullPts = dstPts.toArray().map { Point(it.x + looseRect.x, it.y + looseRect.y) }
-            
-            for (i in 0..3) {
-                Imgproc.line(debugMat, fullPts[i], fullPts[(i + 1) % 4], Scalar(0.0, 200.0, 255.0, 255.0), 8)
-            }
-            
+            val debugMat = rotatedLooseMat.clone()
+            Imgproc.rectangle(debugMat, tightRect, Scalar(255.0, 165.0, 0.0, 255.0), 6)
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
-
-            val hudBmp = addDebugHUD(debugBmp, "Step 1 & 2: True Endpoint ROI Mapping", listOf(
-                "dx: ${dx.toInt()} px, dy: ${dy.toInt()} px",
-                "Rotation Angle: ${String.format("%.1f", angle)} deg"
+            val hudBmp = addDebugHUD(debugBmp, "Step 6~7: Rotated & Expanded ROI", listOf(
+                "Image leveled to 0 degrees.",
+                "Tight ROI size: ${tightRect.width} x ${tightRect.height}",
+                "Ready for Canny Edge Detection."
             ), screenRatio)
-            
-            it.pauseAndShowStep("1~2단계: 실제 선분 기반 ROI 확정", hudBmp)
-            debugMat.release(); debugBmp.recycle(); invRotMat.release(); srcPts.release(); dstPts.release()
+            it.pauseAndShowStep("6~7단계: 수평 회전 및 넉넉한 탐색 영역 확정", hudBmp)
+            debugMat.release(); debugBmp.recycle()
         }
 
-        val thresh = Mat()
-        val openKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 3.0))
-        
-        // 💡 [수정됨] 4% 비율 + 하드 클램프 (그릴 과융합 방지용 보수적 커널)
-        val dynamicKernelWidth = (tightGray.cols() * 0.04).coerceIn(20.0, 36.0)
-        val closeKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(dynamicKernelWidth, 5.0))
-        
+        // =====================================================================
+        // 🚀 [Step 8 & 9] 진짜 테두리 찾기 (Canny Edge + Dilate)
+        // =====================================================================
+        val edges = Mat()
+        val dilateKernel = Imgproc.getStructuringElement(Imgproc.MORPH_CROSS, Size(5.0, 5.0)) // 끊어진 선 잇기
         val contours = ArrayList<MatOfPoint>()
         val hierarchy = Mat()
         var resultPoints: List<ImmutablePoint>? = null
 
         try {
-            Imgproc.medianBlur(tightGray, tightGray, 3)
-            Imgproc.GaussianBlur(tightGray, thresh, Size(5.0, 5.0), 0.0)
-            
-            Imgproc.adaptiveThreshold(
-                thresh, thresh, 255.0, 
-                Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                Imgproc.THRESH_BINARY_INV, 31, 7.0
-            )
-            
-            Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_OPEN, openKernel)
-            Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, closeKernel)
-            
+            // 노이즈 제거 후 강한 명암 대비를 가진 '선(Edge)' 추출
+            Imgproc.GaussianBlur(tightGray, tightGray, Size(5.0, 5.0), 0.0)
+            Imgproc.Canny(tightGray, edges, 60.0, 180.0) // 약간 깐깐한 엣지 검출
+            Imgproc.dilate(edges, edges, dilateKernel) // 끊어진 번호판 테두리 강제 연결
+
             debugListener?.let {
                 val debugMat = Mat()
-                Imgproc.cvtColor(thresh, debugMat, Imgproc.COLOR_GRAY2RGBA)
+                Imgproc.cvtColor(edges, debugMat, Imgproc.COLOR_GRAY2RGBA)
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "Step 3: Morphology (Open + Close)", listOf(
-                    "Adaptive Thresh -> Open (5x3) -> Close (${dynamicKernelWidth.toInt()}x5)"
+                val hudBmp = addDebugHUD(debugBmp, "Step 8~9: Canny Edge & Dilation", listOf(
+                    "Method: Canny(60, 180) + Dilate(5x5 Cross)",
+                    "Target: Extract unbroken outer white border of the plate.",
+                    "Result: Binary line map generated."
                 ), screenRatio)
-                it.pauseAndShowStep("3단계: 모폴로지 (Threshold+Morph)", hudBmp)
+                it.pauseAndShowStep("8~9단계: 번호판 물리적 테두리(Edge) 추출", hudBmp)
                 debugMat.release(); debugBmp.recycle()
             }
 
-            Imgproc.findContours(thresh, contours, hierarchy, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE)
+            // =====================================================================
+            // 🚀 [Step 10] 윤곽선 계층(Hierarchy) 구조 탐색 및 채점
+            // =====================================================================
+            // RETR_TREE: 외곽선뿐만 아니라 내부에 포함된 자식 윤곽선 관계까지 모두 구조화
+            Imgproc.findContours(edges, contours, hierarchy, Imgproc.RETR_TREE, Imgproc.CHAIN_APPROX_SIMPLE)
 
-            // =====================================================================
-            // 🚀 [4단계] 앙상블 스코어링 (Plate Body 45% + Text Density 35% + Center 20%)
-            // =====================================================================
             var bestScore = -Double.MAX_VALUE
             var bestContour: MatOfPoint? = null
             var bestRatio = 0.0
-            var bestRectangularity = 0.0
+            var bestChildCount = 0
             
             val rejectedRects = mutableListOf<Pair<Int, Array<Point>>>()
             val lowScoreRects = mutableListOf<Pair<Int, Array<Point>>>() 
-            val borderTouchedRects = mutableListOf<Pair<Int, Array<Point>>>()
-            val areaTooSmallRects = mutableListOf<Pair<Int, Array<Point>>>()
-            
-            val roiWidth = thresh.cols()
-            val roiHeight = thresh.rows()
-            val allRects = contours.map { Imgproc.boundingRect(it) }
 
-            Log.d("PLATE_DEBUG", "========== STEP 4: CONTOUR EVALUATION ==========")
+            Log.d("PLATE_DEBUG", "========== STEP 10: HIERARCHY EVALUATION ==========")
+            Log.d("PLATE_DEBUG", "Total Contours Found: ${contours.size}")
 
             for (i in contours.indices) {
                 val contour = contours[i]
-                val boundingRect = allRects[i]
-                val area = Imgproc.contourArea(contour)
-
                 val contour2f = MatOfPoint2f(*contour.toArray())
                 val rect = Imgproc.minAreaRect(contour2f)
 
                 val w = rect.size.width
                 val h = rect.size.height
                 val ratio = max(w, h) / max(min(w, h), 1.0)
-                val rectangularity = area / max(w * h, 1.0)
-                
+                val boxArea = w * h
+                val perimeter = Imgproc.arcLength(contour2f, true)
+                val expectedPerimeter = 2 * (w + h)
+                val perimeterRatio = perimeter / max(expectedPerimeter, 1.0) 
+
                 val pts = arrayOf(Point(), Point(), Point(), Point())
                 rect.points(pts)
 
-                if (area < 500) {
-                    areaTooSmallRects.add(Pair(i, pts))
-                    contour2f.release()
-                    continue 
-                }
-
-                if (ratio !in 1.5..7.5 || rectangularity < 0.30) {
+                // 1. 기본 필터링 (너무 작거나 비율이 안 맞으면 탈락)
+                if (boxArea < 2000 || ratio !in 1.5..7.5 || perimeterRatio < 0.7 || perimeterRatio > 1.5) {
                     rejectedRects.add(Pair(i, pts))
                     contour2f.release()
                     continue
                 }
 
-                // 1. Text Density (자식 윤곽선 탐색)
-                var validChildCount = 0
-                var minChildX = Int.MAX_VALUE
-                var maxChildX = Int.MIN_VALUE
-
-                for (j in allRects.indices) {
-                    if (i == j) continue
-                    val child = allRects[j]
-                    if (child.x >= boundingRect.x - 2 && child.y >= boundingRect.y - 2 && 
-                        child.x + child.width <= boundingRect.x + boundingRect.width + 2 && 
-                        child.y + child.height <= boundingRect.y + boundingRect.height + 2) {
-                        
-                        val isTallEnough = child.height >= boundingRect.height * 0.25
-                        val isNotTooWide = child.width <= child.height * 2.5
-                        val isNotTooLarge = child.area() <= boundingRect.area() * 0.3
-                        
-                        if (isTallEnough && isNotTooWide && isNotTooLarge) {
-                            validChildCount++
-                            minChildX = min(minChildX, child.x)
-                            maxChildX = max(maxChildX, child.x + child.width)
-                        }
+                // 2. Hierarchy 파악: 이 윤곽선 '내부'에 자식(글자/숫자)이 몇 개나 있는가?
+                var childCount = 0
+                val node = hierarchy.get(0, i)
+                if (node != null) {
+                    var childIdx = node[2].toInt() // 첫 번째 자식의 인덱스 (First Child)
+                    while (childIdx != -1) {
+                        childCount++
+                        val childNode = hierarchy.get(0, childIdx)
+                        if (childNode != null) {
+                            childIdx = childNode[0].toInt() // 다음 형제 노드로 이동 (Next Sibling)
+                        } else break
                     }
                 }
 
-                var coverageRatio = 0.0
-                if (validChildCount >= 2) {
-                    val coverageWidth = maxChildX - minChildX
-                    coverageRatio = coverageWidth.toDouble() / boundingRect.width
-                }
-
-                // 🌟 가중치 기반 스코어링 (총점 10000점 만점 기준)
+                // 3. 스코어링 (모양 정확도 + 중앙 집중도)
+                val shapeScore = max(0.0, 1.0 - Math.abs(1.0 - perimeterRatio)) * 3000.0 
+                val dist = Math.hypot(rect.center.x - tightGray.cols() / 2.0, rect.center.y - tightGray.rows() / 2.0)
+                val centerBiasScore = max(0.0, 1.0 - (dist / Math.hypot(tightGray.cols() / 2.0, tightGray.rows() / 2.0))) * 2000.0
                 
-                // [1] Plate Body (45%) -> 최대 4500점
-                val plateBodyScore = (rectangularity * 4500.0) - (abs(ratio - 3.5) * 500.0)
-
-                // [2] Text Density & Coverage (35%) -> 최대 3500점
-                var textDensityScore = 0.0
-                when (validChildCount) {
-                    in 5..12 -> textDensityScore += 2000.0
-                    in 3..4 -> textDensityScore += 800.0
-                    in 13..25 -> textDensityScore += 400.0
-                }
-                if (validChildCount >= 2 && coverageRatio > 0.4) {
-                    textDensityScore += (coverageRatio * 1500.0)
+                // 💡 [핵심 보너스] 자식(문자)을 3개 이상 품고 있다면 번호판 외부 테두리일 확률 99%!
+                var hierarchyBonus = 0.0
+                if (childCount in 3..30) {
+                    hierarchyBonus = childCount * 2500.0 // 압도적인 가산점 부여
+                } else if (childCount == 0) {
+                    // 자식이 하나도 없으면 단순한 선이거나 빈 공간이므로 감점
+                    hierarchyBonus = -5000.0
                 }
 
-                // [3] Center Bias (20%) -> 최대 2000점
-                val centerX = roiWidth / 2.0
-                val centerY = roiHeight / 2.0
-                val dist = hypot(rect.center.x - centerX, rect.center.y - centerY)
-                val maxDist = hypot(roiWidth / 2.0, roiHeight / 2.0)
-                val centerBiasScore = max(0.0, 1.0 - (dist / maxDist)) * 2000.0
+                val finalScore = shapeScore + centerBiasScore + hierarchyBonus
 
-                // 오버플로우 패널티 및 Halo 방어
-                val overflowRatioX = max(0.0, (roiWidth * 0.03 - boundingRect.x)) + max(0.0, (boundingRect.x + boundingRect.width) - (roiWidth - roiWidth * 0.03)) / boundingRect.width
-                val overflowRatioY = max(0.0, (roiHeight * 0.05 - boundingRect.y)) + max(0.0, (boundingRect.y + boundingRect.height) - (roiHeight - roiHeight * 0.05)) / boundingRect.height
-                val overflowPenalty = (overflowRatioX + overflowRatioY) * 1500.0
+                Log.d("PLATE_DEBUG", "ID[$i] Score:${String.format("%.0f", finalScore)} | Ratio:${String.format("%.1f", ratio)} | Children:$childCount")
 
-                val isBoundaryHalo = (boundingRect.width.toDouble() / roiWidth > 0.90 && boundingRect.height.toDouble() / roiHeight > 0.80)
-
-                var finalScore = plateBodyScore + textDensityScore + centerBiasScore - overflowPenalty
-
-                if (isBoundaryHalo) {
-                    finalScore -= 5000.0 
-                    borderTouchedRects.add(Pair(i, pts))
-                }
-
-                Log.d("PLATE_DEBUG", "ID[$i] total:${String.format("%.0f", finalScore)} | Body:${String.format("%.0f", plateBodyScore)} | Text:${String.format("%.0f", textDensityScore)} | Center:${String.format("%.0f", centerBiasScore)}")
-
-                if (finalScore > bestScore) {
+                if (finalScore > bestScore && childCount > 0) {
                     if (bestContour != null) {
                         val prevContour2f = MatOfPoint2f(*bestContour!!.toArray())
-                        val prevRect = Imgproc.minAreaRect(prevContour2f)
                         val prevPts = arrayOf(Point(), Point(), Point(), Point())
-                        prevRect.points(prevPts)
+                        Imgproc.minAreaRect(prevContour2f).points(prevPts)
                         lowScoreRects.add(Pair(-1, prevPts)) 
                         prevContour2f.release()
                     }
                     bestScore = finalScore
                     bestContour = contour
                     bestRatio = ratio
-                    bestRectangularity = rectangularity
+                    bestChildCount = childCount
                 } else {
-                    if (!isBoundaryHalo) lowScoreRects.add(Pair(i, pts))
+                    lowScoreRects.add(Pair(i, pts))
                 }
                 contour2f.release()
             }
 
-            val drawFullMap = { bmp: Bitmap -> 
-                val canvasMat = Mat()
-                Utils.bitmapToMat(bmp, canvasMat)
-                
-                val colorRed = Scalar(255.0, 0.0, 0.0, 255.0)       
-                val colorOrange = Scalar(255.0, 165.0, 0.0, 255.0) 
-                val colorBlue = Scalar(0.0, 0.0, 255.0, 255.0)     
-                val colorYellow = Scalar(255.0, 255.0, 0.0, 255.0)   
-                val colorGreen = Scalar(0.0, 255.0, 0.0, 255.0)    
-
-                val drawRectWithId = { list: List<Pair<Int, Array<Point>>>, color: Scalar ->
-                    for (item in list) {
-                        val id = item.first
-                        val pts = item.second
-                        for (i in 0..3) Imgproc.line(canvasMat, pts[i], pts[(i + 1) % 4], color, 2)
-                        if (id >= 0) { 
-                            Imgproc.putText(canvasMat, "$id", Point(pts[1].x, pts[1].y - 5), Imgproc.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-                        }
-                    }
-                }
-
-                drawRectWithId(rejectedRects, colorRed)
-                drawRectWithId(lowScoreRects, colorOrange)
-                drawRectWithId(borderTouchedRects, colorBlue)
-                drawRectWithId(areaTooSmallRects, colorYellow)
-                
-                val rawPts = arrayOf(Point(), Point(), Point(), Point())
-                if (bestContour != null) {
-                    val finalContour2f = MatOfPoint2f(*bestContour!!.toArray())
-                    val minRect = Imgproc.minAreaRect(finalContour2f)
-                    minRect.points(rawPts)
-                    finalContour2f.release()
-                    for (i in 0..3) Imgproc.line(canvasMat, rawPts[i], rawPts[(i + 1) % 4], colorGreen, 5)
-                    Imgproc.putText(canvasMat, "WINNER", Point(rawPts[1].x, rawPts[1].y - 10), Imgproc.FONT_HERSHEY_SIMPLEX, 1.2, colorGreen, 4)
-                }
-                
-                Utils.matToBitmap(canvasMat, bmp)
-                canvasMat.release()
-            }
-
-            if (bestContour == null) {
-                debugListener?.let {
-                    val debugMat = tightMat.clone()
-                    val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
-                    Utils.matToBitmap(debugMat, debugBmp)
-                    
-                    drawFullMap(debugBmp)
-
-                    val hudBmp = addDebugHUD(debugBmp, "Step 4: Scoring FAILED", listOf(
-                        "No valid candidates survived.",
-                        "Check Logcat (PLATE_DEBUG) for scores."
-                    ), screenRatio)
-                    it.pauseAndShowStep("4단계: 유효 윤곽선 없음", hudBmp)
-                    debugMat.release(); debugBmp.recycle()
-                }
-                return null
-            }
-
             debugListener?.let {
                 val debugMat = tightMat.clone()
+                for (item in rejectedRects) { for(i in 0..3) Imgproc.line(debugMat, item.second[i], item.second[(i+1)%4], Scalar(255.0, 0.0, 0.0, 255.0), 2) }
+                for (item in lowScoreRects) { for(i in 0..3) Imgproc.line(debugMat, item.second[i], item.second[(i+1)%4], Scalar(255.0, 165.0, 0.0, 255.0), 3) }
+                
+                var statusText = "FAILED: No valid plate boundary found."
+                if (bestContour != null) {
+                    val rawPts = arrayOf(Point(), Point(), Point(), Point())
+                    val minRect = Imgproc.minAreaRect(MatOfPoint2f(*bestContour!!.toArray()))
+                    minRect.points(rawPts)
+                    for (i in 0..3) Imgproc.line(debugMat, rawPts[i], rawPts[(i + 1) % 4], Scalar(0.0, 255.0, 0.0, 255.0), 6)
+                    statusText = "WINNER SECURED! (Outer Boundary)"
+                }
+
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
-                
-                drawFullMap(debugBmp)
-
-                val hudBmp = addDebugHUD(debugBmp, "Step 4: Scoring Applied", listOf(
-                    "Masterkey Score Activated!",
-                    "Ratio: ${String.format("%.2f", bestRatio)} | Rect: ${String.format("%.2f", bestRectangularity)}",
-                    "Winner Secured."
+                val hudBmp = addDebugHUD(debugBmp, "Step 10: Hierarchy Scoring (Tree)", listOf(
+                    statusText,
+                    "Total Contours: ${contours.size}",
+                    "Winner Children (Text) Count: $bestChildCount",
+                    "Winner Score: ${String.format("%.0f", bestScore)} pts",
+                    "Winner Ratio: ${String.format("%.2f", bestRatio)}"
                 ), screenRatio)
-                it.pauseAndShowStep("4단계: 최종 스코어 맵", hudBmp)
+                it.pauseAndShowStep("10단계: 계층 구조(Hierarchy) 채점 및 우승 테두리 선정", hudBmp)
                 debugMat.release(); debugBmp.recycle()
             }
 
+            if (bestContour == null) return null
+
             // =====================================================================
-            // 🚀 [5단계] 기하학 정렬: Convex Hull + approxPolyDP + Fallback
+            // 🚀 [Step 11] 기하학 정렬 및 최종 4점 추출
             // =====================================================================
             val contour2f = MatOfPoint2f(*bestContour!!.toArray())
-            
-            // 1. Convex Hull: 팽팽한 고무줄처럼 감싸 노이즈 억제
-            val hull = MatOfInt()
-            Imgproc.convexHull(bestContour, hull)
-            
-            val contourArray = bestContour!!.toArray()
-            val hullPoints = hull.toArray().map { contourArray[it] }.toTypedArray()
-            val hull2f = MatOfPoint2f(*hullPoints)
-
-            // 2. approxPolyDP: 다각형 근사화로 원근감이 살아있는 4개의 꼭짓점 추론 시도
-            val approx = MatOfPoint2f()
-            val arcLength = Imgproc.arcLength(hull2f, true)
-            Imgproc.approxPolyDP(hull2f, approx, arcLength * 0.03, true)
-
-            val approxPts = approx.toArray()
-            var rawPoints: Array<Point>
-
-            // 3. 검증 및 Fallback 로직
-            var geometryMethod = "Fallback (minAreaRect)"
-            if (approxPts.size == 4) {
-                rawPoints = approxPts
-                geometryMethod = "approxPolyDP (Perspective)"
-                Log.d("PLATE_DEBUG", "Step 5: approxPolyDP SUCCESS (4 points)")
-            } else {
-                val minRect = Imgproc.minAreaRect(contour2f)
-                rawPoints = arrayOf(Point(), Point(), Point(), Point())
-                minRect.points(rawPoints)
-                Log.d("PLATE_DEBUG", "Step 5: approxPolyDP FAILED (${approxPts.size} pts) -> Fallback to minAreaRect")
-            }
-
-            // 메모리 해제
-            hull.release()
-            hull2f.release()
-            approx.release()
+            val minRect = Imgproc.minAreaRect(contour2f)
+            val rawPoints = arrayOf(Point(), Point(), Point(), Point())
+            minRect.points(rawPoints)
             contour2f.release()
 
-            // 4. 추출된 4개의 점 정렬 (TL, TR, BR, BL 순서 보장)
-            val sum = rawPoints.map { it.x + it.y }
-            val diff = rawPoints.map { it.x - it.y }
-            val tl = rawPoints[sum.indexOf(sum.minOrNull()!!)]
-            val br = rawPoints[sum.indexOf(sum.maxOrNull()!!)]
-            val tr = rawPoints[diff.indexOf(diff.maxOrNull()!!)]
-            val bl = rawPoints[diff.indexOf(diff.minOrNull()!!)]
-            val orderedPoints = arrayOf(tl, tr, br, bl)
+            // 점 정렬 (Top-Left, Top-Right, Bottom-Right, Bottom-Left 순서 보장)
+            val sum = rawPoints.map { it.x + it.y }; val diff = rawPoints.map { it.x - it.y }
+            val orderedPoints = arrayOf(
+                rawPoints[sum.indexOf(sum.minOrNull()!!)], 
+                rawPoints[diff.indexOf(diff.maxOrNull()!!)],
+                rawPoints[sum.indexOf(sum.maxOrNull()!!)], 
+                rawPoints[diff.indexOf(diff.minOrNull()!!)]
+            )
 
-            // 5. 미세 확장 (Scale Up) - 번호판 틈새 노출 방지
-            val rectCx = orderedPoints.map { it.x }.average()
-            val rectCy = orderedPoints.map { it.y }.average()
-            val scaleX = 1.03
-            val scaleY = 1.05 
-            val expandedPoints = Array(4) { Point() }
-            for (i in 0..3) {
-                val pt = orderedPoints[i]
-                expandedPoints[i] = Point(
-                    rectCx + (pt.x - rectCx) * scaleX,
-                    rectCy + (pt.y - rectCy) * scaleY
-                )
-            }
-
-            // 6. 회전(Rotation) 원복 변환 (Inverse Affine)
+            // 역변환: 수평으로 돌려놨던 4점을 실제 사진의 삐뚤어진 각도로 복원 (Inverse Affine)
             val invRotMat = Mat()
             Imgproc.invertAffineTransform(rotMat, invRotMat)
-
-            val pointsInRotatedLoose = expandedPoints.map { Point(it.x + tightRect.x, it.y + tightRect.y) }.toTypedArray()
+            val pointsInRotatedLoose = orderedPoints.map { Point(it.x + tightRect.x, it.y + tightRect.y) }.toTypedArray()
             val srcMat = MatOfPoint2f(*pointsInRotatedLoose)
             val dstMat = MatOfPoint2f()
-
             Core.transform(srcMat, dstMat, invRotMat)
-
-            val finalPts = dstMat.toArray().map { Point(it.x + looseRect.x, it.y + looseRect.y) }
             
-            // 7. Width / Height 계산 및 기하학 무결성 검증 (Geometry Validation)
-            val tlPt = finalPts[0]
-            val trPt = finalPts[1]
-            val brPt = finalPts[2]
-            val blPt = finalPts[3]
-
-            val widthTop = hypot(trPt.x - tlPt.x, trPt.y - tlPt.y)
-            val widthBottom = hypot(brPt.x - blPt.x, brPt.y - blPt.y)
-            val heightLeft = hypot(tlPt.x - blPt.x, tlPt.y - blPt.y)
-            val heightRight = hypot(trPt.x - brPt.x, trPt.y - brPt.y)
-
-            val maxWidth = max(widthTop, widthBottom)
-            val maxHeight = max(heightLeft, heightRight).coerceAtLeast(1.0)
-            val finalRatio = maxWidth / maxHeight
-
-            Log.d("PLATE_DEBUG", "--- Step 5 Geometry Validation ---")
-            Log.d("PLATE_DEBUG", "Method: $geometryMethod")
-            Log.d("PLATE_DEBUG", "TL=$tlPt, TR=$trPt, BR=$brPt, BL=$blPt")
-            Log.d("PLATE_DEBUG", "widthTop=${String.format("%.1f", widthTop)}, widthBottom=${String.format("%.1f", widthBottom)}")
-            Log.d("PLATE_DEBUG", "heightLeft=${String.format("%.1f", heightLeft)}, heightRight=${String.format("%.1f", heightRight)}")
-            Log.d("PLATE_DEBUG", "finalAspectRatio=${String.format("%.2f", finalRatio)}")
-
-            var safeResultPts = finalPts
-            var statusLog = "SUCCESS: Valid ratio secured ($geometryMethod)"
-
-            // 최종 비율이 한국 번호판 규격을 심하게 벗어나면 최후의 안전장치 발동
-            if (finalRatio < 1.5 || finalRatio > 7.5) {
-                statusLog = "FINAL FALLBACK: Invalid ratio ($finalRatio)"
-                Log.d("PLATE_DEBUG", "Step 5: FINAL FALLBACK TRIGGERED (Invalid Ratio: $finalRatio)")
-                val fallbackPts = arrayOf(
-                    Point(tightLeft.toDouble(), tightTop.toDouble()),
-                    Point(tightRight.toDouble(), tightTop.toDouble()),
-                    Point(tightRight.toDouble(), tightBottom.toDouble()),
-                    Point(tightLeft.toDouble(), tightBottom.toDouble())
-                )
-                val fallbackSrc = MatOfPoint2f(*fallbackPts)
-                val fallbackDst = MatOfPoint2f()
-                Core.transform(fallbackSrc, fallbackDst, invRotMat)
-                safeResultPts = fallbackDst.toArray().map { Point(it.x + looseRect.x, it.y + looseRect.y) }
-                fallbackSrc.release(); fallbackDst.release()
-            }
+            // Loose ROI 좌표계를 바탕으로 전체 원본 사진 좌표계로 치환
+            val finalPts = dstMat.toArray().map { Point(it.x + looseRect.x, it.y + looseRect.y) }
 
             debugListener?.let {
                 val debugMat = fullMat.clone()
-                
-                val colors = arrayOf(
-                    Scalar(255.0, 0.0, 0.0, 255.0),   
-                    Scalar(0.0, 255.0, 0.0, 255.0),   
-                    Scalar(0.0, 0.0, 255.0, 255.0),   
-                    Scalar(255.0, 255.0, 0.0, 255.0)  
-                )
+                val colors = arrayOf(Scalar(255.0,0.0,0.0,255.0), Scalar(0.0,255.0,0.0,255.0), Scalar(0.0,0.0,255.0,255.0), Scalar(255.0,255.0,0.0,255.0))
                 val labels = arrayOf("TL", "TR", "BR", "BL")
-
                 for (i in 0..3) {
-                    Imgproc.line(debugMat, safeResultPts[i], safeResultPts[(i + 1) % 4], Scalar(255.0, 255.0, 255.0, 255.0), 4)
-                    Imgproc.circle(debugMat, safeResultPts[i], 15, colors[i], -1)
-                    Imgproc.putText(debugMat, labels[i], Point(safeResultPts[i].x - 20, safeResultPts[i].y - 20), Imgproc.FONT_HERSHEY_SIMPLEX, 2.0, colors[i], 4)
+                    Imgproc.line(debugMat, finalPts[i], finalPts[(i + 1) % 4], Scalar(255.0, 255.0, 255.0, 255.0), 4)
+                    Imgproc.circle(debugMat, finalPts[i], 15, colors[i], -1)
+                    Imgproc.putText(debugMat, labels[i], Point(finalPts[i].x - 20, finalPts[i].y - 20), Imgproc.FONT_HERSHEY_SIMPLEX, 2.0, colors[i], 4)
                 }
-
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
-
-                val hudBmp = addDebugHUD(debugBmp, "Step 5: Geometry Validation", listOf(
-                    "Order: TL -> TR -> BR -> BL",
-                    "Final Aspect Ratio: ${String.format("%.2f", finalRatio)}",
-                    statusLog
+                val hudBmp = addDebugHUD(debugBmp, "Step 11: Final Geometry Export", listOf(
+                    "Inverse Affine Transform: SUCCESS",
+                    "Perfected 4 Outer Boundary Points mapped to original Image.",
+                    "Ready to warp perspective mask!"
                 ), screenRatio)
-                
-                it.pauseAndShowStep("5단계: 기하학 검증 및 마스킹 준비", hudBmp)
+                it.pauseAndShowStep("11단계: 최종 외부 테두리 4점 원본 이미지 보정", hudBmp)
                 debugMat.release(); debugBmp.recycle()
             }
 
-            resultPoints = safeResultPts.map { ImmutablePoint(it.x.toFloat(), it.y.toFloat()) }
-
+            resultPoints = finalPts.map { ImmutablePoint(it.x.toFloat(), it.y.toFloat()) }
             invRotMat.release(); srcMat.release(); dstMat.release()
 
         } catch (e: Exception) {
             e.printStackTrace()
         } finally {
-            thresh.release(); openKernel.release(); closeKernel.release()
-            contours.forEach { it.release() }; hierarchy.release()
+            // 메모리 누수 방지 (수동 해제 필수)
+            edges.release()
+            dilateKernel.release()
+            contours.forEach { it.release() }
+            hierarchy.release()
             
-            rotMat.release()
-            looseMat.release(); looseGray.release()
+            thresh.release()
+            rotMat.release(); looseMat.release(); looseGray.release()
             rotatedLooseMat.release(); rotatedLooseGray.release()
             tightMat.release(); tightGray.release()
             fullMat.release(); fullGray.release()
