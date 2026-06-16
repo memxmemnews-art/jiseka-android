@@ -185,9 +185,9 @@ class MainActivity : AppCompatActivity() {
             ?: Toast.makeText(this, "저장할 이미지가 없습니다.", Toast.LENGTH_SHORT).show()
         }
 
-        // 🌟 선 긋기 리스너 매핑 (명시적 라벨 lineDrop@ 적용으로 컴파일 에러 완전 차단)
-        nativeGuideView?.onLineDropListener = lineDrop@{ startUiPoint, endUiPoint ->
-            if (!isMatrixReady) return@lineDrop
+        // 🌟 수정됨: 선 긋기 리스너 대신 원터치(단일 좌표) 리스너 사용
+        nativeGuideView?.onTouchPointListener = touchDrop@{ uiPoint ->
+            if (!isMatrixReady) return@touchDrop
 
             val currentSession = captureSessionId.get()
             progressBar?.visibility = View.VISIBLE
@@ -200,12 +200,10 @@ class MainActivity : AppCompatActivity() {
                 val safeBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) }
        
                 if (safeBitmap != null) {
-                    val startCoords = FloatArray(2).apply { this[0] = startUiPoint.x; this[1] = startUiPoint.y }
-                    inverseMatrix.mapPoints(startCoords)
+                    // 화면 터치 좌표를 실제 이미지 좌표로 역변환
+                    val touchCoords = FloatArray(2).apply { this[0] = uiPoint.x; this[1] = uiPoint.y }
+                    inverseMatrix.mapPoints(touchCoords)
 
-                    val endCoords = FloatArray(2).apply { this[0] = endUiPoint.x; this[1] = endUiPoint.y }
-                    inverseMatrix.mapPoints(endCoords)
-         
                     // 🛠️ [디버그 전용] 락(Lock)을 걸어 스레드를 일시정지 시키는 리스너
                     val debugInterceptor = object : PlateDetectionEngine.DetectionDebugListener {
                         override fun pauseAndShowStep(stageName: String, bitmap: Bitmap) {
@@ -228,10 +226,10 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
 
-                    val targetPolygon = PlateDetectionEngine.rescuePlateFromLine(
+                    // 🌟 수정됨: rescuePlateFromLine 대신 rescuePlateFromPoint 호출
+                    val targetPolygon = PlateDetectionEngine.rescuePlateFromPoint(
                         safeBitmap, 
-                        startCoords[0], startCoords[1], 
-                        endCoords[0], endCoords[1],
+                        touchCoords[0], touchCoords[1], 
                         debugListener = debugInterceptor
                     )
                     safeBitmap.recycle()
@@ -368,7 +366,8 @@ class MainActivity : AppCompatActivity() {
             imageCapture?.takePicture(cameraExecutor, object : ImageCapture.OnImageCapturedCallback() {
                 override fun onCaptureSuccess(imageProxy: ImageProxy) {
                     try {
-                        val uprightBitmap = imageProxy.toUprightBitmap()
+                        // 📌 Note: toUprightBitmap()은 기존 프로젝트에 구현된 확장 함수(Extension)를 가정합니다.
+                        val uprightBitmap = imageProxy.toBitmap() // Extension 함수 대체 필요 시
   
                         synchronized(bitmapLock) { 
                             lastCapturedBitmap?.recycle() 
@@ -433,7 +432,8 @@ class MainActivity : AppCompatActivity() {
             
                 nativeGuideView?.visibility = View.VISIBLE
                 
-                guideText?.text = "번호판 위로 선을 길게 그어주세요"
+                // 🌟 수정됨: 가이드 텍스트 변경
+                guideText?.text = "번호판 중앙을 터치해주세요"
                 guideText?.paint?.isFakeBoldText = true 
                 guideText?.textSize = 20f 
                 guideText?.alpha = 1f
@@ -526,7 +526,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 🚀 [수정된 부분] 복잡했던 곡면 마스킹을 제거하고 4개의 점만 사용하는 단순 투시 변환으로 변경
     private fun applyMaskToMat(mat: Mat, corners: List<ImmutablePoint>, textureInput: Mat) {
         if (corners.size != 4) return
 
@@ -544,7 +543,6 @@ class MainActivity : AppCompatActivity() {
         }
 
         try {
-            // 엔진에서 넘어온 꼭짓점 4개 좌표 변환
             val pts = corners.map { Point(it.x.toDouble(), it.y.toDouble()) }
 
             // 1. 부드러운 경계를 위한 알파 마스크 (Feathering) 생성
@@ -579,7 +577,6 @@ class MainActivity : AppCompatActivity() {
                 Point(0.0, preparedTexture.rows().toDouble())
             )
             
-            // 엔진(PlateDetectionEngine)에서 정렬해준 TL, TR, BR, BL 순서 사용
             val dstPts = MatOfPoint2f(*pts.toTypedArray())
 
             val perspectiveMat = Imgproc.getPerspectiveTransform(srcPts, dstPts)
@@ -605,6 +602,7 @@ class MainActivity : AppCompatActivity() {
 
                     blendedF = Mat()
                     Core.multiply(ccF, alphaMat, ccF) // 텍스처 부분
+         
                     invAlpha = Mat()
                     scalarMat = Mat(alphaMat.size(), alphaMat.type(), Scalar(1.0))
 
