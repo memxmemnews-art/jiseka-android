@@ -152,10 +152,10 @@ object PlateDetectionEngine {
         }
 
         // =====================================================================
-        // 🚀 [Step 2] 초기 ROI 영역 설정 (🌟 2:1에서 3:1 비율로 수정됨)
+        // 🚀 [Step 2] 20% 폭 2:1 비율의 콤팩트 초기 ROI
         // =====================================================================
-        val roiWidth = (fullMat.cols() * 0.28).toInt() // 가로폭 고해상도 대응 (28%)
-        val roiHeight = (roiWidth / 3.0).toInt()       // 🌟 Fix: 가로세로 3:1 비율 최적화 크기로 조정
+        val roiWidth = (fullMat.cols() * 0.20).toInt() 
+        val roiHeight = (roiWidth / 2.0).toInt()       
 
         val looseLeft = (cx - roiWidth / 2.0).toInt().coerceIn(0, fullMat.cols() - 1)
         val looseTop = (cy - roiHeight / 2.0).toInt().coerceIn(0, fullMat.rows() - 1)
@@ -173,13 +173,12 @@ object PlateDetectionEngine {
             Imgproc.rectangle(debugMat, looseRect, Scalar(0.0, 255.0, 0.0, 255.0), 8)
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
-            val hudBmp = addDebugHUD(debugBmp, "Step 2: Optimized ROI (Ratio 3:1)", listOf(
-                "Fix: 밸런스를 고려하여 수직 높이를 3:1 구조로 조정 완료",
-                "ROI Width: $roiWidth px (화면 가로폭의 28%)",
-                "ROI Height: $roiHeight px (3:1 비율 반영)",
+            val hudBmp = addDebugHUD(debugBmp, "Step 2: Downsized ROI (Ratio 2:1)", listOf(
+                "ROI Width: $roiWidth px (화면 가로폭의 20%)",
+                "ROI Height: $roiHeight px (2:1 비율 완벽 적용)",
                 "Rect Bounds: [L:$looseLeft, T:$looseTop, R:$looseRight, B:$looseBottom]"
             ), screenRatio)
-            it.pauseAndShowStep("2단계: 8% 탐색 구역(Loose ROI) 설정", hudBmp)
+            it.pauseAndShowStep("2단계: 컴팩트 2:1 탐색 구역 설정", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
 
@@ -197,7 +196,7 @@ object PlateDetectionEngine {
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
         
         // =====================================================================
-        // 🚀 [Step 5] 문자 중심점 및 기울기 도출
+        // 🚀 [Step 5] 문자 중심점, 기울기 도출 및 [복구된 방어 로직]
         // =====================================================================
         val tempContours = ArrayList<MatOfPoint>()
         val tempHierarchy = Mat()
@@ -240,7 +239,7 @@ object PlateDetectionEngine {
             val avgH = charList.map { it.height }.average()
             val textSpreadWidth = maxX - minX
             
-            val expectedHeight = max(avgH * 4.5, 280.0).coerceAtMost(looseRect.height.toDouble()) 
+            val expectedHeight = max(avgH * 4.8, 300.0).coerceAtMost(looseRect.height.toDouble()) 
             val marginX = max(textSpreadWidth * 0.25, avgH * 3.0)
 
             tightLeft = (minX - marginX).toInt()
@@ -259,15 +258,32 @@ object PlateDetectionEngine {
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
                 val hudBmp = addDebugHUD(debugBmp, "Step 3~5: Cleaned Text Fitting", listOf(
-                    "Valid Characters Found: ${charList.size} (그릴 무늬 대폭 제거)",
-                    "Recalculated Avg Height: ${String.format("%.1f", avgH)} px",
+                    "Valid Characters Found: ${charList.size}",
                     "Fitted Line Angle: ${String.format("%.2f", angle)} deg",
-                    "Status: 세부 탐색 박스 최소 높이를 280px로 잠금(Clamp)"
+                    "Status: 텍스트 클러스터 정상 감지"
                 ), screenRatio)
                 it.pauseAndShowStep("3~5단계: 문자 탐색 및 기울기 계산", hudBmp)
                 debugMat.release(); debugBmp.recycle()
             }
             pointsMat.release(); line.release(); tempRotMat.release(); dstCenterPts.release()
+            
+        } else {
+            // 🌟 [복구됨] 글자를 제대로 인식하지 못했을 경우의 최후 방어벽 (Fallback)
+            // 전체를 다 쓰지 않고 30%~70% 구간으로 강제 축소하여 상하단 노이즈 원천 배제
+            tightTop = (looseRect.height * 0.3).toInt()
+            tightBottom = (looseRect.height * 0.7).toInt()
+            
+            debugListener?.let {
+                val debugMat = looseMat.clone()
+                val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+                Utils.matToBitmap(debugMat, debugBmp)
+                val hudBmp = addDebugHUD(debugBmp, "Step 3~5: Fallback Triggered", listOf(
+                    "WARNING: 글자를 충분히 찾지 못했습니다.",
+                    "Action: 방어 로직 가동. 중앙 40% 영역으로 강제 축소."
+                ), screenRatio)
+                it.pauseAndShowStep("3~5단계: 방어 로직 가동", hudBmp)
+                debugMat.release(); debugBmp.recycle()
+            }
         }
 
         // =====================================================================
@@ -295,7 +311,7 @@ object PlateDetectionEngine {
             Utils.matToBitmap(debugMat, debugBmp)
             val hudBmp = addDebugHUD(debugBmp, "Step 6~7: True Plate Bound ROI", listOf(
                 "Image leveled to 0 degrees.",
-                "Tight ROI size: ${tightRect.width} x ${tightRect.height} (정상 비율 복구 완료)",
+                "Tight ROI size: ${tightRect.width} x ${tightRect.height}",
                 "Ready for Outer Edge Tracking."
             ), screenRatio)
             it.pauseAndShowStep("6~7단계: 수평 회전 및 넉넉한 탐색 영역 확정", hudBmp)
@@ -303,17 +319,17 @@ object PlateDetectionEngine {
         }
 
         // =====================================================================
-        // 🚀 [Step 8 & 9] 진짜 테두리 찾기 (Canny Edge + Dilate)
+        // 🚀 [Step 8 & 9] 진짜 테두리 찾기 (Canny 35, 100)
         // =====================================================================
         val edges = Mat()
-        val dilateKernel = Imgproc.getStructuringElement(Imgproc.MORPH_CROSS, Size(5.0, 5.0))
+        val dilateKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 5.0))
         val contours = ArrayList<MatOfPoint>()
         val hierarchy = Mat()
         var resultPoints: List<ImmutablePoint>? = null
 
         try {
-            Imgproc.GaussianBlur(tightGray, tightGray, Size(5.0, 5.0), 0.0)
-            Imgproc.Canny(tightGray, edges, 50.0, 160.0) 
+            Imgproc.GaussianBlur(tightGray, tightGray, Size(3.0, 3.0), 0.0)
+            Imgproc.Canny(tightGray, edges, 35.0, 100.0) 
             Imgproc.dilate(edges, edges, dilateKernel)
 
             debugListener?.let {
@@ -321,16 +337,16 @@ object PlateDetectionEngine {
                 Imgproc.cvtColor(edges, debugMat, Imgproc.COLOR_GRAY2RGBA)
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "Step 8~9: Canny Edge Map", listOf(
-                    "Method: Canny(50, 160) + Dilate",
-                    "Notice: 번호판 외곽 테두리 선이 상하 컷팅 없이 완벽히 노출됨."
+                val hudBmp = addDebugHUD(debugBmp, "Step 8~9: High-Sensitivity Canny Map", listOf(
+                    "Method: Canny(35, 100) + Dilate",
+                    "Target: Extract unbroken outer white border."
                 ), screenRatio)
                 it.pauseAndShowStep("8~9단계: 번호판 물리적 테두리(Edge) 추출", hudBmp)
                 debugMat.release(); debugBmp.recycle()
             }
 
             // =====================================================================
-            // 🚀 [Step 10] 윤곽선 계층(Hierarchy) 구조 탐색 및 채점
+            // 🚀 [Step 10] 윤곽선 계층 채점 및 [강력한 노이즈 크기 필터링 추가]
             // =====================================================================
             Imgproc.findContours(edges, contours, hierarchy, Imgproc.RETR_TREE, Imgproc.CHAIN_APPROX_SIMPLE)
 
@@ -341,6 +357,9 @@ object PlateDetectionEngine {
             
             val rejectedRects = mutableListOf<Pair<Int, Array<Point>>>()
             val lowScoreRects = mutableListOf<Pair<Int, Array<Point>>>() 
+            
+            // 🌟 [추가됨] 현재 세부 탐색창 넓이의 최소 5%는 되어야 번호판으로 인정 (동적 노이즈 제거)
+            val minDynamicArea = tightRect.width * tightRect.height * 0.05
 
             for (i in contours.indices) {
                 val contour = contours[i]
@@ -358,7 +377,8 @@ object PlateDetectionEngine {
                 val pts = arrayOf(Point(), Point(), Point(), Point())
                 rect.points(pts)
 
-                if (boxArea < 1500 || ratio !in 1.5..7.5 || perimeterRatio < 0.5 || perimeterRatio > 1.8) {
+                // 🌟 [추가됨] minDynamicArea 비교 및 최소 픽셀 사이즈(120x25) 제한으로 조그만 노이즈 철벽 방어
+                if (boxArea < minDynamicArea || w < 120 || h < 25 || ratio !in 1.5..7.5 || perimeterRatio < 0.4 || perimeterRatio > 1.9) {
                     rejectedRects.add(Pair(i, pts))
                     contour2f.release()
                     continue
@@ -382,7 +402,7 @@ object PlateDetectionEngine {
                 val centerBiasScore = max(0.0, 1.0 - (dist / Math.hypot(tightGray.cols() / 2.0, tightGray.rows() / 2.0))) * 2000.0
                 
                 var hierarchyBonus = 0.0
-                if (childCount in 4..22) {
+                if (childCount in 4..25) {
                     hierarchyBonus = childCount * 3500.0 
                 } else if (childCount == 0) {
                     hierarchyBonus = -6000.0
@@ -424,14 +444,13 @@ object PlateDetectionEngine {
 
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "Step 10: Hierarchy Scoring (Tree)", listOf(
+                val hudBmp = addDebugHUD(debugBmp, "Step 10: Size Filtered Hierarchy Scoring", listOf(
                     statusText,
-                    "Total Contours Inside Window: ${contours.size}",
+                    "Fix: 탐색창 대비 5% 미만의 노이즈 및 초소형 객체 영구 차단 적용",
                     "Winner Core Children Count: $bestChildCount",
-                    "Winner Score: ${String.format("%.0f", bestScore)} pts",
-                    "Winner Aspect Ratio: ${String.format("%.2f", bestRatio)}"
+                    "Winner Score: ${String.format("%.0f", bestScore)} pts"
                 ), screenRatio)
-                it.pauseAndShowStep("10단계: 계층 구조(Hierarchy) 채점 및 우승 테두리 선정", hudBmp)
+                it.pauseAndShowStep("10단계: 계층 구조(Hierarchy) 채점 및 노이즈 필터링", hudBmp)
                 debugMat.release(); debugBmp.recycle()
             }
 
