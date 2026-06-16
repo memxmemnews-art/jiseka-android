@@ -62,12 +62,12 @@ object PlateDetectionEngine {
         val combinedBmp = Bitmap.createBitmap(canvasWidth, canvasHeight, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(combinedBmp)
         
-        val bgPaint = Paint().apply { color = Color.parseColor("#E6000000") } // 반투명 검정 배경
+        val bgPaint = Paint().apply { color = Color.parseColor("#E6000000") }
         canvas.drawRect(0f, 0f, canvasWidth.toFloat(), canvasHeight.toFloat(), bgPaint)
 
         val paint = Paint().apply {
             color = Color.WHITE
-            textSize = 38f // 많은 텍스트를 위해 폰트 사이즈 소폭 축소
+            textSize = 38f
             isAntiAlias = true
             setShadowLayer(5f, 0f, 0f, Color.BLACK)
         }
@@ -246,7 +246,7 @@ object PlateDetectionEngine {
             val avgH = charList.map { it.height }.average()
             val textSpreadWidth = maxX - minX
             
-            // 💡 [개선점] 번호판 외부 '하얀색 테두리'가 잘리지 않도록 Padding을 매우 넉넉하게 확보 (상하 2배, 좌우 1.5배)
+            // 💡 [개선점] 번호판 외부 '하얀색 테두리'가 잘리지 않도록 Padding 확보
             val expectedHeight = max(avgH * 3.5, 100.0) 
             val marginX = max(textSpreadWidth * 0.25, avgH * 2.5)
 
@@ -313,16 +313,15 @@ object PlateDetectionEngine {
         // 🚀 [Step 8 & 9] 진짜 테두리 찾기 (Canny Edge + Dilate)
         // =====================================================================
         val edges = Mat()
-        val dilateKernel = Imgproc.getStructuringElement(Imgproc.MORPH_CROSS, Size(5.0, 5.0)) // 끊어진 선 잇기
+        val dilateKernel = Imgproc.getStructuringElement(Imgproc.MORPH_CROSS, Size(5.0, 5.0))
         val contours = ArrayList<MatOfPoint>()
         val hierarchy = Mat()
         var resultPoints: List<ImmutablePoint>? = null
 
         try {
-            // 노이즈 제거 후 강한 명암 대비를 가진 '선(Edge)' 추출
             Imgproc.GaussianBlur(tightGray, tightGray, Size(5.0, 5.0), 0.0)
-            Imgproc.Canny(tightGray, edges, 60.0, 180.0) // 약간 깐깐한 엣지 검출
-            Imgproc.dilate(edges, edges, dilateKernel) // 끊어진 번호판 테두리 강제 연결
+            Imgproc.Canny(tightGray, edges, 60.0, 180.0)
+            Imgproc.dilate(edges, edges, dilateKernel)
 
             debugListener?.let {
                 val debugMat = Mat()
@@ -341,7 +340,6 @@ object PlateDetectionEngine {
             // =====================================================================
             // 🚀 [Step 10] 윤곽선 계층(Hierarchy) 구조 탐색 및 채점
             // =====================================================================
-            // RETR_TREE: 외곽선뿐만 아니라 내부에 포함된 자식 윤곽선 관계까지 모두 구조화
             Imgproc.findContours(edges, contours, hierarchy, Imgproc.RETR_TREE, Imgproc.CHAIN_APPROX_SIMPLE)
 
             var bestScore = -Double.MAX_VALUE
@@ -371,38 +369,33 @@ object PlateDetectionEngine {
                 val pts = arrayOf(Point(), Point(), Point(), Point())
                 rect.points(pts)
 
-                // 1. 기본 필터링 (너무 작거나 비율이 안 맞으면 탈락)
                 if (boxArea < 2000 || ratio !in 1.5..7.5 || perimeterRatio < 0.7 || perimeterRatio > 1.5) {
                     rejectedRects.add(Pair(i, pts))
                     contour2f.release()
                     continue
                 }
 
-                // 2. Hierarchy 파악: 이 윤곽선 '내부'에 자식(글자/숫자)이 몇 개나 있는가?
                 var childCount = 0
                 val node = hierarchy.get(0, i)
                 if (node != null) {
-                    var childIdx = node[2].toInt() // 첫 번째 자식의 인덱스 (First Child)
+                    var childIdx = node[2].toInt()
                     while (childIdx != -1) {
                         childCount++
                         val childNode = hierarchy.get(0, childIdx)
                         if (childNode != null) {
-                            childIdx = childNode[0].toInt() // 다음 형제 노드로 이동 (Next Sibling)
+                            childIdx = childNode[0].toInt()
                         } else break
                     }
                 }
 
-                // 3. 스코어링 (모양 정확도 + 중앙 집중도)
                 val shapeScore = max(0.0, 1.0 - Math.abs(1.0 - perimeterRatio)) * 3000.0 
                 val dist = Math.hypot(rect.center.x - tightGray.cols() / 2.0, rect.center.y - tightGray.rows() / 2.0)
                 val centerBiasScore = max(0.0, 1.0 - (dist / Math.hypot(tightGray.cols() / 2.0, tightGray.rows() / 2.0))) * 2000.0
                 
-                // 💡 [핵심 보너스] 자식(문자)을 3개 이상 품고 있다면 번호판 외부 테두리일 확률 99%!
                 var hierarchyBonus = 0.0
                 if (childCount in 3..30) {
-                    hierarchyBonus = childCount * 2500.0 // 압도적인 가산점 부여
+                    hierarchyBonus = childCount * 2500.0 
                 } else if (childCount == 0) {
-                    // 자식이 하나도 없으면 단순한 선이거나 빈 공간이므로 감점
                     hierarchyBonus = -5000.0
                 }
 
@@ -466,7 +459,6 @@ object PlateDetectionEngine {
             minRect.points(rawPoints)
             contour2f.release()
 
-            // 점 정렬 (Top-Left, Top-Right, Bottom-Right, Bottom-Left 순서 보장)
             val sum = rawPoints.map { it.x + it.y }; val diff = rawPoints.map { it.x - it.y }
             val orderedPoints = arrayOf(
                 rawPoints[sum.indexOf(sum.minOrNull()!!)], 
@@ -475,7 +467,6 @@ object PlateDetectionEngine {
                 rawPoints[diff.indexOf(diff.minOrNull()!!)]
             )
 
-            // 역변환: 수평으로 돌려놨던 4점을 실제 사진의 삐뚤어진 각도로 복원 (Inverse Affine)
             val invRotMat = Mat()
             Imgproc.invertAffineTransform(rotMat, invRotMat)
             val pointsInRotatedLoose = orderedPoints.map { Point(it.x + tightRect.x, it.y + tightRect.y) }.toTypedArray()
@@ -483,7 +474,6 @@ object PlateDetectionEngine {
             val dstMat = MatOfPoint2f()
             Core.transform(srcMat, dstMat, invRotMat)
             
-            // Loose ROI 좌표계를 바탕으로 전체 원본 사진 좌표계로 치환
             val finalPts = dstMat.toArray().map { Point(it.x + looseRect.x, it.y + looseRect.y) }
 
             debugListener?.let {
@@ -512,7 +502,6 @@ object PlateDetectionEngine {
         } catch (e: Exception) {
             e.printStackTrace()
         } finally {
-            // 메모리 누수 방지 (수동 해제 필수)
             edges.release()
             dilateKernel.release()
             contours.forEach { it.release() }
