@@ -13,60 +13,44 @@ class NativeGuideView @JvmOverloads constructor(
     context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
 ) : View(context, attrs, defStyleAttr) {
 
-    // 선 긋기 완료 리스너 (시작점, 끝점 전달)
-    var onLineDropListener: ((PointF, PointF) -> Unit)? = null 
+    // 터치 좌표 전달 리스너
+    var onTouchPointListener: ((PointF) -> Unit)? = null 
 
     var currentDeviceRotation = 0f
-    private val startPoint = PointF()
-    private val endPoint = PointF()
-    private var isDrawing = false 
+    private val touchPoint = PointF()
+    private var isTouched = false 
 
-    private val lineBackPaint = Paint().apply { color = Color.BLACK; style = Paint.Style.STROKE; strokeWidth = 12f; strokeCap = Paint.Cap.ROUND; isAntiAlias = true }
-    private val lineFrontPaint = Paint().apply { color = Color.CYAN; style = Paint.Style.STROKE; strokeWidth = 6f; strokeCap = Paint.Cap.ROUND; isAntiAlias = true }
-    private val pointPaint = Paint().apply { color = Color.GREEN; style = Paint.Style.FILL; isAntiAlias = true }
+    // 터치 포인트를 표시할 페인트 (눈에 띄게 CYAN 크기 확대)
+    private val pointPaint = Paint().apply { color = Color.CYAN; style = Paint.Style.FILL; isAntiAlias = true }
 
     fun resetState() {
-        isDrawing = false 
+        isTouched = false 
         postInvalidateOnAnimation()
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        if (isDrawing) {
-            canvas.drawLine(startPoint.x, startPoint.y, endPoint.x, endPoint.y, lineBackPaint)
-            canvas.drawLine(startPoint.x, startPoint.y, endPoint.x, endPoint.y, lineFrontPaint)
-            
-            canvas.drawCircle(startPoint.x, startPoint.y, 12f, pointPaint)
-            canvas.drawCircle(endPoint.x, endPoint.y, 12f, pointPaint)
+        if (isTouched) {
+            canvas.drawCircle(touchPoint.x, touchPoint.y, 40f, pointPaint)
         }
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        var x = event.x
-        var y = event.y
+        val x = event.x
+        val y = event.y
 
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
-                isDrawing = true
-                startPoint.set(x, y)
-                endPoint.set(x, y)
-                postInvalidateOnAnimation()
-                return true
-            }
-            MotionEvent.ACTION_MOVE -> {
-                endPoint.set(x, y)
+                isTouched = true
+                touchPoint.set(x, y)
                 postInvalidateOnAnimation()
                 return true
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                if (isDrawing) {
-                    isDrawing = false
-                    val dist = kotlin.math.hypot(endPoint.x - startPoint.x, endPoint.y - startPoint.y)
-                    if (dist > 20f) {
-                        onLineDropListener?.invoke(PointF(startPoint.x, startPoint.y), PointF(endPoint.x, endPoint.y))
-                    } else {
-                        resetState() // 선이 너무 짧으면 취소
-                    }
+                if (isTouched) {
+                    isTouched = false
+                    // 손을 떼는 순간 1개의 좌표만 전달
+                    onTouchPointListener?.invoke(PointF(touchPoint.x, touchPoint.y))
                 }
                 return true
             }
