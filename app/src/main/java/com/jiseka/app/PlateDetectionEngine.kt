@@ -155,13 +155,11 @@ object PlateDetectionEngine {
         }
 
         // =====================================================================
-        // 🚀 [Step 2] 8% ROI (4:1) 영역 설정
+        // 🚀 [Step 2] 초기 ROI 영역 설정 (🌟면적 방식 폐기 -> 화면 가로폭 비율 매핑)
         // =====================================================================
-        val screenArea = fullMat.rows() * fullMat.cols()
-        val targetArea = screenArea * 0.08
-        
-        val roiHeight = Math.sqrt(targetArea / 4.0).toInt()
-        val roiWidth = roiHeight * 4
+        // 고해상도 화면(3060px)에 대응하기 위해 가로폭의 26% 수준으로 컴팩트하게 제한
+        val roiWidth = (fullMat.cols() * 0.26).toInt() 
+        val roiHeight = roiWidth / 4                 
 
         val looseLeft = (cx - roiWidth / 2.0).toInt().coerceIn(0, fullMat.cols() - 1)
         val looseTop = (cy - roiHeight / 2.0).toInt().coerceIn(0, fullMat.rows() - 1)
@@ -179,10 +177,10 @@ object PlateDetectionEngine {
             Imgproc.rectangle(debugMat, looseRect, Scalar(0.0, 255.0, 0.0, 255.0), 8)
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
-            val hudBmp = addDebugHUD(debugBmp, "Step 2: Loose ROI (8% Area)", listOf(
-                "Calculated Area: ${targetArea.toInt()} pixels",
-                "ROI Width: $roiWidth px (Ratio 4)",
-                "ROI Height: $roiHeight px (Ratio 1)",
+            val hudBmp = addDebugHUD(debugBmp, "Step 2: Optimized Resolution-Aware ROI", listOf(
+                "Fix 적용: 해상도 맞춤형 타겟팅 적용 (그릴 노이즈 원천 차단)",
+                "ROI Width: $roiWidth px (화면 가로폭의 26%)",
+                "ROI Height: $roiHeight px (4:1 비율 고정)",
                 "Rect Bounds: [L:$looseLeft, T:$looseTop, R:$looseRight, B:$looseBottom]"
             ), screenRatio)
             it.pauseAndShowStep("2단계: 8% 탐색 구역(Loose ROI) 설정", hudBmp)
@@ -217,7 +215,8 @@ object PlateDetectionEngine {
             val area = rect.area()
             val ratio = rect.height.toDouble() / max(rect.width.toDouble(), 1.0)
 
-            if (ratio in 1.1..4.5 && area > 50 && area < looseRect.area() * 0.1) {
+            // 한국 번호판 글자 특성 필터 정밀화 (그릴 노이즈 추가 방어)
+            if (ratio in 1.2..4.2 && area > 80 && area < looseRect.area() * 0.08) {
                 val center = Point(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
                 charList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect))
             }
@@ -246,9 +245,9 @@ object PlateDetectionEngine {
             val avgH = charList.map { it.height }.average()
             val textSpreadWidth = maxX - minX
             
-            // 💡 [개선점] 번호판 외부 '하얀색 테두리'가 잘리지 않도록 Padding 확보
-            val expectedHeight = max(avgH * 3.5, 100.0) 
-            val marginX = max(textSpreadWidth * 0.25, avgH * 2.5)
+            // 번호판 테두리가 포함되도록 상하좌우를 글자 크기 대비 넉넉하게 확장
+            val expectedHeight = max(avgH * 3.8, 110.0) 
+            val marginX = max(textSpreadWidth * 0.22, avgH * 2.5)
 
             tightLeft = (minX - marginX).toInt()
             tightRight = (maxX + marginX).toInt()
@@ -266,10 +265,10 @@ object PlateDetectionEngine {
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
                 val hudBmp = addDebugHUD(debugBmp, "Step 3~5: Text Alignment & Fitting", listOf(
-                    "Valid Characters Found: ${charList.size}",
-                    "Average Char Height: ${String.format("%.1f", avgH)} px",
-                    "Calculated Rotation Angle: ${String.format("%.2f", angle)} deg",
-                    "Padding added to preserve outer border"
+                    "Filtered Characters Found: ${charList.size} (그릴 무늬 제외 완료)",
+                    "Average Character Height: ${String.format("%.1f", avgH)} px",
+                    "Fitted Line Rotation Angle: ${String.format("%.2f", angle)} deg",
+                    "Status: 테두리 보존을 위한 확장 다이내믹 패딩 적용"
                 ), screenRatio)
                 it.pauseAndShowStep("3~5단계: 문자 탐색 및 기울기 계산", hudBmp)
                 debugMat.release(); debugBmp.recycle()
@@ -350,9 +349,6 @@ object PlateDetectionEngine {
             val rejectedRects = mutableListOf<Pair<Int, Array<Point>>>()
             val lowScoreRects = mutableListOf<Pair<Int, Array<Point>>>() 
 
-            Log.d("PLATE_DEBUG", "========== STEP 10: HIERARCHY EVALUATION ==========")
-            Log.d("PLATE_DEBUG", "Total Contours Found: ${contours.size}")
-
             for (i in contours.indices) {
                 val contour = contours[i]
                 val contour2f = MatOfPoint2f(*contour.toArray())
@@ -369,7 +365,7 @@ object PlateDetectionEngine {
                 val pts = arrayOf(Point(), Point(), Point(), Point())
                 rect.points(pts)
 
-                if (boxArea < 2000 || ratio !in 1.5..7.5 || perimeterRatio < 0.7 || perimeterRatio > 1.5) {
+                if (boxArea < 1500 || ratio !in 1.5..7.5 || perimeterRatio < 0.6 || perimeterRatio > 1.6) {
                     rejectedRects.add(Pair(i, pts))
                     contour2f.release()
                     continue
@@ -393,15 +389,13 @@ object PlateDetectionEngine {
                 val centerBiasScore = max(0.0, 1.0 - (dist / Math.hypot(tightGray.cols() / 2.0, tightGray.rows() / 2.0))) * 2000.0
                 
                 var hierarchyBonus = 0.0
-                if (childCount in 3..30) {
-                    hierarchyBonus = childCount * 2500.0 
+                if (childCount in 4..20) {
+                    hierarchyBonus = childCount * 3000.0  // 진짜 한국 글자 수 규격에 가산점 집중
                 } else if (childCount == 0) {
-                    hierarchyBonus = -5000.0
+                    hierarchyBonus = -6000.0
                 }
 
                 val finalScore = shapeScore + centerBiasScore + hierarchyBonus
-
-                Log.d("PLATE_DEBUG", "ID[$i] Score:${String.format("%.0f", finalScore)} | Ratio:${String.format("%.1f", ratio)} | Children:$childCount")
 
                 if (finalScore > bestScore && childCount > 0) {
                     if (bestContour != null) {
@@ -439,10 +433,10 @@ object PlateDetectionEngine {
                 Utils.matToBitmap(debugMat, debugBmp)
                 val hudBmp = addDebugHUD(debugBmp, "Step 10: Hierarchy Scoring (Tree)", listOf(
                     statusText,
-                    "Total Contours: ${contours.size}",
-                    "Winner Children (Text) Count: $bestChildCount",
+                    "Total Contours Inside Window: ${contours.size}",
+                    "Winner Core Children Count: $bestChildCount",
                     "Winner Score: ${String.format("%.0f", bestScore)} pts",
-                    "Winner Ratio: ${String.format("%.2f", bestRatio)}"
+                    "Winner Aspect Ratio: ${String.format("%.2f", bestRatio)}"
                 ), screenRatio)
                 it.pauseAndShowStep("10단계: 계층 구조(Hierarchy) 채점 및 우승 테두리 선정", hudBmp)
                 debugMat.release(); debugBmp.recycle()
