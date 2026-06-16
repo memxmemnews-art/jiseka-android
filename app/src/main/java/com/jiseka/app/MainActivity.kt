@@ -185,7 +185,6 @@ class MainActivity : AppCompatActivity() {
             ?: Toast.makeText(this, "저장할 이미지가 없습니다.", Toast.LENGTH_SHORT).show()
         }
 
-        // 🌟 수정됨: 선 긋기 리스너 대신 원터치(단일 좌표) 리스너 사용
         nativeGuideView?.onTouchPointListener = touchDrop@{ uiPoint ->
             if (!isMatrixReady) return@touchDrop
 
@@ -200,11 +199,9 @@ class MainActivity : AppCompatActivity() {
                 val safeBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) }
        
                 if (safeBitmap != null) {
-                    // 화면 터치 좌표를 실제 이미지 좌표로 역변환
                     val touchCoords = FloatArray(2).apply { this[0] = uiPoint.x; this[1] = uiPoint.y }
                     inverseMatrix.mapPoints(touchCoords)
 
-                    // 🛠️ [디버그 전용] 락(Lock)을 걸어 스레드를 일시정지 시키는 리스너
                     val debugInterceptor = object : PlateDetectionEngine.DetectionDebugListener {
                         override fun pauseAndShowStep(stageName: String, bitmap: Bitmap) {
                             debugLatch = CountDownLatch(1)
@@ -217,7 +214,7 @@ class MainActivity : AppCompatActivity() {
                                 progressBar?.visibility = View.GONE 
                             }
                             
-                            debugLatch?.await() // 버튼 누를 때까지 대기
+                            debugLatch?.await() 
                             
                             runOnUiThread { 
                                 btnDebugNext?.visibility = View.GONE 
@@ -226,7 +223,6 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
 
-                    // 🌟 수정됨: rescuePlateFromLine 대신 rescuePlateFromPoint 호출
                     val targetPolygon = PlateDetectionEngine.rescuePlateFromPoint(
                         safeBitmap, 
                         touchCoords[0], touchCoords[1], 
@@ -289,7 +285,7 @@ class MainActivity : AppCompatActivity() {
     private fun resetToLiveMode() {
         captureSessionId.incrementAndGet()
         
-        debugLatch?.countDown() // 🛠️ 진행 중 취소 시 스레드 해방
+        debugLatch?.countDown() 
         btnDebugNext?.visibility = View.GONE
       
         btnCapture?.isEnabled = true
@@ -366,8 +362,11 @@ class MainActivity : AppCompatActivity() {
             imageCapture?.takePicture(cameraExecutor, object : ImageCapture.OnImageCapturedCallback() {
                 override fun onCaptureSuccess(imageProxy: ImageProxy) {
                     try {
-                        // 📌 Note: toUprightBitmap()은 기존 프로젝트에 구현된 확장 함수(Extension)를 가정합니다.
-                        val uprightBitmap = imageProxy.toBitmap() // Extension 함수 대체 필요 시
+                        // 🌟 수정됨: 가로로 눕는 현상을 막기 위해 EXIF 회전값을 직접 읽어 비트맵에 적용
+                        val rawBitmap = imageProxy.toBitmap()
+                        val rotationDegrees = imageProxy.imageInfo.rotationDegrees.toFloat()
+                        val matrix = Matrix().apply { postRotate(rotationDegrees) }
+                        val uprightBitmap = Bitmap.createBitmap(rawBitmap, 0, 0, rawBitmap.width, rawBitmap.height, matrix, true)
   
                         synchronized(bitmapLock) { 
                             lastCapturedBitmap?.recycle() 
@@ -432,7 +431,6 @@ class MainActivity : AppCompatActivity() {
             
                 nativeGuideView?.visibility = View.VISIBLE
                 
-                // 🌟 수정됨: 가이드 텍스트 변경
                 guideText?.text = "번호판 중앙을 터치해주세요"
                 guideText?.paint?.isFakeBoldText = true 
                 guideText?.textSize = 20f 
