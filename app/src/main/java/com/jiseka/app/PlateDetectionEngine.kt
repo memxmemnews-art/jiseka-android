@@ -152,7 +152,7 @@ object PlateDetectionEngine {
         }
 
         // =====================================================================
-        // 🚀 [Step 2] 22% 폭 (기존 20% 대비 상향) 2:1 비율의 초기 ROI
+        // 🚀 [Step 2] 22% 폭 2:1 비율의 초기 ROI
         // =====================================================================
         val roiWidth = (fullMat.cols() * 0.22).toInt() 
         val roiHeight = (roiWidth / 2.0).toInt()       
@@ -359,7 +359,6 @@ object PlateDetectionEngine {
 
             var isFallback = false
             
-            // 🚨 2회전 스캔 로직: 1차(엄격 모드) 실패 시, 2차(유연 모드) 가동
             for (attempt in 0..1) {
                 bestScore = -Double.MAX_VALUE
                 bestContour = null
@@ -373,19 +372,25 @@ object PlateDetectionEngine {
 
                     val w = rect.size.width
                     val h = rect.size.height
-                    val ratio = max(w, h) / max(min(w, h), 1.0)
-                    val boxArea = w * h
+                    
+                    // 🚨 회전에 무관하게 실제 긴 변과 짧은 변을 구분하여 필터링
+                    val longSide = max(w, h)
+                    val shortSide = min(w, h)
+                    
+                    val ratio = longSide / max(shortSide, 1.0)
+                    val boxArea = longSide * shortSide
+                    
                     val perimeter = Imgproc.arcLength(contour2f, true)
-                    val expectedPerimeter = 2 * (w + h)
+                    val expectedPerimeter = 2 * (longSide + shortSide)
                     val perimeterRatio = perimeter / max(expectedPerimeter, 1.0) 
 
                     val pts = arrayOf(Point(), Point(), Point(), Point())
                     rect.points(pts)
 
-                    // Fallback 모드에서는 테두리 거칠기 허용 한도를 3.0까지 대폭 완화
                     val currentMaxPerimeter = if (isFallback) 3.0 else 1.9
 
-                    if (boxArea < minDynamicArea || w < 160 || h < 35 || ratio !in 1.5..7.5 || perimeterRatio < 0.4 || perimeterRatio > currentMaxPerimeter) {
+                    // 🚨 longSide, shortSide 변수 사용
+                    if (boxArea < minDynamicArea || longSide < 160 || shortSide < 35 || ratio !in 1.5..7.5 || perimeterRatio < 0.4 || perimeterRatio > currentMaxPerimeter) {
                         rejectedRects.add(Pair(i, pts))
                         contour2f.release()
                         continue
@@ -406,12 +411,10 @@ object PlateDetectionEngine {
 
                     var hierarchyBonus = 0.0
                     if (!isFallback) {
-                        // Strict 모드
                         if (childCount in 4..25) hierarchyBonus = childCount * 3500.0 
                         else if (childCount == 0) hierarchyBonus = -6000.0
                         else if (childCount > 35) hierarchyBonus = -15000.0 
                     } else {
-                        // Fallback 모드: 자식 0개 감점 면제
                         if (childCount in 1..35) hierarchyBonus = 3000.0 
                         else if (childCount == 0) hierarchyBonus = 0.0
                         else hierarchyBonus = -10000.0 
@@ -425,12 +428,10 @@ object PlateDetectionEngine {
                     val dist = Math.hypot(rect.center.x - tightGray.cols() / 2.0, rect.center.y - tightGray.rows() / 2.0)
                     val centerBiasScore = max(0.0, 1.0 - (dist / Math.hypot(tightGray.cols() / 2.0, tightGray.rows() / 2.0))) * 2000.0
                     
-                    // Fallback 모드에서만 압도적인 탐색창 대비 면적 점수 부여
                     val areaScore = if (isFallback) (boxArea / (tightRect.width * tightRect.height.toDouble())) * 5000.0 else 0.0
                     
                     val finalScore = shapeScore + centerBiasScore + hierarchyBonus + noisePenalty + areaScore
 
-                    // 정체성 검증: Strict는 무조건 자식 필요, Fallback은 0개 허용
                     val isValid = if (isFallback) true else (childCount > 0)
 
                     if (finalScore > bestScore && isValid) {
@@ -451,10 +452,7 @@ object PlateDetectionEngine {
                     contour2f.release()
                 }
                 
-                // 우승자를 찾았으면 즉시 루프 종료
                 if (bestContour != null) break
-                
-                // 못 찾았으면 다음 루프에서 Fallback 모드 가동
                 isFallback = true
             }
 
@@ -479,6 +477,7 @@ object PlateDetectionEngine {
                 val hudBmp = addDebugHUD(debugBmp, "Step 10: Size Filtered Hierarchy Scoring", listOf(
                     statusText,
                     modeText,
+                    "Fix: w,h 뒤바뀜 버그 해결 (longSide, shortSide 분리)",
                     "Winner Core Children Count: $bestChildCount",
                     "Winner Score: ${String.format("%.0f", bestScore)} pts"
                 ), screenRatio)
