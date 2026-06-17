@@ -318,20 +318,21 @@ object PlateDetectionEngine {
         }
 
         // =====================================================================
-        // 🚀 [Step 8 & 9] 진짜 테두리 찾기 (선 끊어짐 방지 및 틈새 봉합)
+        // 🚀 [Step 8 & 9] 진짜 테두리 찾기 (가로형 커널로 봉합, 상하 떡짐 방지)
         // =====================================================================
         val edges = Mat()
-        val dilateKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
-        val closeKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 5.0))
+        // 🚨 가로로만 7픽셀 확장되는 직사각형 커널 생성
+        val horizontalKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(7.0, 1.0))
         val contours = ArrayList<MatOfPoint>()
         val hierarchy = Mat()
         var resultPoints: List<ImmutablePoint>? = null
 
         try {
             Imgproc.GaussianBlur(tightGray, tightGray, Size(3.0, 3.0), 0.0)
-            Imgproc.Canny(tightGray, edges, 40.0, 120.0) 
-            Imgproc.dilate(edges, edges, dilateKernel)
-            Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_CLOSE, closeKernel) 
+            Imgproc.Canny(tightGray, edges, 35.0, 100.0) 
+            
+            // 🚨 제안하신 원리 적용: 부풀리기+깎아내기를 동시에 처리하여 좌우 끊어짐만 선택적 연결
+            Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_CLOSE, horizontalKernel)
 
             debugListener?.let {
                 val debugMat = Mat()
@@ -339,15 +340,15 @@ object PlateDetectionEngine {
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
                 val hudBmp = addDebugHUD(debugBmp, "Step 8~9: High-Sensitivity Canny Map", listOf(
-                    "Method: Canny(40, 120) + Dilate(3x3) + Close(5x5)",
-                    "Target: Extract unbroken outer white border."
+                    "Method: Canny(35, 100) + Close(7x1 Horizontal)",
+                    "Target: Bridge lateral gaps, prevent vertical solid block fusion."
                 ), screenRatio)
                 it.pauseAndShowStep("8~9단계: 번호판 물리적 테두리(Edge) 추출", hudBmp)
                 debugMat.release(); debugBmp.recycle()
             }
 
             // =====================================================================
-            // 🚀 [Step 10] 윤곽선 계층 채점
+            // 🚀 [Step 10] 윤곽선 계층 채점 (안전장치 childCount > 0 복구 적용)
             // =====================================================================
             Imgproc.findContours(edges, contours, hierarchy, Imgproc.RETR_TREE, Imgproc.CHAIN_APPROX_SIMPLE)
 
@@ -413,6 +414,7 @@ object PlateDetectionEngine {
                 
                 val finalScore = shapeScore + centerBiasScore + hierarchyBonus + noisePenalty
 
+                // 🚨 정체성 확인: childCount > 0 필수 조건 복구
                 if (finalScore > bestScore && childCount > 0) {
                     if (bestContour != null) {
                         val prevContour2f = MatOfPoint2f(*bestContour!!.toArray())
@@ -449,7 +451,7 @@ object PlateDetectionEngine {
                 Utils.matToBitmap(debugMat, debugBmp)
                 val hudBmp = addDebugHUD(debugBmp, "Step 10: Size Filtered Hierarchy Scoring", listOf(
                     statusText,
-                    "Fix: 탐색창 대비 12% 미만 컷, 범퍼 노이즈 강력 감점",
+                    "Fix: 가로형 봉합(Horizontal Close) 적용 완료",
                     "Winner Core Children Count: $bestChildCount",
                     "Winner Score: ${String.format("%.0f", bestScore)} pts"
                 ), screenRatio)
@@ -460,7 +462,7 @@ object PlateDetectionEngine {
             if (bestContour == null) return null
 
             // =====================================================================
-            // 🚀 [Step 11] 기하학 정렬 및 최종 4점 추출 (수학적 극단점 방식 적용)
+            // 🚀 [Step 11] 기하학 정렬 및 최종 4점 추출 (수학적 극단점 방식 유지)
             // =====================================================================
             val contourPts = bestContour!!.toArray()
 
@@ -507,8 +509,7 @@ object PlateDetectionEngine {
             e.printStackTrace()
         } finally {
             edges.release()
-            dilateKernel.release()
-            closeKernel.release() 
+            horizontalKernel.release() 
             contours.forEach { it.release() }
             hierarchy.release()
             
