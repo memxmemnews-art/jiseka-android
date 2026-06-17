@@ -239,7 +239,6 @@ object PlateDetectionEngine {
             val avgH = charList.map { it.height }.average()
             val textSpreadWidth = maxX - minX
             
-            // 🚨 범퍼 노이즈 제거용 타이트닝 로직 (높이: 글자의 2.8배, 좌우 여백 축소)
             val expectedHeight = (avgH * 2.8).coerceAtMost(looseRect.height.toDouble()) 
             val marginX = max(textSpreadWidth * 0.15, avgH * 1.5)
 
@@ -321,7 +320,6 @@ object PlateDetectionEngine {
         // 🚀 [Step 8 & 9] 진짜 테두리 찾기 (가로형 커널로 봉합, 상하 떡짐 방지)
         // =====================================================================
         val edges = Mat()
-        // 🚨 가로로만 7픽셀 확장되는 직사각형 커널 생성
         val horizontalKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(7.0, 1.0))
         val contours = ArrayList<MatOfPoint>()
         val hierarchy = Mat()
@@ -330,8 +328,6 @@ object PlateDetectionEngine {
         try {
             Imgproc.GaussianBlur(tightGray, tightGray, Size(3.0, 3.0), 0.0)
             Imgproc.Canny(tightGray, edges, 35.0, 100.0) 
-            
-            // 🚨 제안하신 원리 적용: 부풀리기+깎아내기를 동시에 처리하여 좌우 끊어짐만 선택적 연결
             Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_CLOSE, horizontalKernel)
 
             debugListener?.let {
@@ -348,7 +344,7 @@ object PlateDetectionEngine {
             }
 
             // =====================================================================
-            // 🚀 [Step 10] 윤곽선 계층 채점 (안전장치 childCount > 0 복구 적용)
+            // 🚀 [Step 10] 윤곽선 계층 채점 (2-Pass 구조: Strict -> Fallback)
             // =====================================================================
             Imgproc.findContours(edges, contours, hierarchy, Imgproc.RETR_TREE, Imgproc.CHAIN_APPROX_SIMPLE)
 
@@ -359,78 +355,107 @@ object PlateDetectionEngine {
             
             val rejectedRects = mutableListOf<Pair<Int, Array<Point>>>()
             val lowScoreRects = mutableListOf<Pair<Int, Array<Point>>>() 
-            
             val minDynamicArea = tightRect.width * tightRect.height * 0.12
 
-            for (i in contours.indices) {
-                val contour = contours[i]
-                val contour2f = MatOfPoint2f(*contour.toArray())
-                val rect = Imgproc.minAreaRect(contour2f)
-
-                val w = rect.size.width
-                val h = rect.size.height
-                val ratio = max(w, h) / max(min(w, h), 1.0)
-                val boxArea = w * h
-                val perimeter = Imgproc.arcLength(contour2f, true)
-                val expectedPerimeter = 2 * (w + h)
-                val perimeterRatio = perimeter / max(expectedPerimeter, 1.0) 
-
-                val pts = arrayOf(Point(), Point(), Point(), Point())
-                rect.points(pts)
-
-                if (boxArea < minDynamicArea || w < 160 || h < 35 || ratio !in 1.5..7.5 || perimeterRatio < 0.4 || perimeterRatio > 1.9) {
-                    rejectedRects.add(Pair(i, pts))
-                    contour2f.release()
-                    continue
-                }
-
-                var childCount = 0
-                val node = hierarchy.get(0, i)
-                if (node != null) {
-                    var childIdx = node[2].toInt()
-                    while (childIdx != -1) {
-                        childCount++
-                        val childNode = hierarchy.get(0, childIdx)
-                        if (childNode != null) {
-                            childIdx = childNode[0].toInt()
-                        } else break
-                    }
-                }
-
-                var hierarchyBonus = 0.0
-                if (childCount in 4..25) {
-                    hierarchyBonus = childCount * 3500.0 
-                } else if (childCount == 0) {
-                    hierarchyBonus = -6000.0
-                } else if (childCount > 35) {
-                    hierarchyBonus = -15000.0 
-                }
-
-                val noisePenalty = if (perimeterRatio > 1.2) -5000.0 else 0.0
-
-                val shapeScore = max(0.0, 1.0 - Math.abs(1.0 - perimeterRatio)) * 3000.0 
-                val dist = Math.hypot(rect.center.x - tightGray.cols() / 2.0, rect.center.y - tightGray.rows() / 2.0)
-                val centerBiasScore = max(0.0, 1.0 - (dist / Math.hypot(tightGray.cols() / 2.0, tightGray.rows() / 2.0))) * 2000.0
+            var isFallback = false
+            
+            // 🚨 2회전 스캔 로직: 1차(엄격 모드) 실패 시, 2차(유연 모드) 가동
+            for (attempt in 0..1) {
+                bestScore = -Double.MAX_VALUE
+                bestContour = null
+                rejectedRects.clear()
+                lowScoreRects.clear()
                 
-                val finalScore = shapeScore + centerBiasScore + hierarchyBonus + noisePenalty
+                for (i in contours.indices) {
+                    val contour = contours[i]
+                    val contour2f = MatOfPoint2f(*contour.toArray())
+                    val rect = Imgproc.minAreaRect(contour2f)
 
-                // 🚨 정체성 확인: childCount > 0 필수 조건 복구
-                if (finalScore > bestScore && childCount > 0) {
-                    if (bestContour != null) {
-                        val prevContour2f = MatOfPoint2f(*bestContour!!.toArray())
-                        val prevPts = arrayOf(Point(), Point(), Point(), Point())
-                        Imgproc.minAreaRect(prevContour2f).points(prevPts)
-                        lowScoreRects.add(Pair(-1, prevPts)) 
-                        prevContour2f.release()
+                    val w = rect.size.width
+                    val h = rect.size.height
+                    val ratio = max(w, h) / max(min(w, h), 1.0)
+                    val boxArea = w * h
+                    val perimeter = Imgproc.arcLength(contour2f, true)
+                    val expectedPerimeter = 2 * (w + h)
+                    val perimeterRatio = perimeter / max(expectedPerimeter, 1.0) 
+
+                    val pts = arrayOf(Point(), Point(), Point(), Point())
+                    rect.points(pts)
+
+                    // Fallback 모드에서는 테두리 거칠기 허용 한도를 3.0까지 대폭 완화
+                    val currentMaxPerimeter = if (isFallback) 3.0 else 1.9
+
+                    if (boxArea < minDynamicArea || w < 160 || h < 35 || ratio !in 1.5..7.5 || perimeterRatio < 0.4 || perimeterRatio > currentMaxPerimeter) {
+                        rejectedRects.add(Pair(i, pts))
+                        contour2f.release()
+                        continue
                     }
-                    bestScore = finalScore
-                    bestContour = contour
-                    bestRatio = ratio
-                    bestChildCount = childCount
-                } else {
-                    lowScoreRects.add(Pair(i, pts))
+
+                    var childCount = 0
+                    val node = hierarchy.get(0, i)
+                    if (node != null) {
+                        var childIdx = node[2].toInt()
+                        while (childIdx != -1) {
+                            childCount++
+                            val childNode = hierarchy.get(0, childIdx)
+                            if (childNode != null) {
+                                childIdx = childNode[0].toInt()
+                            } else break
+                        }
+                    }
+
+                    var hierarchyBonus = 0.0
+                    if (!isFallback) {
+                        // Strict 모드
+                        if (childCount in 4..25) hierarchyBonus = childCount * 3500.0 
+                        else if (childCount == 0) hierarchyBonus = -6000.0
+                        else if (childCount > 35) hierarchyBonus = -15000.0 
+                    } else {
+                        // Fallback 모드: 자식 0개 감점 면제
+                        if (childCount in 1..35) hierarchyBonus = 3000.0 
+                        else if (childCount == 0) hierarchyBonus = 0.0
+                        else hierarchyBonus = -10000.0 
+                    }
+
+                    val noisePenaltyThreshold = if (isFallback) 1.8 else 1.2
+                    val noisePenaltyAmount = if (isFallback) -2000.0 else -5000.0
+                    val noisePenalty = if (perimeterRatio > noisePenaltyThreshold) noisePenaltyAmount else 0.0
+
+                    val shapeScore = max(0.0, 1.0 - Math.abs(1.0 - perimeterRatio)) * 3000.0 
+                    val dist = Math.hypot(rect.center.x - tightGray.cols() / 2.0, rect.center.y - tightGray.rows() / 2.0)
+                    val centerBiasScore = max(0.0, 1.0 - (dist / Math.hypot(tightGray.cols() / 2.0, tightGray.rows() / 2.0))) * 2000.0
+                    
+                    // Fallback 모드에서만 압도적인 탐색창 대비 면적 점수 부여
+                    val areaScore = if (isFallback) (boxArea / (tightRect.width * tightRect.height.toDouble())) * 5000.0 else 0.0
+                    
+                    val finalScore = shapeScore + centerBiasScore + hierarchyBonus + noisePenalty + areaScore
+
+                    // 정체성 검증: Strict는 무조건 자식 필요, Fallback은 0개 허용
+                    val isValid = if (isFallback) true else (childCount > 0)
+
+                    if (finalScore > bestScore && isValid) {
+                        if (bestContour != null) {
+                            val prevContour2f = MatOfPoint2f(*bestContour!!.toArray())
+                            val prevPts = arrayOf(Point(), Point(), Point(), Point())
+                            Imgproc.minAreaRect(prevContour2f).points(prevPts)
+                            lowScoreRects.add(Pair(-1, prevPts)) 
+                            prevContour2f.release()
+                        }
+                        bestScore = finalScore
+                        bestContour = contour
+                        bestRatio = ratio
+                        bestChildCount = childCount
+                    } else {
+                        lowScoreRects.add(Pair(i, pts))
+                    }
+                    contour2f.release()
                 }
-                contour2f.release()
+                
+                // 우승자를 찾았으면 즉시 루프 종료
+                if (bestContour != null) break
+                
+                // 못 찾았으면 다음 루프에서 Fallback 모드 가동
+                isFallback = true
             }
 
             debugListener?.let {
@@ -439,6 +464,8 @@ object PlateDetectionEngine {
                 for (item in lowScoreRects) { for(i in 0..3) Imgproc.line(debugMat, item.second[i], item.second[(i+1)%4], Scalar(255.0, 165.0, 0.0, 255.0), 3) }
                 
                 var statusText = "FAILED: No valid plate boundary found."
+                val modeText = if (isFallback) "Mode: 2차 Fallback (룰 완화 + Area Score)" else "Mode: 1차 Strict (고정밀 탐색)"
+                
                 if (bestContour != null) {
                     val rawPts = arrayOf(Point(), Point(), Point(), Point())
                     val minRect = Imgproc.minAreaRect(MatOfPoint2f(*bestContour!!.toArray()))
@@ -451,7 +478,7 @@ object PlateDetectionEngine {
                 Utils.matToBitmap(debugMat, debugBmp)
                 val hudBmp = addDebugHUD(debugBmp, "Step 10: Size Filtered Hierarchy Scoring", listOf(
                     statusText,
-                    "Fix: 가로형 봉합(Horizontal Close) 적용 완료",
+                    modeText,
                     "Winner Core Children Count: $bestChildCount",
                     "Winner Score: ${String.format("%.0f", bestScore)} pts"
                 ), screenRatio)
