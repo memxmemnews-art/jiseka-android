@@ -152,9 +152,9 @@ object PlateDetectionEngine {
         }
 
         // =====================================================================
-        // 🚀 [Step 2] 22% 폭 (기존 대비 10% 증가) 2:1 비율의 초기 ROI
+        // 🚀 [Step 2] 22% 폭 (기존 20% 대비 상향) 2:1 비율의 초기 ROI
         // =====================================================================
-        val roiWidth = (fullMat.cols() * 0.22).toInt() // 20%에서 22%로 상향
+        val roiWidth = (fullMat.cols() * 0.22).toInt() 
         val roiHeight = (roiWidth / 2.0).toInt()       
 
         val looseLeft = (cx - roiWidth / 2.0).toInt().coerceIn(0, fullMat.cols() - 1)
@@ -178,7 +178,7 @@ object PlateDetectionEngine {
                 "ROI Height: $roiHeight px (2:1 비율 완벽 적용)",
                 "Rect Bounds: [L:$looseLeft, T:$looseTop, R:$looseRight, B:$looseBottom]"
             ), screenRatio)
-            it.pauseAndShowStep("2단계: 컴팩트 2:1 탐색 구역 설정 (크기 10% 상향)", hudBmp)
+            it.pauseAndShowStep("2단계: 컴팩트 2:1 탐색 구역 설정", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
 
@@ -196,7 +196,7 @@ object PlateDetectionEngine {
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
         
         // =====================================================================
-        // 🚀 [Step 5] 문자 중심점, 기울기 도출
+        // 🚀 [Step 5] 문자 중심점, 기울기 도출 및 타이트닝 확정
         // =====================================================================
         val tempContours = ArrayList<MatOfPoint>()
         val tempHierarchy = Mat()
@@ -239,8 +239,9 @@ object PlateDetectionEngine {
             val avgH = charList.map { it.height }.average()
             val textSpreadWidth = maxX - minX
             
-            val expectedHeight = max(avgH * 4.8, 300.0).coerceAtMost(looseRect.height.toDouble()) 
-            val marginX = max(textSpreadWidth * 0.25, avgH * 3.0)
+            // 🚨 범퍼 노이즈 제거용 타이트닝 로직 (높이: 글자의 2.8배, 좌우 여백 축소)
+            val expectedHeight = (avgH * 2.8).coerceAtMost(looseRect.height.toDouble()) 
+            val marginX = max(textSpreadWidth * 0.15, avgH * 1.5)
 
             tightLeft = (minX - marginX).toInt()
             tightRight = (maxX + marginX).toInt()
@@ -312,23 +313,25 @@ object PlateDetectionEngine {
                 "Tight ROI size: ${tightRect.width} x ${tightRect.height}",
                 "Ready for Outer Edge Tracking."
             ), screenRatio)
-            it.pauseAndShowStep("6~7단계: 수평 회전 및 넉넉한 탐색 영역 확정", hudBmp)
+            it.pauseAndShowStep("6~7단계: 수평 회전 및 타이트 탐색 영역 확정", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
 
         // =====================================================================
-        // 🚀 [Step 8 & 9] 진짜 테두리 찾기 (얇은 커널, Canny 상향)
+        // 🚀 [Step 8 & 9] 진짜 테두리 찾기 (선 끊어짐 방지 및 틈새 봉합)
         // =====================================================================
         val edges = Mat()
-        val dilateKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
+        val dilateKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
+        val closeKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 5.0))
         val contours = ArrayList<MatOfPoint>()
         val hierarchy = Mat()
         var resultPoints: List<ImmutablePoint>? = null
 
         try {
             Imgproc.GaussianBlur(tightGray, tightGray, Size(3.0, 3.0), 0.0)
-            Imgproc.Canny(tightGray, edges, 50.0, 150.0) 
+            Imgproc.Canny(tightGray, edges, 40.0, 120.0) 
             Imgproc.dilate(edges, edges, dilateKernel)
+            Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_CLOSE, closeKernel) 
 
             debugListener?.let {
                 val debugMat = Mat()
@@ -336,7 +339,7 @@ object PlateDetectionEngine {
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
                 val hudBmp = addDebugHUD(debugBmp, "Step 8~9: High-Sensitivity Canny Map", listOf(
-                    "Method: Canny(50, 150) + Dilate(2x2)",
+                    "Method: Canny(40, 120) + Dilate(3x3) + Close(5x5)",
                     "Target: Extract unbroken outer white border."
                 ), screenRatio)
                 it.pauseAndShowStep("8~9단계: 번호판 물리적 테두리(Edge) 추출", hudBmp)
@@ -344,7 +347,7 @@ object PlateDetectionEngine {
             }
 
             // =====================================================================
-            // 🚀 [Step 10] 윤곽선 계층 채점 (면적 비율 상향 및 노이즈 페널티 추가)
+            // 🚀 [Step 10] 윤곽선 계층 채점
             // =====================================================================
             Imgproc.findContours(edges, contours, hierarchy, Imgproc.RETR_TREE, Imgproc.CHAIN_APPROX_SIMPLE)
 
@@ -435,7 +438,6 @@ object PlateDetectionEngine {
                 
                 var statusText = "FAILED: No valid plate boundary found."
                 if (bestContour != null) {
-                    // 여기서는 단순히 우승자의 대략적인 모양을 보여주기 위해 minAreaRect 그리기
                     val rawPts = arrayOf(Point(), Point(), Point(), Point())
                     val minRect = Imgproc.minAreaRect(MatOfPoint2f(*bestContour!!.toArray()))
                     minRect.points(rawPts)
@@ -506,6 +508,7 @@ object PlateDetectionEngine {
         } finally {
             edges.release()
             dilateKernel.release()
+            closeKernel.release() 
             contours.forEach { it.release() }
             hierarchy.release()
             
