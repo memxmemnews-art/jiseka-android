@@ -320,22 +320,20 @@ object PlateDetectionEngine {
         // 🚀 [Step 8 & 9] 진짜 테두리 찾기 (에지 증발 버그 수정 및 브릿지 최소화)
         // =====================================================================
         val edges = Mat()
-        // 💡 가로 봉합 커널 크기를 줄여서(7x1 -> 4x1) 그릴과 무리하게 연결되는 현상 방지
+        // 가로 봉합 커널 크기를 줄여서(7x1 -> 4x1) 그릴과 무리하게 연결되는 현상 방지
         val horizontalKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(4.0, 1.0))
         val contours = ArrayList<MatOfPoint>()
         val hierarchy = Mat()
         var resultPoints: List<ImmutablePoint>? = null
 
         try {
-            // 💡 블러를 줄여서 경계선을 날카롭게 유지 (그릴과 번호판이 뭉개져 섞이지 않도록)
+            // 블러를 줄여서 경계선을 날카롭게 유지 (그릴과 번호판이 뭉개져 섞이지 않도록)
             Imgproc.GaussianBlur(tightGray, tightGray, Size(3.0, 3.0), 0.0)
             
-            // 💡 Canny 임계값을 적절히 타협 (번호판은 잡고, 얕은 그릴 선은 무시)
+            // Canny 임계값을 적절히 타협 (번호판은 잡고, 얕은 그릴 선은 무시)
             Imgproc.Canny(tightGray, edges, 40.0, 120.0) 
             
-            // 🚨 문제의 원인이었던 MORPH_OPEN 연산 완전 삭제 (1픽셀 두께 증발 방지)
-            
-            // 끊어진 번호판 테두리만 조심스럽게 봉합
+            // 끊어진 번호판 테두리만 조심스럽게 봉합 (1픽셀 두께 증발 방지를 위해 MORPH_OPEN 제거)
             Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_CLOSE, horizontalKernel)
 
             debugListener?.let {
@@ -515,12 +513,11 @@ object PlateDetectionEngine {
             if (bestContour == null) return null
 
             // =====================================================================
-            // 🚀 [Step 11] 기하학 정렬 및 최종 4점 추출 (approxPolyDP 기반 퍼스펙티브 유지)
+            // 🚀 [Step 11] 기하학 정렬 및 최종 4점 추출 (강제 수축 로직 제거 및 1:1 매핑)
             // =====================================================================
             val contour2f = MatOfPoint2f(*bestContour!!.toArray())
             
-            // 💡 직사각형(minAreaRect) 대신, 윤곽선의 원근감(사다리꼴)을 유지하면서 
-            // 울퉁불퉁한 잔가지(노이즈)만 직선으로 깔끔하게 펴주는 다각형 근사화(approxPolyDP) 적용
+            // 윤곽선의 원근감(사다리꼴)을 유지하면서 잔가지(노이즈)만 직선으로 펴주는 다각형 근사화
             val approxCurve = MatOfPoint2f()
             val perimeter = Imgproc.arcLength(contour2f, true)
             Imgproc.approxPolyDP(contour2f, approxCurve, perimeter * 0.02, true) 
@@ -535,24 +532,14 @@ object PlateDetectionEngine {
             contour2f.release()
             approxCurve.release()
 
-            // 💡 하얀색 영역만 덮기 위해 중심점(Center)을 향해 4점을 수축(Inset)
-            val cx = (rawTopLeft.x + rawTopRight.x + rawBottomRight.x + rawBottomLeft.x) / 4.0
-            val cy = (rawTopLeft.y + rawTopRight.y + rawBottomRight.y + rawBottomLeft.y) / 4.0
-
-            // 수축 비율 (1.0 = 원본 크기)
-            val scaleX = 0.95 // 좌우 프레임 두께 피하기 (가로 5% 축소)
-            val scaleY = 0.82 // 상하 프레임 두께 피하기 (세로 18% 축소)
-
-            val orderedPoints = arrayOf(rawTopLeft, rawTopRight, rawBottomRight, rawBottomLeft).map { pt ->
-                Point(
-                    cx + (pt.x - cx) * scaleX,
-                    cy + (pt.y - cy) * scaleY
-                )
-            }.toTypedArray()
+            // 🚨 수축(Inset) 부작용 예측 완료 및 완전 제거: 
+            // 8~10단계에서 확보된 완벽한 경계선 좌표를 변형 없이 100% 그대로 활용
+            val orderedPoints = arrayOf(rawTopLeft, rawTopRight, rawBottomRight, rawBottomLeft)
 
             val invRotMat = Mat()
             Imgproc.invertAffineTransform(rotMat, invRotMat)
             
+            // 회전/크롭된 좌표를 다시 원본 사진(풀사이즈)의 좌표계로 되돌리기
             val pointsInRotatedLoose = orderedPoints.map { Point(it.x + tightRect.x, it.y + tightRect.y) }.toTypedArray()
             val srcMat = MatOfPoint2f(*pointsInRotatedLoose)
             val dstMat = MatOfPoint2f()
@@ -573,7 +560,7 @@ object PlateDetectionEngine {
                 Utils.matToBitmap(debugMat, debugBmp)
                 val hudBmp = addDebugHUD(debugBmp, "Step 11: Final Geometry Export", listOf(
                     "Mathematical Extreme Points (x±y) applied.",
-                    "Perfected 4 Outer Boundary Points mapped.",
+                    "Removed manual inset scaling (1:1 mapping).",
                     "Ready to warp perspective mask!"
                 ), screenRatio)
                 it.pauseAndShowStep("11단계: 최종 외부 테두리 4점 원본 이미지 보정", hudBmp)
