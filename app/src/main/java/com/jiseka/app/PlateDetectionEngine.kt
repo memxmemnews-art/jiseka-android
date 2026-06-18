@@ -346,6 +346,18 @@ object PlateDetectionEngine {
             // =====================================================================
             // 🚀 [Step 10] 윤곽선 계층 채점 (2-Pass 구조: Strict -> Fallback)
             // =====================================================================
+            val tightCharCenters = mutableListOf<Point>()
+            if (charList.isNotEmpty()) {
+                val srcPts = MatOfPoint2f(*charList.map { it.center }.toTypedArray())
+                val dstPts = MatOfPoint2f()
+                Core.transform(srcPts, dstPts, rotMat)
+                dstPts.toArray().forEach { pt ->
+                    tightCharCenters.add(Point(pt.x - tightRect.x, pt.y - tightRect.y))
+                }
+                srcPts.release()
+                dstPts.release()
+            }
+
             Imgproc.findContours(edges, contours, hierarchy, Imgproc.RETR_TREE, Imgproc.CHAIN_APPROX_SIMPLE)
 
             var bestScore = -Double.MAX_VALUE
@@ -373,7 +385,6 @@ object PlateDetectionEngine {
                     val w = rect.size.width
                     val h = rect.size.height
                     
-                    // 🚨 회전에 무관하게 실제 긴 변과 짧은 변을 구분하여 필터링
                     val longSide = max(w, h)
                     val shortSide = min(w, h)
                     
@@ -389,7 +400,6 @@ object PlateDetectionEngine {
 
                     val currentMaxPerimeter = if (isFallback) 3.0 else 1.9
 
-                    // 🚨 longSide, shortSide 변수 사용
                     if (boxArea < minDynamicArea || longSide < 160 || shortSide < 35 || ratio !in 1.5..7.5 || perimeterRatio < 0.4 || perimeterRatio > currentMaxPerimeter) {
                         rejectedRects.add(Pair(i, pts))
                         contour2f.release()
@@ -409,14 +419,22 @@ object PlateDetectionEngine {
                         }
                     }
 
+                    var containedCharCount = 0
+                    for (pt in tightCharCenters) {
+                        if (Imgproc.pointPolygonTest(contour2f, pt, false) >= 0.0) {
+                            containedCharCount++
+                        }
+                    }
+                    val effectiveChildCount = max(childCount, containedCharCount)
+
                     var hierarchyBonus = 0.0
                     if (!isFallback) {
-                        if (childCount in 4..25) hierarchyBonus = childCount * 3500.0 
-                        else if (childCount == 0) hierarchyBonus = -6000.0
-                        else if (childCount > 35) hierarchyBonus = -15000.0 
+                        if (effectiveChildCount in 4..25) hierarchyBonus = effectiveChildCount * 3500.0 
+                        else if (effectiveChildCount == 0) hierarchyBonus = -6000.0
+                        else if (effectiveChildCount > 35) hierarchyBonus = -15000.0 
                     } else {
-                        if (childCount in 1..35) hierarchyBonus = 3000.0 
-                        else if (childCount == 0) hierarchyBonus = 0.0
+                        if (effectiveChildCount in 1..35) hierarchyBonus = 3000.0 
+                        else if (effectiveChildCount == 0) hierarchyBonus = 0.0
                         else hierarchyBonus = -10000.0 
                     }
 
@@ -432,7 +450,7 @@ object PlateDetectionEngine {
                     
                     val finalScore = shapeScore + centerBiasScore + hierarchyBonus + noisePenalty + areaScore
 
-                    val isValid = if (isFallback) true else (childCount > 0)
+                    val isValid = if (isFallback) true else (effectiveChildCount > 0)
 
                     if (finalScore > bestScore && isValid) {
                         if (bestContour != null) {
@@ -445,7 +463,7 @@ object PlateDetectionEngine {
                         bestScore = finalScore
                         bestContour = contour
                         bestRatio = ratio
-                        bestChildCount = childCount
+                        bestChildCount = effectiveChildCount
                     } else {
                         lowScoreRects.add(Pair(i, pts))
                     }
