@@ -317,7 +317,7 @@ object PlateDetectionEngine {
         }
 
         // =====================================================================
-        // 🚀 [Step 8 & 9] 진짜 테두리 찾기 (에지 증발 버그 수정 및 브릿지 최소화)
+        // 🚀 [Step 8 & 9] 진짜 테두리 찾기
         // =====================================================================
         val edges = Mat()
         val horizontalKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(4.0, 1.0))
@@ -344,7 +344,7 @@ object PlateDetectionEngine {
             }
 
             // =====================================================================
-            // 🚀 [Step 10] 윤곽선 계층 채점 (2-Pass 구조: Strict -> Fallback)
+            // 🚀 [Step 10] 윤곽선 계층 채점
             // =====================================================================
             val tightCharCenters = mutableListOf<Point>()
             if (charList.isNotEmpty()) {
@@ -505,79 +505,76 @@ object PlateDetectionEngine {
             if (bestContour == null) return null
 
             // =====================================================================
-            // 🚀 [Step 11] 기하학 정렬 및 최종 4점 추출 (다각형 시각화 디버그 포함)
+            // 🚀 [Step 11] 기하학 정렬: 디버그 강화 및 2중 좌표 검증
             // =====================================================================
             val contour2f = MatOfPoint2f(*bestContour!!.toArray())
-            
-            // 윤곽선의 원근감(사다리꼴)을 유지하면서 잔가지(노이즈)만 직선으로 펴주는 다각형 근사화
             val approxCurve = MatOfPoint2f()
             val perimeter = Imgproc.arcLength(contour2f, true)
             Imgproc.approxPolyDP(contour2f, approxCurve, perimeter * 0.02, true) 
-            
-            val cleanPts = if (approxCurve.rows() >= 4) approxCurve.toArray() else contour2f.toArray()
+            val cleanPts = approxCurve.toArray()
 
+            // [방식 1] 기존 극단점 방식 (Extreme Points)
             val rawTopLeft = cleanPts.minByOrNull { it.x + it.y }!!
             val rawBottomRight = cleanPts.maxByOrNull { it.x + it.y }!!
             val rawTopRight = cleanPts.maxByOrNull { it.x - it.y }!!
             val rawBottomLeft = cleanPts.minByOrNull { it.x - it.y }!!
+            val extremeOrdered = arrayOf(rawTopLeft, rawTopRight, rawBottomRight, rawBottomLeft)
 
-            // 🚨 원인 해결: 강제로 안쪽으로 밀어넣던 수축(Inset) 로직 완전 제거
-            val orderedPoints = arrayOf(rawTopLeft, rawTopRight, rawBottomRight, rawBottomLeft)
+            // [방식 2] minAreaRect 방식 (검증용)
+            val minRect = Imgproc.minAreaRect(contour2f)
+            val rectPts = arrayOf(Point(), Point(), Point(), Point())
+            minRect.points(rectPts)
 
             val invRotMat = Mat()
             Imgproc.invertAffineTransform(rotMat, invRotMat)
             
-            // 1. 회전/크롭된 "4개의 극단점"을 원본 사진 좌표계로 되돌리기
-            val pointsInRotatedLoose = orderedPoints.map { Point(it.x + tightRect.x, it.y + tightRect.y) }.toTypedArray()
-            val srcMat = MatOfPoint2f(*pointsInRotatedLoose)
-            val dstMat = MatOfPoint2f()
-            Core.transform(srcMat, dstMat, invRotMat)
-            val finalPts = dstMat.toArray().map { Point(it.x + looseRect.x, it.y + looseRect.y) }
+            // 좌표 변환 공통 로직
+            val extremeRotated = extremeOrdered.map { Point(it.x + tightRect.x, it.y + tightRect.y) }.toTypedArray()
+            val extremeSrcMat = MatOfPoint2f(*extremeRotated)
+            val extremeDstMat = MatOfPoint2f()
+            Core.transform(extremeSrcMat, extremeDstMat, invRotMat)
+            val finalExtremePts = extremeDstMat.toArray().map { Point(it.x + looseRect.x, it.y + looseRect.y) }
 
-            // 2. [디버그용] "approxPolyDP 다각형 전체 픽셀"을 원본 사진 좌표계로 되돌리기
-            val debugPolygonPtsInRotated = cleanPts.map { Point(it.x + tightRect.x, it.y + tightRect.y) }.toTypedArray()
-            val srcPolygonMat = MatOfPoint2f(*debugPolygonPtsInRotated)
-            val dstPolygonMat = MatOfPoint2f()
-            Core.transform(srcPolygonMat, dstPolygonMat, invRotMat)
-            val finalPolygonPts = dstPolygonMat.toArray().map { Point(it.x + looseRect.x, it.y + looseRect.y) }
+            val rectRotated = rectPts.map { Point(it.x + tightRect.x, it.y + tightRect.y) }.toTypedArray()
+            val rectSrcMat = MatOfPoint2f(*rectRotated)
+            val rectDstMat = MatOfPoint2f()
+            Core.transform(rectSrcMat, rectDstMat, invRotMat)
+            val finalRectPts = rectDstMat.toArray().map { Point(it.x + looseRect.x, it.y + looseRect.y) }
 
             debugListener?.let {
                 val debugMat = fullMat.clone()
                 
-                // 💡 [디버그 추가] approxPolyDP가 만들어낸 '진짜 다각형 모양'과 '모든 꼭짓점'을 청록색과 흰색 점으로 시각화
-                for (i in finalPolygonPts.indices) {
-                    Imgproc.line(debugMat, finalPolygonPts[i], finalPolygonPts[(i + 1) % finalPolygonPts.size], Scalar(255.0, 255.0, 0.0, 255.0), 3) // 청록색 다각형 테두리
-                    Imgproc.circle(debugMat, finalPolygonPts[i], 5, Scalar(255.0, 255.0, 255.0, 255.0), -1) // 흰색 점 (다각형의 꼭짓점들)
-                }
-
-                // 기존의 최종 4개 극단점(TL, TR, BR, BL) 시각화
-                val colors = arrayOf(Scalar(255.0,0.0,0.0,255.0), Scalar(0.0,255.0,0.0,255.0), Scalar(0.0,0.0,255.0,255.0), Scalar(255.0,255.0,0.0,255.0))
-                val labels = arrayOf("TL", "TR", "BR", "BL")
-                for (i in 0..3) {
-                    Imgproc.line(debugMat, finalPts[i], finalPts[(i + 1) % 4], Scalar(255.0, 255.0, 255.0, 255.0), 4)
-                    Imgproc.circle(debugMat, finalPts[i], 15, colors[i], -1)
-                    Imgproc.putText(debugMat, labels[i], Point(finalPts[i].x - 20, finalPts[i].y - 20), Imgproc.FONT_HERSHEY_SIMPLEX, 2.0, colors[i], 4)
-                }
+                // 극단점(빨강) vs minAreaRect(흰색) 비교 시각화
+                finalExtremePts.forEach { Imgproc.circle(debugMat, it, 15, Scalar(255.0, 0.0, 0.0, 255.0), -1) }
+                finalRectPts.forEach { Imgproc.circle(debugMat, it, 10, Scalar(255.0, 255.0, 255.0, 255.0), -1) }
                 
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
                 
-                val statusText = if(approxCurve.rows() == 4) "Status: Perfect Quad Shape!" else "Status: Non-Quad (${approxCurve.rows()} points), Extracted Extreme Corners."
+                val boundingBox = Imgproc.boundingRect(bestContour)
+                val cArea = Imgproc.contourArea(bestContour!!)
                 
-                val hudBmp = addDebugHUD(debugBmp, "Step 11: Final Geometry Export", listOf(
-                    "ApproxPolyDP Vertices: ${approxCurve.rows()} (Ideal: 4)",
-                    statusText,
-                    "Cyan Line: Evaluated Polygon Shape",
-                    "Colored Dots: Selected 4 Extreme Corners"
+                val hudBmp = addDebugHUD(debugBmp, "Step 11: Geometry Verification", listOf(
+                    "ApproxPolyDP Vertices: ${cleanPts.size}",
+                    "Contour Area: ${String.format("%.0f", cArea)}, Bounds: ${boundingBox.width}x${boundingBox.height}",
+                    "Extreme(Red) vs minAreaRect(White)",
+                    "Check which points fit the corners better."
                 ), screenRatio)
-                it.pauseAndShowStep("11단계: 기하학 시각화 및 최종 4점 보정", hudBmp)
+                it.pauseAndShowStep("11단계: 후보군 검증 시각화", hudBmp)
                 debugMat.release(); debugBmp.recycle()
             }
 
-            resultPoints = finalPts.map { ImmutablePoint(it.x.toFloat(), it.y.toFloat()) }
-            contour2f.release(); approxCurve.release()
-            invRotMat.release(); srcMat.release(); dstMat.release()
-            srcPolygonMat.release(); dstPolygonMat.release()
+            // 임시로 기존 극단점 반환 (문제 확인용). 해결책 적용을 원하시면 finalRectPts를 매핑하도록 변경하면 됩니다.
+            resultPoints = finalExtremePts.map { ImmutablePoint(it.x.toFloat(), it.y.toFloat()) }
+            
+            // 메모리 해제
+            contour2f.release()
+            approxCurve.release()
+            invRotMat.release()
+            extremeSrcMat.release()
+            extremeDstMat.release()
+            rectSrcMat.release()
+            rectDstMat.release()
 
         } catch (e: Exception) {
             e.printStackTrace()
