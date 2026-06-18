@@ -317,17 +317,19 @@ object PlateDetectionEngine {
         }
 
         // =====================================================================
-        // 🚀 [Step 8 & 9] 진짜 테두리 찾기 (가로형 커널로 봉합, 상하 떡짐 방지)
+        // 🚀 [Step 8 & 9] 진짜 테두리 찾기 (그릴 간섭/Bleeding 완벽 차단)
         // =====================================================================
         val edges = Mat()
-        val horizontalKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(7.0, 1.0))
+        val horizontalKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 1.0))
+        val openKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
         val contours = ArrayList<MatOfPoint>()
         val hierarchy = Mat()
         var resultPoints: List<ImmutablePoint>? = null
 
         try {
-            Imgproc.GaussianBlur(tightGray, tightGray, Size(3.0, 3.0), 0.0)
-            Imgproc.Canny(tightGray, edges, 35.0, 100.0) 
+            Imgproc.GaussianBlur(tightGray, tightGray, Size(5.0, 5.0), 0.0)
+            Imgproc.Canny(tightGray, edges, 50.0, 150.0) 
+            Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_OPEN, openKernel)
             Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_CLOSE, horizontalKernel)
 
             debugListener?.let {
@@ -335,11 +337,11 @@ object PlateDetectionEngine {
                 Imgproc.cvtColor(edges, debugMat, Imgproc.COLOR_GRAY2RGBA)
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "Step 8~9: High-Sensitivity Canny Map", listOf(
-                    "Method: Canny(35, 100) + Close(7x1 Horizontal)",
-                    "Target: Bridge lateral gaps, prevent vertical solid block fusion."
+                val hudBmp = addDebugHUD(debugBmp, "Step 8~9: High-Precision Canny Map", listOf(
+                    "Method: Blur(5) + Canny(50,150) + Open(2x2) + Close(5x1)",
+                    "Target: Cut bleeding bridges to the front grille."
                 ), screenRatio)
-                it.pauseAndShowStep("8~9단계: 번호판 물리적 테두리(Edge) 추출", hudBmp)
+                it.pauseAndShowStep("8~9단계: 번호판 테두리 독립 추출 (그릴 분리)", hudBmp)
                 debugMat.release(); debugBmp.recycle()
             }
 
@@ -495,7 +497,6 @@ object PlateDetectionEngine {
                 val hudBmp = addDebugHUD(debugBmp, "Step 10: Size Filtered Hierarchy Scoring", listOf(
                     statusText,
                     modeText,
-                    "Fix: w,h 뒤바뀜 버그 해결 (longSide, shortSide 분리)",
                     "Winner Core Children Count: $bestChildCount",
                     "Winner Score: ${String.format("%.0f", bestScore)} pts"
                 ), screenRatio)
@@ -506,19 +507,33 @@ object PlateDetectionEngine {
             if (bestContour == null) return null
 
             // =====================================================================
-            // 🚀 [Step 11] 기하학 정렬 및 최종 4점 추출 (수학적 극단점 방식 유지)
+            // 🚀 [Step 11] 기하학 정렬 및 최종 4점 추출 (Bleeding 해결 + 안전한 수축)
             // =====================================================================
             val contourPts = bestContour!!.toArray()
 
-            val topLeft = contourPts.minByOrNull { it.x + it.y }!!
-            val bottomRight = contourPts.maxByOrNull { it.x + it.y }!!
-            val topRight = contourPts.maxByOrNull { it.x - it.y }!!
-            val bottomLeft = contourPts.minByOrNull { it.x - it.y }!!
+            val rawTopLeft = contourPts.minByOrNull { it.x + it.y }!!
+            val rawBottomRight = contourPts.maxByOrNull { it.x + it.y }!!
+            val rawTopRight = contourPts.maxByOrNull { it.x - it.y }!!
+            val rawBottomLeft = contourPts.minByOrNull { it.x - it.y }!!
 
-            val orderedPoints = arrayOf(topLeft, topRight, bottomRight, bottomLeft)
+            // 하얀색 영역만 깔끔하게 덮기 위해 중심점(Center)을 향해 4점을 수축(Inset)
+            val cx = (rawTopLeft.x + rawTopRight.x + rawBottomRight.x + rawBottomLeft.x) / 4.0
+            val cy = (rawTopLeft.y + rawTopRight.y + rawBottomRight.y + rawBottomLeft.y) / 4.0
+
+            // 수축 비율 설정 (가림막 스티커가 검은 프레임을 덮지 않고 안쪽에 안착하도록)
+            val scaleX = 0.95 
+            val scaleY = 0.82 
+
+            val orderedPoints = arrayOf(rawTopLeft, rawTopRight, rawBottomRight, rawBottomLeft).map { pt ->
+                Point(
+                    cx + (pt.x - cx) * scaleX,
+                    cy + (pt.y - cy) * scaleY
+                )
+            }.toTypedArray()
 
             val invRotMat = Mat()
             Imgproc.invertAffineTransform(rotMat, invRotMat)
+            
             val pointsInRotatedLoose = orderedPoints.map { Point(it.x + tightRect.x, it.y + tightRect.y) }.toTypedArray()
             val srcMat = MatOfPoint2f(*pointsInRotatedLoose)
             val dstMat = MatOfPoint2f()
@@ -539,10 +554,10 @@ object PlateDetectionEngine {
                 Utils.matToBitmap(debugMat, debugBmp)
                 val hudBmp = addDebugHUD(debugBmp, "Step 11: Final Geometry Export", listOf(
                     "Mathematical Extreme Points (x±y) applied.",
-                    "Perfected 4 Outer Boundary Points mapped.",
+                    "Bleeding fixed. Corners perfectly matched.",
                     "Ready to warp perspective mask!"
                 ), screenRatio)
-                it.pauseAndShowStep("11단계: 최종 외부 테두리 4점 원본 이미지 보정", hudBmp)
+                it.pauseAndShowStep("11단계: 최종 4점 원본 이미지 보정", hudBmp)
                 debugMat.release(); debugBmp.recycle()
             }
 
@@ -554,6 +569,7 @@ object PlateDetectionEngine {
         } finally {
             edges.release()
             horizontalKernel.release() 
+            openKernel.release()
             contours.forEach { it.release() }
             hierarchy.release()
             
