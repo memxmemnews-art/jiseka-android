@@ -317,23 +317,17 @@ object PlateDetectionEngine {
         }
 
         // =====================================================================
-        // 🚀 [Step 8 & 9] 진짜 테두리 찾기 (에지 증발 버그 수정 및 브릿지 최소화)
+        // 🚀 [Step 8 & 9] 진짜 테두리 찾기
         // =====================================================================
         val edges = Mat()
-        // 가로 봉합 커널 크기를 줄여서(7x1 -> 4x1) 그릴과 무리하게 연결되는 현상 방지
         val horizontalKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(4.0, 1.0))
         val contours = ArrayList<MatOfPoint>()
         val hierarchy = Mat()
         var resultPoints: List<ImmutablePoint>? = null
 
         try {
-            // 블러를 줄여서 경계선을 날카롭게 유지 (그릴과 번호판이 뭉개져 섞이지 않도록)
             Imgproc.GaussianBlur(tightGray, tightGray, Size(3.0, 3.0), 0.0)
-            
-            // Canny 임계값을 적절히 타협 (번호판은 잡고, 얕은 그릴 선은 무시)
             Imgproc.Canny(tightGray, edges, 40.0, 120.0) 
-            
-            // 끊어진 번호판 테두리만 조심스럽게 봉합 (1픽셀 두께 증발 방지를 위해 MORPH_OPEN 제거)
             Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_CLOSE, horizontalKernel)
 
             debugListener?.let {
@@ -343,15 +337,14 @@ object PlateDetectionEngine {
                 Utils.matToBitmap(debugMat, debugBmp)
                 val hudBmp = addDebugHUD(debugBmp, "Step 8~9: Fixed Canny Map", listOf(
                     "Method: Blur(3) + Canny(40,120) + Close(4x1)",
-                    "Fix: Removed MORPH_OPEN to prevent edge evaporation.",
                     "Target: Keep plate edge alive & minimize grille bridge."
                 ), screenRatio)
-                it.pauseAndShowStep("8~9단계: 번호판 테두리 추출 (증발 버그 수정)", hudBmp)
+                it.pauseAndShowStep("8~9단계: 번호판 테두리 추출", hudBmp)
                 debugMat.release(); debugBmp.recycle()
             }
 
             // =====================================================================
-            // 🚀 [Step 10] 윤곽선 계층 채점 (2-Pass 구조: Strict -> Fallback)
+            // 🚀 [Step 10] 윤곽선 계층 채점
             // =====================================================================
             val tightCharCenters = mutableListOf<Point>()
             if (charList.isNotEmpty()) {
@@ -502,7 +495,6 @@ object PlateDetectionEngine {
                 val hudBmp = addDebugHUD(debugBmp, "Step 10: Size Filtered Hierarchy Scoring", listOf(
                     statusText,
                     modeText,
-                    "Fix: w,h 뒤바뀜 버그 해결 (longSide, shortSide 분리)",
                     "Winner Core Children Count: $bestChildCount",
                     "Winner Score: ${String.format("%.0f", bestScore)} pts"
                 ), screenRatio)
@@ -513,33 +505,34 @@ object PlateDetectionEngine {
             if (bestContour == null) return null
 
             // =====================================================================
-            // 🚀 [Step 11] 기하학 정렬 및 최종 4점 추출 (강제 수축 로직 제거 및 1:1 매핑)
+            // 🚀 [Step 11] 기하학 정렬 및 최종 4점 추출 (Convex Hull 기반 완벽 모서리 복원)
             // =====================================================================
-            val contour2f = MatOfPoint2f(*bestContour!!.toArray())
+            val contourPts = bestContour!!.toArray()
+            val contourMat = MatOfPoint(*contourPts)
+            val hull = MatOfInt()
             
-            // 윤곽선의 원근감(사다리꼴)을 유지하면서 잔가지(노이즈)만 직선으로 펴주는 다각형 근사화
-            val approxCurve = MatOfPoint2f()
-            val perimeter = Imgproc.arcLength(contour2f, true)
-            Imgproc.approxPolyDP(contour2f, approxCurve, perimeter * 0.02, true) 
-            
-            val cleanPts = if (approxCurve.rows() >= 4) approxCurve.toArray() else contour2f.toArray()
+            // 💡 [해결책] 볼록 껍질(Convex Hull) 적용: 윤곽선이 안쪽으로 파고든(오목한) 부분을
+            // 고무줄 팽팽하게 당기듯 무시하고, 가장 바깥쪽의 진짜 모서리 한계선만 추출합니다.
+            Imgproc.convexHull(contourMat, hull)
 
-            val rawTopLeft = cleanPts.minByOrNull { it.x + it.y }!!
-            val rawBottomRight = cleanPts.maxByOrNull { it.x + it.y }!!
-            val rawTopRight = cleanPts.maxByOrNull { it.x - it.y }!!
-            val rawBottomLeft = cleanPts.minByOrNull { it.x - it.y }!!
+            val hullIndices = hull.toArray()
+            val hullPts = hullIndices.map { contourPts[it] }
 
-            contour2f.release()
-            approxCurve.release()
+            // 볼록 껍질 위에서 극단점을 추출하므로 절대 번호판 안쪽 홈(오목한 점)이 잡히지 않습니다.
+            val rawTopLeft = hullPts.minByOrNull { it.x + it.y }!!
+            val rawBottomRight = hullPts.maxByOrNull { it.x + it.y }!!
+            val rawTopRight = hullPts.maxByOrNull { it.x - it.y }!!
+            val rawBottomLeft = hullPts.minByOrNull { it.x - it.y }!!
 
-            // 🚨 수축(Inset) 부작용 예측 완료 및 완전 제거: 
-            // 8~10단계에서 확보된 완벽한 경계선 좌표를 변형 없이 100% 그대로 활용
+            contourMat.release()
+            hull.release()
+
+            // 🚨 수축(Inset) 부작용 제거: 확보된 완벽한 경계선 좌표를 100% 그대로 활용
             val orderedPoints = arrayOf(rawTopLeft, rawTopRight, rawBottomRight, rawBottomLeft)
 
             val invRotMat = Mat()
             Imgproc.invertAffineTransform(rotMat, invRotMat)
             
-            // 회전/크롭된 좌표를 다시 원본 사진(풀사이즈)의 좌표계로 되돌리기
             val pointsInRotatedLoose = orderedPoints.map { Point(it.x + tightRect.x, it.y + tightRect.y) }.toTypedArray()
             val srcMat = MatOfPoint2f(*pointsInRotatedLoose)
             val dstMat = MatOfPoint2f()
@@ -559,8 +552,8 @@ object PlateDetectionEngine {
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
                 val hudBmp = addDebugHUD(debugBmp, "Step 11: Final Geometry Export", listOf(
-                    "Mathematical Extreme Points (x±y) applied.",
-                    "Removed manual inset scaling (1:1 mapping).",
+                    "Convex Hull Rubber-Band Applied.",
+                    "Concave noise successfully ignored.",
                     "Ready to warp perspective mask!"
                 ), screenRatio)
                 it.pauseAndShowStep("11단계: 최종 외부 테두리 4점 원본 이미지 보정", hudBmp)
