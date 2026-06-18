@@ -173,11 +173,11 @@ object PlateDetectionEngine {
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
             val hudBmp = addDebugHUD(debugBmp, "Step 2: Downsized ROI (Ratio 2:1)", listOf(
-                "ROI Width: $roiWidth px (화면 가로폭의 22%)",
-                "ROI Height: $roiHeight px (2:1 비율 완벽 적용)",
+                "ROI Width: $roiWidth px",
+                "ROI Height: $roiHeight px",
                 "Rect Bounds: [L:$looseLeft, T:$looseTop, R:$looseRight, B:$looseBottom]"
             ), screenRatio)
-            it.pauseAndShowStep("2단계: 컴팩트 2:1 탐색 구역 설정", hudBmp)
+            it.pauseAndShowStep("2단계: 컴팩트 탐색 구역 설정", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
 
@@ -195,7 +195,7 @@ object PlateDetectionEngine {
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
         
         // =====================================================================
-        // 🚀 [Step 5] 문자 중심점 추출 및 실패 원인 분석
+        // 🚀 [Step 5] 문자 중심점 및 초기 와이어프레임(뼈대) 도출
         // =====================================================================
         val tempContours = ArrayList<MatOfPoint>()
         val tempHierarchy = Mat()
@@ -203,7 +203,7 @@ object PlateDetectionEngine {
 
         class CharData(val center: Point, val width: Double, val height: Double, val rect: Rect)
         val charList = mutableListOf<CharData>()
-        val allRects = mutableListOf<Rect>() // 실패 시 원인 분석을 위해 모든 바운딩 박스 기록
+        val allRects = mutableListOf<Rect>()
 
         for (contour in tempContours) {
             val rect = Imgproc.boundingRect(contour)
@@ -211,7 +211,6 @@ object PlateDetectionEngine {
             val ratio = rect.height.toDouble() / max(rect.width.toDouble(), 1.0)
             
             allRects.add(rect)
-
             if (ratio in 1.2..4.2 && area > 120 && rect.height >= 40 && area < looseRect.area() * 0.08) {
                 val center = Point(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
                 charList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect))
@@ -219,96 +218,111 @@ object PlateDetectionEngine {
         }
         tempContours.forEach { it.release() }; tempHierarchy.release(); tempOpen.release(); tempClose.release()
 
-        // 🚨 실패 원인 부검 (Post-Mortem) 디버그 화면
         if (charList.size < 2) {
-            debugListener?.let {
-                val debugMat = looseMat.clone()
-                for (rect in allRects) Imgproc.rectangle(debugMat, rect, Scalar(255.0, 0.0, 0.0, 255.0), 2)
-                for (charData in charList) Imgproc.rectangle(debugMat, charData.rect, Scalar(0.0, 255.0, 0.0, 255.0), 5)
-                
-                val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
-                Utils.matToBitmap(debugMat, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "🚨 FAILED: Text Core Not Found", listOf(
-                    "Reason: 뼈대를 세울 유효 문자가 2개 미만(${charList.size}개)입니다.",
-                    "Guide: 빨간 박스(탈락 객체)들의 비율과 찌그러짐을 확인하세요.",
-                    "Tip: 세차장 조명 난반사, 도장면 물기, 파라미터(Area/Ratio) 점검 요망."
-                ), screenRatio)
-                it.pauseAndShowStep("❌ 탐색 실패: 문자 코어 확보 미달", hudBmp)
-                debugMat.release(); debugBmp.recycle()
-            }
-            
-            thresh.release()
-            looseMat.release(); looseGray.release()
-            fullMat.release(); fullGray.release()
+            thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
             return null
         }
 
-        var angle = 0.0
-        var tightLeft = 0; var tightRight = looseRect.width
-        var tightTop = 0; var tightBottom = looseRect.height
-
-        val pointsMat = MatOfPoint2f(*charList.map { it.center }.toTypedArray())
+        val sortedChars = charList.sortedBy { it.center.x }
+        val pointsMat = MatOfPoint2f(*sortedChars.map { it.center }.toTypedArray())
         val line = Mat()
         Imgproc.fitLine(pointsMat, line, Imgproc.DIST_L2, 0.0, 0.01, 0.01)
         val vx = line.get(0, 0)[0]; val vy = line.get(1, 0)[0]
-        angle = Math.toDegrees(Math.atan2(vy, vx))
+        val angle = Math.toDegrees(Math.atan2(vy, vx))
         
-        val tempRotMat = Imgproc.getRotationMatrix2D(Point(looseRect.width / 2.0, looseRect.height / 2.0), angle, 1.0)
-        val dstCenterPts = MatOfPoint2f()
-        Core.transform(pointsMat, dstCenterPts, tempRotMat)
+        // 💡 요청하신 기능: 3~5단계에서 즉시 4면 뼈대(Wireframe) 추출
+        val topPtsArray = sortedChars.map { Point(it.center.x, it.rect.y.toDouble()) }.toTypedArray()
+        val bottomPtsArray = sortedChars.map { Point(it.center.x, it.rect.y.toDouble() + it.rect.height) }.toTypedArray()
         
-        val rotCenters = dstCenterPts.toArray()
-        val minX = rotCenters.minOf { it.x }
-        val maxX = rotCenters.maxOf { it.x }
-        val avgY = rotCenters.map { it.y }.average()
-        val avgH = charList.map { it.height }.average()
-        val textSpreadWidth = maxX - minX
+        val topPts = MatOfPoint2f(*topPtsArray); val bottomPts = MatOfPoint2f(*bottomPtsArray)
+        val topLineMat = Mat(); val bottomLineMat = Mat()
         
-        val expectedHeight = (avgH * 2.8).coerceAtMost(looseRect.height.toDouble()) 
-        val marginX = max(textSpreadWidth * 0.15, avgH * 1.5)
+        Imgproc.fitLine(topPts, topLineMat, Imgproc.DIST_L2, 0.0, 0.01, 0.01)
+        Imgproc.fitLine(bottomPts, bottomLineMat, Imgproc.DIST_L2, 0.0, 0.01, 0.01)
 
-        tightLeft = (minX - marginX).toInt()
-        tightRight = (maxX + marginX).toInt()
-        tightTop = (avgY - expectedHeight / 2.0).toInt()
-        tightBottom = (avgY + expectedHeight / 2.0).toInt()
+        val tvx = topLineMat.get(0, 0)[0]; val tvy = topLineMat.get(1, 0)[0]
+        val tx0 = topLineMat.get(2, 0)[0]; val ty0 = topLineMat.get(3, 0)[0]
+        
+        val bvx = bottomLineMat.get(0, 0)[0]; val bvy = bottomLineMat.get(1, 0)[0]
+        val bx0 = bottomLineMat.get(2, 0)[0]; val by0 = bottomLineMat.get(3, 0)[0]
+
+        // 좌/우 뼈대는 중앙선(vx, vy)과 수직이 되도록 하향 벡터(-vy, vx) 적용
+        var lvx = -vy; var lvy = vx; if (lvy < 0) { lvx = -lvx; lvy = -lvy }
+        val rvx = lvx; val rvy = lvy
+        
+        val lx0 = sortedChars.first().rect.x.toDouble(); val ly0 = sortedChars.first().center.y
+        val rx0 = sortedChars.last().rect.x.toDouble() + sortedChars.last().rect.width; val ry0 = sortedChars.last().center.y
+
+        // 교차점(수학적 꼭짓점) 도출 함수
+        fun getIntersect(x1: Double, y1: Double, vx1: Double, vy1: Double, x2: Double, y2: Double, vx2: Double, vy2: Double): Point {
+            val dx = x2 - x1; val dy = y2 - y1
+            val det = vx2 * vy1 - vy2 * vx1
+            if (abs(det) < 1e-6) return Point(x1, y1)
+            val u = (dy * vx1 - dx * vy1) / det
+            return Point(x2 + u * vx2, y2 + u * vy2)
+        }
+
+        // 💡 가장 날것의 뼈대 4점 (회전하기 전 원본 공간에서의 뼈대)
+        val initTL = getIntersect(tx0, ty0, tvx, tvy, lx0, ly0, lvx, lvy)
+        val initTR = getIntersect(tx0, ty0, tvx, tvy, rx0, ry0, rvx, rvy)
+        val initBR = getIntersect(bx0, by0, bvx, bvy, rx0, ry0, rvx, rvy)
+        val initBL = getIntersect(bx0, by0, bvx, bvy, lx0, ly0, lvx, lvy)
+        val initWireframePts = arrayOf(initTL, initTR, initBR, initBL)
         
         debugListener?.let {
             val debugMat = looseMat.clone()
-            val x0 = line.get(2, 0)[0]; val y0 = line.get(3, 0)[0]
-            val pt1 = Point(x0 - vx * 1000, y0 - vy * 1000)
-            val pt2 = Point(x0 + vx * 1000, y0 + vy * 1000)
-            Imgproc.line(debugMat, pt1, pt2, Scalar(0.0, 255.0, 0.0, 255.0), 3)
+            // 💡 3~5단계 디버그 창에 완성된 뼈대를 즉시 보라색 선으로 렌더링
+            for (i in 0..3) Imgproc.line(debugMat, initWireframePts[i], initWireframePts[(i+1)%4], Scalar(255.0, 0.0, 255.0, 255.0), 3)
             for (charData in charList) Imgproc.circle(debugMat, charData.center, 5, Scalar(255.0, 0.0, 0.0, 255.0), -1)
             
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
-            val hudBmp = addDebugHUD(debugBmp, "Step 3~5: Cleaned Text Fitting", listOf(
+            val hudBmp = addDebugHUD(debugBmp, "Step 3~5: Text Core Wireframe", listOf(
                 "Valid Characters Found: ${charList.size}",
                 "Fitted Line Angle: ${String.format("%.2f", angle)} deg",
-                "Status: 텍스트 클러스터 정상 감지"
+                "Action: 회전 전, 날것의 좌표계에서 뼈대 구축 완료!"
             ), screenRatio)
-            it.pauseAndShowStep("3~5단계: 문자 탐색 및 기울기 계산", hudBmp)
+            it.pauseAndShowStep("3~5단계: 문자 탐색 및 기초 뼈대 구축", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
-        pointsMat.release(); line.release(); tempRotMat.release(); dstCenterPts.release()
+        pointsMat.release(); line.release(); topPts.release(); bottomPts.release()
+        topLineMat.release(); bottomLineMat.release()
 
         // =====================================================================
-        // 🚀 [Step 6 & 7] 회전 및 타이트 ROI 추출
+        // 🚀 [Step 6 & 7] 회전 및 타이트 ROI 추출 (뼈대도 함께 회전시킴!)
         // =====================================================================
         val rotMat = Imgproc.getRotationMatrix2D(Point(looseRect.width / 2.0, looseRect.height / 2.0), angle, 1.0)
         val rotatedLooseMat = Mat(); val rotatedLooseGray = Mat()
         Imgproc.warpAffine(looseMat, rotatedLooseMat, rotMat, looseMat.size(), Imgproc.INTER_LINEAR)
         Imgproc.warpAffine(looseGray, rotatedLooseGray, rotMat, looseGray.size(), Imgproc.INTER_LINEAR)
 
-        tightLeft = tightLeft.coerceIn(0, rotatedLooseMat.cols() - 1)
-        tightRight = tightRight.coerceIn(1, rotatedLooseMat.cols())
-        tightTop = tightTop.coerceIn(0, rotatedLooseMat.rows() - 1)
-        tightBottom = tightBottom.coerceIn(1, rotatedLooseMat.rows())
+        // 💡 뼈대의 4점을 회전 변환하여 새로운 ROI 기준점으로 사용
+        val srcPtsMat = MatOfPoint2f(*initWireframePts)
+        val rotatedPtsMat = MatOfPoint2f()
+        Core.transform(srcPtsMat, rotatedPtsMat, rotMat)
+        val rotatedWireframePts = rotatedPtsMat.toArray()
+
+        val minX = rotatedWireframePts.minOf { it.x }
+        val maxX = rotatedWireframePts.maxOf { it.x }
+        val minY = rotatedWireframePts.minOf { it.y }
+        val maxY = rotatedWireframePts.maxOf { it.y }
+        
+        val avgH = charList.map { it.height }.average()
+        val marginX = avgH * 2.0
+        val marginY = avgH * 1.5
+
+        val tightLeft = (minX - marginX).toInt().coerceIn(0, rotatedLooseMat.cols() - 1)
+        val tightRight = (maxX + marginX).toInt().coerceIn(1, rotatedLooseMat.cols())
+        val tightTop = (minY - marginY).toInt().coerceIn(0, rotatedLooseMat.rows() - 1)
+        val tightBottom = (maxY + marginY).toInt().coerceIn(1, rotatedLooseMat.rows())
 
         val tightRect = Rect(tightLeft, tightTop, tightRight - tightLeft, tightBottom - tightTop)
         val tightMat = Mat(); val tightGray = Mat()
         rotatedLooseMat.submat(tightRect).copyTo(tightMat)
         rotatedLooseGray.submat(tightRect).copyTo(tightGray)
+
+        // 💡 회전된 뼈대 좌표를 TightMat(잘린 이미지) 공간 좌표계로 완벽히 일치되게 이동
+        val tightWireframePts = rotatedWireframePts.map { Point(it.x - tightRect.x, it.y - tightRect.y) }.toTypedArray()
 
         debugListener?.let {
             val debugMat = rotatedLooseMat.clone()
@@ -317,15 +331,15 @@ object PlateDetectionEngine {
             Utils.matToBitmap(debugMat, debugBmp)
             val hudBmp = addDebugHUD(debugBmp, "Step 6~7: True Plate Bound ROI", listOf(
                 "Image leveled to 0 degrees.",
-                "Tight ROI size: ${tightRect.width} x ${tightRect.height}",
-                "Ready for Outer Edge Tracking."
+                "Action: 뼈대를 감싸는 타이트한 탐색 구역 설정",
+                "좌표계 오차(Mismatch) 완벽 해결."
             ), screenRatio)
             it.pauseAndShowStep("6~7단계: 수평 회전 및 타이트 탐색 영역 확정", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
 
         // =====================================================================
-        // 🚀 [Step 8 & 9] 진짜 테두리 찾기 (이중 구조적 모폴로지 최적화)
+        // 🚀 [Step 8 & 9] 진짜 테두리 찾기 (이중 모폴로지)
         // =====================================================================
         val edges = Mat()
         val verticalKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(1.0, 7.0))
@@ -333,8 +347,6 @@ object PlateDetectionEngine {
         
         val mask = Mat()
         val intersectMat = Mat()
-        val topLineMat = Mat()
-        val bottomLineMat = Mat()
         val invRotMat = Mat()
 
         var resultPoints: List<ImmutablePoint>? = null
@@ -345,76 +357,34 @@ object PlateDetectionEngine {
             Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_CLOSE, verticalKernel)
             Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_CLOSE, horizontalKernel)
 
-            debugListener?.let {
-                val debugMat = Mat()
-                Imgproc.cvtColor(edges, debugMat, Imgproc.COLOR_GRAY2RGBA)
-                val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
-                Utils.matToBitmap(debugMat, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "Step 8~9: Fixed Canny Map", listOf(
-                    "Method: medianBlur(3) + Canny(35,100)",
-                    "Morphology: Vertical Close(1x7) -> Horizontal Close(3x1)",
-                    "Insight: 세로 단절 우선 복구 및 과연결 부작용 제어"
-                ), screenRatio)
-                it.pauseAndShowStep("8~9단계: 번호판 테두리 이중 봉합 완료", hudBmp)
-                debugMat.release(); debugBmp.recycle()
-            }
-
             // =====================================================================
-            // 🚀 [Step 10] Text-Anchored Wireframe Snapping (텍스트 뼈대 스내핑)
+            // 🚀 [Step 10] 교정된 뼈대를 기반으로 한 스내핑 (Snapping)
             // =====================================================================
-            val sortedChars = charList.sortedBy { it.center.x }
-            val avgCharHeight = charList.map { it.height }.average()
-            val finalSpreadWidth = sortedChars.last().center.x - sortedChars.first().center.x
+            // 💡 Tight 좌표계에 맞춰진 뼈대의 4점에서 새롭게 벡터와 원점을 추출 (좌표 불일치 버그 해결)
+            val tTL = tightWireframePts[0]; val tTR = tightWireframePts[1]
+            val tBR = tightWireframePts[2]; val tBL = tightWireframePts[3]
 
-            // 상/하단 가로줄 뼈대 (Trend Line) 추출
-            val topPtsArray = sortedChars.map { Point(it.center.x, it.rect.y.toDouble()) }.toTypedArray()
-            val bottomPtsArray = sortedChars.map { Point(it.center.x, it.rect.y.toDouble() + it.rect.height) }.toTypedArray()
-            
-            val topPts = MatOfPoint2f(*topPtsArray)
-            val bottomPts = MatOfPoint2f(*bottomPtsArray)
-            
-            Imgproc.fitLine(topPts, topLineMat, Imgproc.DIST_L2, 0.0, 0.01, 0.01)
-            Imgproc.fitLine(bottomPts, bottomLineMat, Imgproc.DIST_L2, 0.0, 0.01, 0.01)
+            var pTvx = tTR.x - tTL.x; var pTvy = tTR.y - tTL.y
+            val tLen = hypot(pTvx, pTvy); pTvx /= tLen; pTvy /= tLen
+            val pTx0 = tTL.x; val pTy0 = tTL.y
 
-            val tvx = topLineMat.get(0, 0)[0]; val tvy = topLineMat.get(1, 0)[0]
-            val tx0 = topLineMat.get(2, 0)[0]; val ty0 = topLineMat.get(3, 0)[0]
-            
-            val bvx = bottomLineMat.get(0, 0)[0]; val bvy = bottomLineMat.get(1, 0)[0]
-            val bx0 = bottomLineMat.get(2, 0)[0]; val by0 = bottomLineMat.get(3, 0)[0]
+            var pBvx = tBR.x - tBL.x; var pBvy = tBR.y - tBL.y
+            val bLen = hypot(pBvx, pBvy); pBvx /= bLen; pBvy /= bLen
+            val pBx0 = tBL.x; val pBy0 = tBL.y
 
-            // 좌/우측 세로줄 뼈대 (순수 수직 팽창)
-            val lvx = 0.0; val lvy = 1.0
-            val lx0 = sortedChars.first().rect.x.toDouble(); val ly0 = sortedChars.first().center.y
-            
-            val rvx = 0.0; val rvy = 1.0
-            val rx0 = sortedChars.last().rect.x.toDouble() + sortedChars.last().rect.width; val ry0 = sortedChars.last().center.y
+            var pLvx = tBL.x - tTL.x; var pLvy = tBL.y - tTL.y
+            val lLen = hypot(pLvx, pLvy); pLvx /= lLen; pLvy /= lLen
+            val pLx0 = tTL.x; val pLy0 = tTL.y
 
-            // 🚨 [디버그 10.1] 팽창 전 초기 뼈대(Wireframe) 상태 확인
-            debugListener?.let {
-                val debugMat = tightMat.clone()
-                val lineLen = finalSpreadWidth / 2.0
-                val hLineLen = avgCharHeight
-                
-                Imgproc.line(debugMat, Point(tx0 - tvx * lineLen, ty0 - tvy * lineLen), Point(tx0 + tvx * lineLen, ty0 + tvy * lineLen), Scalar(255.0, 0.0, 255.0, 255.0), 2)
-                Imgproc.line(debugMat, Point(bx0 - bvx * lineLen, by0 - bvy * lineLen), Point(bx0 + bvx * lineLen, by0 + bvy * lineLen), Scalar(255.0, 0.0, 255.0, 255.0), 2)
-                Imgproc.line(debugMat, Point(lx0 - lvx * hLineLen, ly0 - lvy * hLineLen), Point(lx0 + lvx * hLineLen, ly0 + lvy * hLineLen), Scalar(0.0, 255.0, 255.0, 255.0), 2)
-                Imgproc.line(debugMat, Point(rx0 - rvx * hLineLen, ry0 - rvy * hLineLen), Point(rx0 + rvx * hLineLen, ry0 + rvy * hLineLen), Scalar(0.0, 255.0, 255.0, 255.0), 2)
+            var pRvx = tBR.x - tTR.x; var pRvy = tBR.y - tTR.y
+            val rLen = hypot(pRvx, pRvy); pRvx /= rLen; pRvy /= rLen
+            val pRx0 = tTR.x; val pRy0 = tTR.y
 
-                val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
-                Utils.matToBitmap(debugMat, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "Step 10.1: Initial Wireframe", listOf(
-                    "Action: 글자 중심점을 관통하는 뼈대 생성",
-                    "Check: 이 선들이 번호판 기울기와 평행한가?",
-                    "노이즈(그릴 등)가 섞였다면 선이 심하게 틀어집니다."
-                ), screenRatio)
-                it.pauseAndShowStep("10.1단계: 팽창 전 초기 뼈대 확인", hudBmp)
-                debugMat.release(); debugBmp.recycle()
-            }
-
+            // 스내핑 비트 연산 준비
             mask.create(edges.size(), CvType.CV_8UC1)
             val imgBounds = Rect(0, 0, edges.cols(), edges.rows())
 
-            // 💡 핵심 팽창 함수: 길이를 글자에 맞춰 최적화
+            // 💡 무한선 버그 수정: 검사 선의 길이를 실제 글자 범위(lineSpan)에 맞춤
             fun snapLine(
                 lineVx: Double, lineVy: Double, originX: Double, originY: Double,
                 nx: Double, ny: Double, maxSteps: Int, lineSpan: Double
@@ -430,13 +400,10 @@ object PlateDetectionEngine {
                     val currentX = originX + nx * step
                     val currentY = originY + ny * step
                     
-                    p1.x = currentX - lineVx * (lineSpan / 2.0)
-                    p1.y = currentY - lineVy * (lineSpan / 2.0)
-                    p2.x = currentX + lineVx * (lineSpan / 2.0)
-                    p2.y = currentY + lineVy * (lineSpan / 2.0)
+                    p1.x = currentX - lineVx * (lineSpan / 2.0); p1.y = currentY - lineVy * (lineSpan / 2.0)
+                    p2.x = currentX + lineVx * (lineSpan / 2.0); p2.y = currentY + lineVy * (lineSpan / 2.0)
                     
                     Imgproc.clipLine(imgBounds, p1, p2)
-                    
                     mask.setTo(Scalar(0.0))
                     Imgproc.line(mask, p1, p2, Scalar(255.0), 1)
                     Core.bitwise_and(edges, mask, intersectMat)
@@ -450,29 +417,25 @@ object PlateDetectionEngine {
                             snappedX = currentX; snappedY = currentY
                             break
                         }
-                    } else {
-                        consecutiveHits = 0
-                    }
-                    
+                    } else { consecutiveHits = 0 }
                     if (step == maxSteps) { snappedX = currentX; snappedY = currentY }
                 }
                 return Pair(snappedX, snappedY)
             }
 
-            val limit = (avgCharHeight * 1.2).toInt()
+            val limit = (lLen * 1.2).toInt() // 글자 높이(lLen)의 1.2배까지만 탐색
             
-            var tnx = -tvy; var tny = tvx
-            if (tny > 0) { tnx = -tnx; tny = -tny }
-            val finalTop = snapLine(tvx, tvy, tx0, ty0, tnx, tny, limit, finalSpreadWidth * 0.9)
+            // 법선 벡터 계산 (밖으로 밀어내는 방향)
+            var tnx = -pTvy; var tny = pTvx; if (tny > 0) { tnx = -tnx; tny = -tny } // 위로
+            var bnx = -pBvy; var bny = pBvx; if (bny < 0) { bnx = -bnx; bny = -bny } // 아래로
+            var lnx = -pLvy; var lny = pLvx; if (lnx > 0) { lnx = -lnx; lny = -lny } // 왼쪽으로
+            var rnx = -pRvy; var rny = pRvx; if (rnx < 0) { rnx = -rnx; rny = -rny } // 오른쪽으로
 
-            var bnx = -bvy; var bny = bvx
-            if (bny < 0) { bnx = -bnx; bny = -bny }
-            val finalBottom = snapLine(bvx, bvy, bx0, by0, bnx, bny, limit, finalSpreadWidth * 0.9)
+            val finalTop = snapLine(pTvx, pTvy, pTx0, pTy0, tnx, tny, limit, tLen * 0.9)
+            val finalBottom = snapLine(pBvx, pBvy, pBx0, pBy0, bnx, bny, limit, tLen * 0.9)
+            val finalLeft = snapLine(pLvx, pLvy, pLx0, pLy0, lnx, lny, limit, lLen * 1.5)
+            val finalRight = snapLine(pRvx, pRvy, pRx0, pRy0, rnx, rny, limit, lLen * 1.5)
 
-            val finalLeft = snapLine(lvx, lvy, lx0, ly0, -1.0, 0.0, limit, avgCharHeight * 1.5)
-            val finalRight = snapLine(rvx, rvy, rx0, ry0, 1.0, 0.0, limit, avgCharHeight * 1.5)
-
-            // 🚨 [디버그 10.2] Canny 위에서 팽창이 멈춘 위치 확인
             debugListener?.let {
                 val debugMat = Mat()
                 Imgproc.cvtColor(edges, debugMat, Imgproc.COLOR_GRAY2RGBA)
@@ -487,37 +450,24 @@ object PlateDetectionEngine {
 
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "Step 10.2: Snapped Bounds on Canny", listOf(
-                    "Action: 뼈대를 밀어내어 Canny 흰색 선에 멈춤",
-                    "Check: 초록색 선이 엉뚱한 노이즈에 걸려 멈췄는가?",
-                    "제대로 멈췄다면 이 선들의 교차점이 최종 가림막이 됩니다."
+                val hudBmp = addDebugHUD(debugBmp, "Step 8~10: Edge Snapping Check", listOf(
+                    "Method: Canny Map + Wireframe Expansion",
+                    "Action: 뼈대를 밀어내어 진짜 테두리에서 멈춤",
+                    "무한선 버그 수정으로 노이즈 관통력 상승!"
                 ), screenRatio)
-                it.pauseAndShowStep("10.2단계: 에지 충돌 스내핑 결과 확인", hudBmp)
+                it.pauseAndShowStep("8~10단계: 에지 렌더링 및 스내핑 확인", hudBmp)
                 debugMat.release(); debugBmp.recycle()
             }
 
-            fun getIntersect(
-                p1: Pair<Double, Double>, v1: Pair<Double, Double>,
-                p2: Pair<Double, Double>, v2: Pair<Double, Double>
-            ): Point {
-                val dx = p2.first - p1.first
-                val dy = p2.second - p1.second
-                val det = v2.first * v1.second - v2.second * v1.first
-                if (abs(det) < 1e-6) return Point(p1.first, p1.second) 
-                val u = (dy * v1.first - dx * v1.second) / det
-                return Point(p2.first + u * v2.first, p2.second + u * v2.second)
-            }
-
-            val ptTL = getIntersect(finalTop, Pair(tvx, tvy), finalLeft, Pair(lvx, lvy))
-            val ptTR = getIntersect(finalTop, Pair(tvx, tvy), finalRight, Pair(rvx, rvy))
-            val ptBR = getIntersect(finalBottom, Pair(bvx, bvy), finalRight, Pair(rvx, rvy))
-            val ptBL = getIntersect(finalBottom, Pair(bvx, bvy), finalLeft, Pair(lvx, lvy))
+            val ptTL = getIntersect(finalTop.first, finalTop.second, pTvx, pTvy, finalLeft.first, finalLeft.second, pLvx, pLvy)
+            val ptTR = getIntersect(finalTop.first, finalTop.second, pTvx, pTvy, finalRight.first, finalRight.second, pRvx, pRvy)
+            val ptBR = getIntersect(finalBottom.first, finalBottom.second, pBvx, pBvy, finalRight.first, finalRight.second, pRvx, pRvy)
+            val ptBL = getIntersect(finalBottom.first, finalBottom.second, pBvx, pBvy, finalLeft.first, finalLeft.second, pLvx, pLvy)
 
             val orderedPoints = arrayOf(ptTL, ptTR, ptBR, ptBL)
-            topPts.release(); bottomPts.release()
 
             // =====================================================================
-            // 🚀 [Step 11] 기하학 정렬: 최종 극단점 원본 이미지 좌표로 역회전 매핑
+            // 🚀 [Step 11] 기하학 정렬: 최종 극단점 원본 좌표로 역회전
             // =====================================================================
             Imgproc.invertAffineTransform(rotMat, invRotMat)
             
@@ -543,8 +493,8 @@ object PlateDetectionEngine {
                 Utils.matToBitmap(debugMat, debugBmp)
                 
                 val hudBmp = addDebugHUD(debugBmp, "Step 11: Final Export", listOf(
-                    "Mode: Text Core Polygon Expansion",
-                    "Result: Perspective Intact & Snapped.",
+                    "Mode: Text Core Wireframe Snapping",
+                    "Result: Perspective Intact & Precision Fit.",
                     "교차점을 원본 해상도 좌표계로 복원 완료."
                 ), screenRatio)
                 it.pauseAndShowStep("11단계: 최종 좌표 보정 완료", hudBmp)
@@ -553,8 +503,8 @@ object PlateDetectionEngine {
 
             resultPoints = finalPts.map { ImmutablePoint(it.x.toFloat(), it.y.toFloat()) }
             
-            rectSrcMat.release()
-            rectDstMat.release()
+            srcPtsMat.release(); rotatedPtsMat.release()
+            rectSrcMat.release(); rectDstMat.release()
 
         } catch (e: Exception) {
             e.printStackTrace()
@@ -565,8 +515,6 @@ object PlateDetectionEngine {
             
             mask.release()
             intersectMat.release()
-            topLineMat.release()
-            bottomLineMat.release()
             invRotMat.release()
             
             thresh.release()
