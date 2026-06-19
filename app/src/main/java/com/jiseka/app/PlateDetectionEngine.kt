@@ -195,14 +195,13 @@ object PlateDetectionEngine {
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
         
         // =====================================================================
-        // 🚀 [Step 5] 문자 중심점 및 초기 와이어프레임(뼈대) 도출
+        // 🚀 [Step 5] 바운딩 박스 중심 기반 뼈대 구축
         // =====================================================================
         val tempContours = ArrayList<MatOfPoint>()
         val tempHierarchy = Mat()
         Imgproc.findContours(thresh, tempContours, tempHierarchy, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE)
 
-        // 💡 핵심 로직: 최상단, 최하단, 중심점 3개를 담는 속성 추가
-        class CharData(val center: Point, val width: Double, val height: Double, val rect: Rect, val topPt: Point, val bottomPt: Point)
+        class CharData(val center: Point, val width: Double, val height: Double, val rect: Rect)
         val charList = mutableListOf<CharData>()
         val allRects = mutableListOf<Rect>()
 
@@ -214,12 +213,7 @@ object PlateDetectionEngine {
             allRects.add(rect)
             if (ratio in 1.2..4.2 && area > 120 && rect.height >= 40 && area < looseRect.area() * 0.08) {
                 val center = Point(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
-                val pts = contour.toArray()
-                // 윤곽선의 픽셀 중 y가 가장 작은 점(최상단)과 가장 큰 점(최하단) 추출
-                val topPt = pts.minByOrNull { it.y } ?: center
-                val bottomPt = pts.maxByOrNull { it.y } ?: center
-                
-                charList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect, topPt, bottomPt))
+                charList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect))
             }
         }
         tempContours.forEach { it.release() }; tempHierarchy.release(); tempOpen.release(); tempClose.release()
@@ -236,7 +230,7 @@ object PlateDetectionEngine {
         val vx = line.get(0, 0)[0]; val vy = line.get(1, 0)[0]
         val angle = Math.toDegrees(Math.atan2(vy, vx))
         
-        // 1. 가로 뼈대: 각 글자의 상/하 중심점을 관통하는 선
+        // 1. 가로 뼈대
         val topPtsArray = sortedChars.map { Point(it.center.x, it.rect.y.toDouble()) }.toTypedArray()
         val bottomPtsArray = sortedChars.map { Point(it.center.x, it.rect.y.toDouble() + it.rect.height) }.toTypedArray()
         
@@ -252,25 +246,33 @@ object PlateDetectionEngine {
         val bvx = bottomLineMat.get(0, 0)[0]; val bvy = bottomLineMat.get(1, 0)[0]
         val bx0 = bottomLineMat.get(2, 0)[0]; val by0 = bottomLineMat.get(3, 0)[0]
 
-        // 💡 2. 세로 뼈대: 가장 왼쪽/오른쪽 글자의 최상단, 중심점, 최하단 3점을 피팅하여 원근이 반영된 기울기 도출
+        // 💡 2. 유저 요청 로직: 바운딩 박스(Rect)의 상단 중앙, 중심, 하단 중앙 3점 추출 및 피팅
         val firstChar = sortedChars.first()
         val lastChar = sortedChars.last()
 
-        val leftPts = MatOfPoint2f(firstChar.topPt, firstChar.center, firstChar.bottomPt)
+        val leftTopMid = Point(firstChar.rect.x + firstChar.rect.width / 2.0, firstChar.rect.y.toDouble())
+        val leftCenter = firstChar.center
+        val leftBottomMid = Point(firstChar.rect.x + firstChar.rect.width / 2.0, firstChar.rect.y + firstChar.rect.height.toDouble())
+
+        val rightTopMid = Point(lastChar.rect.x + lastChar.rect.width / 2.0, lastChar.rect.y.toDouble())
+        val rightCenter = lastChar.center
+        val rightBottomMid = Point(lastChar.rect.x + lastChar.rect.width / 2.0, lastChar.rect.y + lastChar.rect.height.toDouble())
+
+        val leftPts = MatOfPoint2f(leftTopMid, leftCenter, leftBottomMid)
         val leftLine = Mat()
         Imgproc.fitLine(leftPts, leftLine, Imgproc.DIST_L2, 0.0, 0.01, 0.01)
         var lvx = leftLine.get(0, 0)[0]; var lvy = leftLine.get(1, 0)[0]
         if (lvy < 0) { lvx = -lvx; lvy = -lvy }
         val lx0 = firstChar.center.x; val ly0 = firstChar.center.y
 
-        val rightPts = MatOfPoint2f(lastChar.topPt, lastChar.center, lastChar.bottomPt)
+        val rightPts = MatOfPoint2f(rightTopMid, rightCenter, rightBottomMid)
         val rightLine = Mat()
         Imgproc.fitLine(rightPts, rightLine, Imgproc.DIST_L2, 0.0, 0.01, 0.01)
         var rvx = rightLine.get(0, 0)[0]; var rvy = rightLine.get(1, 0)[0]
         if (rvy < 0) { rvx = -rvx; rvy = -rvy }
         val rx0 = lastChar.center.x; val ry0 = lastChar.center.y
 
-        // 교차점 도출 함수
+        // 교차점 계산
         fun getIntersect(x1: Double, y1: Double, vx1: Double, vy1: Double, x2: Double, y2: Double, vx2: Double, vy2: Double): Point {
             val dx = x2 - x1; val dy = y2 - y1
             val det = vx2 * vy1 - vy2 * vx1
@@ -279,7 +281,6 @@ object PlateDetectionEngine {
             return Point(x2 + u * vx2, y2 + u * vy2)
         }
 
-        // 글자의 중심들을 관통하는 완벽한 내접 사각형(Wireframe) 4점 완성
         val initTL = getIntersect(tx0, ty0, tvx, tvy, lx0, ly0, lvx, lvy)
         val initTR = getIntersect(tx0, ty0, tvx, tvy, rx0, ry0, rvx, rvy)
         val initBR = getIntersect(bx0, by0, bvx, bvy, rx0, ry0, rvx, rvy)
@@ -288,24 +289,29 @@ object PlateDetectionEngine {
         
         debugListener?.let {
             val debugMat = looseMat.clone()
-            for (i in 0..3) Imgproc.line(debugMat, initWireframePts[i], initWireframePts[(i+1)%4], Scalar(255.0, 0.0, 255.0, 255.0), 3)
-            // 검증용 3개의 점 그리기
-            Imgproc.circle(debugMat, firstChar.topPt, 6, Scalar(0.0, 255.0, 255.0, 255.0), -1)
-            Imgproc.circle(debugMat, firstChar.center, 6, Scalar(0.0, 255.0, 255.0, 255.0), -1)
-            Imgproc.circle(debugMat, firstChar.bottomPt, 6, Scalar(0.0, 255.0, 255.0, 255.0), -1)
             
-            Imgproc.circle(debugMat, lastChar.topPt, 6, Scalar(0.0, 255.0, 255.0, 255.0), -1)
-            Imgproc.circle(debugMat, lastChar.center, 6, Scalar(0.0, 255.0, 255.0, 255.0), -1)
-            Imgproc.circle(debugMat, lastChar.bottomPt, 6, Scalar(0.0, 255.0, 255.0, 255.0), -1)
+            // 💡 바운딩 박스 확인용: 모든 글자에 초록색 직사각형 렌더링
+            for (charData in charList) {
+                Imgproc.rectangle(debugMat, charData.rect, Scalar(0.0, 255.0, 0.0, 255.0), 2)
+            }
+
+            // 뼈대 보라색 렌더링
+            for (i in 0..3) Imgproc.line(debugMat, initWireframePts[i], initWireframePts[(i+1)%4], Scalar(255.0, 0.0, 255.0, 255.0), 3)
+            
+            // 💡 유저 요청 로직 검증용: 세로선의 기준이 된 3점(윗변 중앙, 중심, 아랫변 중앙) 하늘색 렌더링
+            val testPts = arrayOf(leftTopMid, leftCenter, leftBottomMid, rightTopMid, rightCenter, rightBottomMid)
+            for (pt in testPts) {
+                Imgproc.circle(debugMat, pt, 6, Scalar(0.0, 255.0, 255.0, 255.0), -1)
+            }
 
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
-            val hudBmp = addDebugHUD(debugBmp, "Step 3~5: Perspective Wireframe", listOf(
-                "Method: 최상단, 중심, 최하단 3점 피팅",
-                "Action: 원근 왜곡 기울기가 반영된 세로 뼈대 구축!",
-                "하늘색 점들이 세로 기울기의 기준이 된 3개의 점입니다."
+            val hudBmp = addDebugHUD(debugBmp, "Step 3~5: Bounding Box Wireframe", listOf(
+                "Method: 바운딩 박스 윗변 중앙, 중심, 아랫변 중앙 연결",
+                "초록색: OpenCV가 추출한 바운딩 박스 영역",
+                "하늘색: 세로선의 기준이 된 추출된 3개의 포인트"
             ), screenRatio)
-            it.pauseAndShowStep("3~5단계: 원근 보정 기하학 뼈대 구축", hudBmp)
+            it.pauseAndShowStep("3~5단계: 바운딩 박스 기준 뼈대 및 점 확인", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
         pointsMat.release(); line.release(); topPts.release(); bottomPts.release()
@@ -331,7 +337,6 @@ object PlateDetectionEngine {
         val maxY = rotatedWireframePts.maxOf { it.y }
         
         val avgH = charList.map { it.height }.average()
-        // 💡 뼈대가 글자 안쪽 중심에 위치하므로 탐색 마진을 기존 2.0에서 2.5로 상향
         val marginX = avgH * 2.5
         val marginY = avgH * 1.5
 
@@ -381,7 +386,7 @@ object PlateDetectionEngine {
             Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_CLOSE, horizontalKernel)
 
             // =====================================================================
-            // 🚀 [Step 10] 교정된 뼈대를 기반으로 한 스내핑 (Snapping)
+            // 🚀 [Step 10] 바운딩 박스 뼈대 기반 스내핑 (Snapping)
             // =====================================================================
             val tTL = tightWireframePts[0]; val tTR = tightWireframePts[1]
             val tBR = tightWireframePts[2]; val tBL = tightWireframePts[3]
@@ -442,9 +447,8 @@ object PlateDetectionEngine {
                 return Pair(snappedX, snappedY)
             }
 
-            // 💡 상/하, 좌/우 팽창 한계치 분리 (뼈대가 중심에 있으므로 좌우를 더 멀리 밀어냄)
-            val vLimit = (lLen * 1.2).toInt() // 상하 한계치
-            val hLimit = (lLen * 2.2).toInt() // 좌우 한계치 (파란색 KOR 확보용)
+            val vLimit = (lLen * 1.2).toInt() 
+            val hLimit = (lLen * 2.2).toInt() 
             
             var tnx = -pTvy; var tny = pTvx; if (tny > 0) { tnx = -tnx; tny = -tny }
             var bnx = -pBvy; var bny = pBvx; if (bny < 0) { bnx = -bnx; bny = -bny }
@@ -513,8 +517,8 @@ object PlateDetectionEngine {
                 Utils.matToBitmap(debugMat, debugBmp)
                 
                 val hudBmp = addDebugHUD(debugBmp, "Step 11: Final Export", listOf(
-                    "Mode: Perspective Extrema Wireframe",
-                    "Result: 원근 왜곡 완벽 보정 완료",
+                    "Mode: Bounding Box Midpoints Wireframe",
+                    "Result: 바운딩 박스 기준 세로 정렬 완료",
                     "교차점을 원본 해상도 좌표계로 복원 완료."
                 ), screenRatio)
                 it.pauseAndShowStep("11단계: 최종 좌표 보정 완료", hudBmp)
