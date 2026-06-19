@@ -195,7 +195,7 @@ object PlateDetectionEngine {
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
         
         // =====================================================================
-        // 🚀 [Step 5] 바운딩 박스 중심 기반 뼈대 구축
+        // 🚀 [Step 5] 바운딩 박스 중심 기반 뼈대 구축 및 타이트한 군집화 필터 적용
         // =====================================================================
         val tempContours = ArrayList<MatOfPoint>()
         val tempHierarchy = Mat()
@@ -203,14 +203,12 @@ object PlateDetectionEngine {
 
         class CharData(val center: Point, val width: Double, val height: Double, val rect: Rect)
         val charList = mutableListOf<CharData>()
-        val allRects = mutableListOf<Rect>()
 
         for (contour in tempContours) {
             val rect = Imgproc.boundingRect(contour)
             val area = rect.area()
             val ratio = rect.height.toDouble() / max(rect.width.toDouble(), 1.0)
             
-            allRects.add(rect)
             if (ratio in 1.2..4.2 && area > 120 && rect.height >= 40 && area < looseRect.area() * 0.08) {
                 val center = Point(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
                 charList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect))
@@ -224,15 +222,45 @@ object PlateDetectionEngine {
         }
 
         val sortedChars = charList.sortedBy { it.center.x }
-        val pointsMat = MatOfPoint2f(*sortedChars.map { it.center }.toTypedArray())
+
+        // 💡 [피드백 적용] 타이트한 군집화: 임계값을 2.5배에서 1.7배로 하향 조정
+        val gaps = (1 until sortedChars.size).map { sortedChars[it].center.x - sortedChars[it - 1].center.x }
+        val medianGap = if (gaps.isNotEmpty()) gaps.sorted()[gaps.size / 2] else 0.0
+        val avgWidth = sortedChars.map { it.width }.average()
+        
+        // 띄어쓰기는 허용하되, 그릴 노이즈는 차단하는 1.7배 황금비율 적용 (보조 안전장치: 글자 너비 1.8배)
+        val maxGap = max(medianGap * 1.7, avgWidth * 1.8) 
+
+        val clusters = mutableListOf<MutableList<CharData>>()
+        var currentCluster = mutableListOf(sortedChars.first())
+
+        for (i in 1 until sortedChars.size) {
+            val gap = sortedChars[i].center.x - sortedChars[i - 1].center.x
+            if (gap > maxGap) {
+                clusters.add(currentCluster) 
+                currentCluster = mutableListOf(sortedChars[i]) 
+            } else {
+                currentCluster.add(sortedChars[i])
+            }
+        }
+        clusters.add(currentCluster)
+
+        val validChars = clusters.maxByOrNull { it.size } ?: sortedChars
+
+        if (validChars.size < 2) {
+            thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
+            return null
+        }
+
+        val pointsMat = MatOfPoint2f(*validChars.map { it.center }.toTypedArray())
         val line = Mat()
         Imgproc.fitLine(pointsMat, line, Imgproc.DIST_L2, 0.0, 0.01, 0.01)
         val vx = line.get(0, 0)[0]; val vy = line.get(1, 0)[0]
         val angle = Math.toDegrees(Math.atan2(vy, vx))
         
         // 1. 가로 뼈대
-        val topPtsArray = sortedChars.map { Point(it.center.x, it.rect.y.toDouble()) }.toTypedArray()
-        val bottomPtsArray = sortedChars.map { Point(it.center.x, it.rect.y.toDouble() + it.rect.height) }.toTypedArray()
+        val topPtsArray = validChars.map { Point(it.center.x, it.rect.y.toDouble()) }.toTypedArray()
+        val bottomPtsArray = validChars.map { Point(it.center.x, it.rect.y.toDouble() + it.rect.height) }.toTypedArray()
         
         val topPts = MatOfPoint2f(*topPtsArray); val bottomPts = MatOfPoint2f(*bottomPtsArray)
         val topLineMat = Mat(); val bottomLineMat = Mat()
@@ -246,9 +274,9 @@ object PlateDetectionEngine {
         val bvx = bottomLineMat.get(0, 0)[0]; val bvy = bottomLineMat.get(1, 0)[0]
         val bx0 = bottomLineMat.get(2, 0)[0]; val by0 = bottomLineMat.get(3, 0)[0]
 
-        // 💡 2. 유저 요청 로직: 바운딩 박스(Rect)의 상단 중앙, 중심, 하단 중앙 3점 추출 및 피팅
-        val firstChar = sortedChars.first()
-        val lastChar = sortedChars.last()
+        // 2. 세로 뼈대 (바운딩 박스 기준)
+        val firstChar = validChars.first()
+        val lastChar = validChars.last()
 
         val leftTopMid = Point(firstChar.rect.x + firstChar.rect.width / 2.0, firstChar.rect.y.toDouble())
         val leftCenter = firstChar.center
@@ -272,7 +300,6 @@ object PlateDetectionEngine {
         if (rvy < 0) { rvx = -rvx; rvy = -rvy }
         val rx0 = lastChar.center.x; val ry0 = lastChar.center.y
 
-        // 교차점 계산
         fun getIntersect(x1: Double, y1: Double, vx1: Double, vy1: Double, x2: Double, y2: Double, vx2: Double, vy2: Double): Point {
             val dx = x2 - x1; val dy = y2 - y1
             val det = vx2 * vy1 - vy2 * vx1
@@ -290,15 +317,13 @@ object PlateDetectionEngine {
         debugListener?.let {
             val debugMat = looseMat.clone()
             
-            // 💡 바운딩 박스 확인용: 모든 글자에 초록색 직사각형 렌더링
             for (charData in charList) {
-                Imgproc.rectangle(debugMat, charData.rect, Scalar(0.0, 255.0, 0.0, 255.0), 2)
+                val color = if (validChars.contains(charData)) Scalar(0.0, 255.0, 0.0, 255.0) else Scalar(255.0, 0.0, 0.0, 255.0)
+                Imgproc.rectangle(debugMat, charData.rect, color, 2)
             }
 
-            // 뼈대 보라색 렌더링
             for (i in 0..3) Imgproc.line(debugMat, initWireframePts[i], initWireframePts[(i+1)%4], Scalar(255.0, 0.0, 255.0, 255.0), 3)
             
-            // 💡 유저 요청 로직 검증용: 세로선의 기준이 된 3점(윗변 중앙, 중심, 아랫변 중앙) 하늘색 렌더링
             val testPts = arrayOf(leftTopMid, leftCenter, leftBottomMid, rightTopMid, rightCenter, rightBottomMid)
             for (pt in testPts) {
                 Imgproc.circle(debugMat, pt, 6, Scalar(0.0, 255.0, 255.0, 255.0), -1)
@@ -306,12 +331,12 @@ object PlateDetectionEngine {
 
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
-            val hudBmp = addDebugHUD(debugBmp, "Step 3~5: Bounding Box Wireframe", listOf(
-                "Method: 바운딩 박스 윗변 중앙, 중심, 아랫변 중앙 연결",
-                "초록색: OpenCV가 추출한 바운딩 박스 영역",
-                "하늘색: 세로선의 기준이 된 추출된 3개의 포인트"
+            val hudBmp = addDebugHUD(debugBmp, "Step 3~5: Optimized Clustering", listOf(
+                "Method: 1.7x Median Gap & Width Fail-safe",
+                "초록 박스: 통과 / 빨간 박스: 탈락",
+                "노이즈 차단력 상승!"
             ), screenRatio)
-            it.pauseAndShowStep("3~5단계: 바운딩 박스 기준 뼈대 및 점 확인", hudBmp)
+            it.pauseAndShowStep("3~5단계: 타이트한 군집 분리 완료", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
         pointsMat.release(); line.release(); topPts.release(); bottomPts.release()
@@ -336,7 +361,7 @@ object PlateDetectionEngine {
         val minY = rotatedWireframePts.minOf { it.y }
         val maxY = rotatedWireframePts.maxOf { it.y }
         
-        val avgH = charList.map { it.height }.average()
+        val avgH = validChars.map { it.height }.average()
         val marginX = avgH * 2.5
         val marginY = avgH * 1.5
 
