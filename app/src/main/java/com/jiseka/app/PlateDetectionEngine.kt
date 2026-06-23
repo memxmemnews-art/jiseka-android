@@ -240,7 +240,27 @@ object PlateDetectionEngine {
         }
         clusters.add(currentCluster)
 
-        val validChars = clusters.maxByOrNull { it.size } ?: sortedChars
+        val validChars = (clusters.maxByOrNull { it.size } ?: sortedChars).toMutableList()
+
+        // =====================================================================
+        // 🚀 [추가됨] 파란색 KOR 마크 정밀 타격 및 탈락 (안전장치)
+        // =====================================================================
+        if (validChars.size > 2) {
+            val firstChar = validChars.first() // 항상 맨 왼쪽 요소만 검사
+            val roi = looseMat.submat(firstChar.rect)
+            val meanColor = Core.mean(roi)
+            roi.release() // 메모리 즉시 해제
+            
+            // RGBA 채널: 0=Red, 1=Green, 2=Blue
+            val r = meanColor.`val`[0]
+            val g = meanColor.`val`[1]
+            val b = meanColor.`val`[2]
+            
+            // KOR 마크는 파란 바탕이므로 B 채널이 R, G보다 확연히 높음
+            if (b > r + 20 && b > g + 10) {
+                validChars.removeAt(0) // KOR 마크 확인됨 -> 뼈대에서 즉시 제외
+            }
+        }
 
         if (validChars.size < 2) {
             thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
@@ -393,7 +413,7 @@ object PlateDetectionEngine {
                 val hudBmp = addDebugHUD(debugBmp, "Step 6: Perspective Plate Estimation", listOf(
                     "Target: 3D 측면 원근 왜곡 대응 가림막 생성",
                     "Formula: Text Height -> Plate Size -> Local Vector Expansion",
-                    "Result: 사진의 사다리꼴 기울기와 소실점을 그대로 복사한 가림막 도출 완료"
+                    "Result: KOR 마크가 제외된 순수 뼈대 기반 정밀 가림막 도출 완료"
                 ), screenRatio)
                 it.pauseAndShowStep("최종 단계: 원근 보존 가림막 좌표 확정", hudBmp)
                 debugMat.release(); debugBmp.recycle()
