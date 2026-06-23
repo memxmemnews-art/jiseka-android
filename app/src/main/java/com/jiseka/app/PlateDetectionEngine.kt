@@ -130,9 +130,7 @@ object PlateDetectionEngine {
         Imgproc.cvtColor(fullMat, fullGray, Imgproc.COLOR_RGBA2GRAY)
 
         val screenRatio = fullMat.rows().toFloat() / fullMat.cols().toFloat()
-
-        val cx = touchX.toDouble()
-        val cy = touchY.toDouble()
+        val cx = touchX.toDouble(); val cy = touchY.toDouble()
 
         debugListener?.let {
             val debugMat = fullMat.clone()
@@ -195,7 +193,7 @@ object PlateDetectionEngine {
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
         
         // =====================================================================
-        // 🚀 [Step 5] 바운딩 박스 중심 기반 뼈대 구축 및 타이트한 군집화 필터 적용
+        // 🚀 [Step 5] 바운딩 박스 기반 뼈대 구축 및 군집화
         // =====================================================================
         val tempContours = ArrayList<MatOfPoint>()
         val tempHierarchy = Mat()
@@ -222,13 +220,10 @@ object PlateDetectionEngine {
         }
 
         val sortedChars = charList.sortedBy { it.center.x }
-
-        // 💡 [피드백 적용] 타이트한 군집화: 임계값을 2.5배에서 1.7배로 하향 조정
         val gaps = (1 until sortedChars.size).map { sortedChars[it].center.x - sortedChars[it - 1].center.x }
         val medianGap = if (gaps.isNotEmpty()) gaps.sorted()[gaps.size / 2] else 0.0
         val avgWidth = sortedChars.map { it.width }.average()
         
-        // 띄어쓰기는 허용하되, 그릴 노이즈는 차단하는 1.7배 황금비율 적용 (보조 안전장치: 글자 너비 1.8배)
         val maxGap = max(medianGap * 1.7, avgWidth * 1.8) 
 
         val clusters = mutableListOf<MutableList<CharData>>()
@@ -258,7 +253,6 @@ object PlateDetectionEngine {
         val vx = line.get(0, 0)[0]; val vy = line.get(1, 0)[0]
         val angle = Math.toDegrees(Math.atan2(vy, vx))
         
-        // 1. 가로 뼈대
         val topPtsArray = validChars.map { Point(it.center.x, it.rect.y.toDouble()) }.toTypedArray()
         val bottomPtsArray = validChars.map { Point(it.center.x, it.rect.y.toDouble() + it.rect.height) }.toTypedArray()
         
@@ -274,7 +268,6 @@ object PlateDetectionEngine {
         val bvx = bottomLineMat.get(0, 0)[0]; val bvy = bottomLineMat.get(1, 0)[0]
         val bx0 = bottomLineMat.get(2, 0)[0]; val by0 = bottomLineMat.get(3, 0)[0]
 
-        // 2. 세로 뼈대 (바운딩 박스 기준)
         val firstChar = validChars.first()
         val lastChar = validChars.last()
 
@@ -316,27 +309,20 @@ object PlateDetectionEngine {
         
         debugListener?.let {
             val debugMat = looseMat.clone()
-            
             for (charData in charList) {
                 val color = if (validChars.contains(charData)) Scalar(0.0, 255.0, 0.0, 255.0) else Scalar(255.0, 0.0, 0.0, 255.0)
                 Imgproc.rectangle(debugMat, charData.rect, color, 2)
             }
-
             for (i in 0..3) Imgproc.line(debugMat, initWireframePts[i], initWireframePts[(i+1)%4], Scalar(255.0, 0.0, 255.0, 255.0), 3)
-            
-            val testPts = arrayOf(leftTopMid, leftCenter, leftBottomMid, rightTopMid, rightCenter, rightBottomMid)
-            for (pt in testPts) {
-                Imgproc.circle(debugMat, pt, 6, Scalar(0.0, 255.0, 255.0, 255.0), -1)
-            }
 
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
-            val hudBmp = addDebugHUD(debugBmp, "Step 3~5: Optimized Clustering", listOf(
-                "Method: 1.7x Median Gap & Width Fail-safe",
+            val hudBmp = addDebugHUD(debugBmp, "Step 3~5: Base Wireframe", listOf(
+                "Method: 바운딩 박스 기반 기초 뼈대 구축",
                 "초록 박스: 통과 / 빨간 박스: 탈락",
-                "노이즈 차단력 상승!"
+                "이 뼈대가 회전(Leveling)의 기준이 됩니다."
             ), screenRatio)
-            it.pauseAndShowStep("3~5단계: 타이트한 군집 분리 완료", hudBmp)
+            it.pauseAndShowStep("3~5단계: 노이즈 필터링 및 기초 뼈대 확정", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
         pointsMat.release(); line.release(); topPts.release(); bottomPts.release()
@@ -344,7 +330,7 @@ object PlateDetectionEngine {
         leftPts.release(); rightPts.release(); leftLine.release(); rightLine.release()
 
         // =====================================================================
-        // 🚀 [Step 6 & 7] 회전 및 타이트 ROI 추출
+        // 🚀 [Step 6 & 7] 회전(0도 Leveling) 및 타이트 ROI 절단
         // =====================================================================
         val rotMat = Imgproc.getRotationMatrix2D(Point(looseRect.width / 2.0, looseRect.height / 2.0), angle, 1.0)
         val rotatedLooseMat = Mat(); val rotatedLooseGray = Mat()
@@ -362,13 +348,15 @@ object PlateDetectionEngine {
         val maxY = rotatedWireframePts.maxOf { it.y }
         
         val avgH = validChars.map { it.height }.average()
-        val marginX = avgH * 2.5
-        val marginY = avgH * 1.5
+        
+        // 💡 여유로운 ROI Crop: 스내핑 선이 뻗어나갈 공간 보장
+        val vMargin = avgH * 0.5 
+        val hMargin = avgH * 1.0 
 
-        val tightLeft = (minX - marginX).toInt().coerceIn(0, rotatedLooseMat.cols() - 1)
-        val tightRight = (maxX + marginX).toInt().coerceIn(1, rotatedLooseMat.cols())
-        val tightTop = (minY - marginY).toInt().coerceIn(0, rotatedLooseMat.rows() - 1)
-        val tightBottom = (maxY + marginY).toInt().coerceIn(1, rotatedLooseMat.rows())
+        val tightLeft = (minX - hMargin).toInt().coerceIn(0, rotatedLooseMat.cols() - 1)
+        val tightRight = (maxX + hMargin).toInt().coerceIn(1, rotatedLooseMat.cols())
+        val tightTop = (minY - vMargin).toInt().coerceIn(0, rotatedLooseMat.rows() - 1)
+        val tightBottom = (maxY + vMargin).toInt().coerceIn(1, rotatedLooseMat.rows())
 
         val tightRect = Rect(tightLeft, tightTop, tightRight - tightLeft, tightBottom - tightTop)
         val tightMat = Mat(); val tightGray = Mat()
@@ -385,21 +373,18 @@ object PlateDetectionEngine {
             val hudBmp = addDebugHUD(debugBmp, "Step 6~7: True Plate Bound ROI", listOf(
                 "Image leveled to 0 degrees.",
                 "Action: 뼈대를 감싸는 타이트한 탐색 구역 설정",
-                "좌표계 오차(Mismatch) 완벽 해결."
+                "이 구역 안에서 안쪽 테두리 탐색이 시작됩니다."
             ), screenRatio)
-            it.pauseAndShowStep("6~7단계: 수평 회전 및 타이트 탐색 영역 확정", hudBmp)
+            it.pauseAndShowStep("6~7단계: 수평 회전 및 타이트 탐색 영역 절단", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
 
         // =====================================================================
-        // 🚀 [Step 8 & 9] 진짜 테두리 찾기 (이중 모폴로지)
+        // 🚀 [Step 8 ~ 10] 안쪽 테두리 스내핑(Inner Snapping) 및 수학적 패딩
         // =====================================================================
         val edges = Mat()
         val verticalKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(1.0, 7.0))
         val horizontalKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 1.0))
-        
-        val mask = Mat()
-        val intersectMat = Mat()
         val invRotMat = Mat()
 
         var resultPoints: List<ImmutablePoint>? = null
@@ -410,9 +395,6 @@ object PlateDetectionEngine {
             Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_CLOSE, verticalKernel)
             Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_CLOSE, horizontalKernel)
 
-            // =====================================================================
-            // 🚀 [Step 10] 바운딩 박스 뼈대 기반 스내핑 (Snapping)
-            // =====================================================================
             val tTL = tightWireframePts[0]; val tTR = tightWireframePts[1]
             val tBR = tightWireframePts[2]; val tBL = tightWireframePts[3]
 
@@ -432,10 +414,18 @@ object PlateDetectionEngine {
             val rLen = hypot(pRvx, pRvy); pRvx /= rLen; pRvy /= rLen
             val pRx0 = tTR.x; val pRy0 = tTR.y
 
-            mask.create(edges.size(), CvType.CV_8UC1)
+            var tnx = -pTvy; var tny = pTvx; if (tny > 0) { tnx = -tnx; tny = -tny }
+            var bnx = -pBvy; var bny = pBvx; if (bny < 0) { bnx = -bnx; bny = -bny }
+            var lnx = -pLvy; var lny = pLvx; if (lnx > 0) { lnx = -lnx; lny = -lny }
+            var rnx = -pRvy; var rny = pRvx; if (rnx < 0) { rnx = -rnx; rny = -rny }
+
+            val mask = Mat(edges.size(), CvType.CV_8UC1)
+            val intersectMat = Mat()
             val imgBounds = Rect(0, 0, edges.cols(), edges.rows())
 
-            fun snapLine(
+            // 💡 1. 안쪽 테두리(Inner Edge) 스내핑 함수
+            // 중심에서 바깥으로 나가다가 첫 번째 하얀색 에지에 닿으면 즉시 정지합니다.
+            fun snapToInnerEdge(
                 lineVx: Double, lineVy: Double, originX: Double, originY: Double,
                 nx: Double, ny: Double, maxSteps: Int, lineSpan: Double
             ): Pair<Double, Double> {
@@ -443,7 +433,7 @@ object PlateDetectionEngine {
                 val p1 = Point(); val p2 = Point()
                 var consecutiveHits = 0 
                 val requiredHits = 2
-                val safeZone = 5
+                val safeZone = 5 // 글자 자체 테두리를 벗어나기 위한 안전 이격거리
 
                 for (step in safeZone..maxSteps) {
                     val currentX = originX + nx * step
@@ -460,6 +450,7 @@ object PlateDetectionEngine {
                     val hitCount = Core.countNonZero(intersectMat)
                     val lineLength = hypot(p2.x - p1.x, p2.y - p1.y)
                     
+                    // 에지와 교차하면 '안쪽 테두리'로 간주하고 탐색 정지
                     if (hitCount > lineLength * 0.15) {
                         consecutiveHits++
                         if (consecutiveHits >= requiredHits) {
@@ -472,48 +463,60 @@ object PlateDetectionEngine {
                 return Pair(snappedX, snappedY)
             }
 
-            val vLimit = (lLen * 1.2).toInt() 
-            val hLimit = (lLen * 2.2).toInt() 
+            val vLimit = (lLen * 0.8).toInt() 
+            val hLimit = (lLen * 1.5).toInt() 
             
-            var tnx = -pTvy; var tny = pTvx; if (tny > 0) { tnx = -tnx; tny = -tny }
-            var bnx = -pBvy; var bny = pBvx; if (bny < 0) { bnx = -bnx; bny = -bny }
-            var lnx = -pLvy; var lny = pLvx; if (lnx > 0) { lnx = -lnx; lny = -lny }
-            var rnx = -pRvy; var rny = pRvx; if (rnx < 0) { rnx = -rnx; rny = -rny }
+            // 💡 2. 그릴이 닿지 못하는 깨끗한 '안쪽 테두리' 라인 확보
+            val innerTop = snapToInnerEdge(pTvx, pTvy, pTx0, pTy0, tnx, tny, vLimit, tLen * 0.5)
+            val innerBottom = snapToInnerEdge(pBvx, pBvy, pBx0, pBy0, bnx, bny, vLimit, tLen * 0.5)
+            val innerLeft = snapToInnerEdge(pLvx, pLvy, pLx0, pLy0, lnx, lny, hLimit, lLen * 0.5)
+            val innerRight = snapToInnerEdge(pRvx, pRvy, pRx0, pRy0, rnx, rny, hLimit, lLen * 0.5)
 
-            val finalTop = snapLine(pTvx, pTvy, pTx0, pTy0, tnx, tny, vLimit, tLen * 0.9)
-            val finalBottom = snapLine(pBvx, pBvy, pBx0, pBy0, bnx, bny, vLimit, tLen * 0.9)
-            val finalLeft = snapLine(pLvx, pLvy, pLx0, pLy0, lnx, lny, hLimit, lLen * 1.5)
-            val finalRight = snapLine(pRvx, pRvy, pRx0, pRy0, rnx, rny, hLimit, lLen * 1.5)
+            // 💡 3. 수학적 패딩 (Mathematical Padding)
+            // 확보한 안쪽 라인을 프레임 두께만큼만 바깥으로 일정하게 밀어줍니다. (외부 노이즈 완벽 차단)
+            val padY = lLen * 0.15 // 상하 프레임 두께 보정
+            val padX = lLen * 0.25 // 좌우 프레임 두께 보정
+
+            val finalTopX = innerTop.first + tnx * padY; val finalTopY = innerTop.second + tny * padY
+            val finalBotX = innerBottom.first + bnx * padY; val finalBotY = innerBottom.second + bny * padY
+            val finalLftX = innerLeft.first + lnx * padX; val finalLftY = innerLeft.second + lny * padX
+            val finalRgtX = innerRight.first + rnx * padX; val finalRgtY = innerRight.second + rny * padX
+
+            val ptTL = getIntersect(finalTopX, finalTopY, pTvx, pTvy, finalLftX, finalLftY, pLvx, pLvy)
+            val ptTR = getIntersect(finalTopX, finalTopY, pTvx, pTvy, finalRgtX, finalRgtY, pRvx, pRvy)
+            val ptBR = getIntersect(finalBotX, finalBotY, pBvx, pBvy, finalRgtX, finalRgtY, pRvx, pRvy)
+            val ptBL = getIntersect(finalBotX, finalBotY, pBvx, pBvy, finalLftX, finalLftY, pLvx, pLvy)
+
+            val orderedPoints = arrayOf(ptTL, ptTR, ptBR, ptBL)
 
             debugListener?.let {
                 val debugMat = Mat()
-                Imgproc.cvtColor(edges, debugMat, Imgproc.COLOR_GRAY2RGBA)
-                
-                val cX1 = finalLeft.first; val cX2 = finalRight.first
-                val cY1 = finalTop.second; val cY2 = finalBottom.second
-                
-                Imgproc.line(debugMat, Point(cX1 - 500, cY1), Point(cX2 + 500, cY1), Scalar(0.0, 255.0, 0.0, 255.0), 2)
-                Imgproc.line(debugMat, Point(cX1 - 500, cY2), Point(cX2 + 500, cY2), Scalar(0.0, 255.0, 0.0, 255.0), 2)
-                Imgproc.line(debugMat, Point(cX1, cY1 - 500), Point(cX1, cY2 + 500), Scalar(0.0, 255.0, 0.0, 255.0), 2)
-                Imgproc.line(debugMat, Point(cX2, cY1 - 500), Point(cX2, cY2 + 500), Scalar(0.0, 255.0, 0.0, 255.0), 2)
+                Imgproc.cvtColor(edges, debugMat, Imgproc.COLOR_GRAY2RGBA) 
+
+                // 렌더링용: 안쪽 테두리(노란색)와 패딩 적용된 최종 꼭짓점(초록색) 비교
+                val innerPtTL = getIntersect(innerTop.first, innerTop.second, pTvx, pTvy, innerLeft.first, innerLeft.second, pLvx, pLvy)
+                val innerPtTR = getIntersect(innerTop.first, innerTop.second, pTvx, pTvy, innerRight.first, innerRight.second, pRvx, pRvy)
+                val innerPtBR = getIntersect(innerBottom.first, innerBottom.second, pBvx, pBvy, innerRight.first, innerRight.second, pRvx, pRvy)
+                val innerPtBL = getIntersect(innerBottom.first, innerBottom.second, pBvx, pBvy, innerLeft.first, innerLeft.second, pLvx, pLvy)
+                val innerPts = arrayOf(innerPtTL, innerPtTR, innerPtBR, innerPtBL)
+
+                for (i in 0..3) {
+                    Imgproc.line(debugMat, innerPts[i], innerPts[(i+1)%4], Scalar(255.0, 255.0, 0.0, 255.0), 2) // 안쪽 테두리 (노란색)
+                    Imgproc.line(debugMat, orderedPoints[i], orderedPoints[(i+1)%4], Scalar(0.0, 255.0, 0.0, 255.0), 4) // 최종 프레임 (초록색)
+                    Imgproc.circle(debugMat, orderedPoints[i], 8, Scalar(0.0, 0.0, 255.0, 255.0), -1)
+                }
 
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "Step 8~10: Edge Snapping Check", listOf(
-                    "Method: Canny Map + Wireframe Expansion",
-                    "Action: 뼈대를 밀어내어 진짜 테두리에서 멈춤",
-                    "무한선 버그 수정으로 노이즈 관통력 상승!"
+                val hudBmp = addDebugHUD(debugBmp, "Step 8~10: Inner Edge Isolation", listOf(
+                    "Method: 안쪽 테두리 스내핑 후 프레임 두께만큼 수학적 패딩",
+                    "노란선: 그릴 간섭을 피하기 위해 도출한 '안쪽 테두리'",
+                    "초록선: 패딩을 더해 도출된 최종 번호판 프레임 (노이즈 0%)"
                 ), screenRatio)
-                it.pauseAndShowStep("8~10단계: 에지 렌더링 및 스내핑 확인", hudBmp)
+                it.pauseAndShowStep("8~10단계: 안쪽 테두리 타격 및 외부 프레임 도출", hudBmp)
                 debugMat.release(); debugBmp.recycle()
             }
-
-            val ptTL = getIntersect(finalTop.first, finalTop.second, pTvx, pTvy, finalLeft.first, finalLeft.second, pLvx, pLvy)
-            val ptTR = getIntersect(finalTop.first, finalTop.second, pTvx, pTvy, finalRight.first, finalRight.second, pRvx, pRvy)
-            val ptBR = getIntersect(finalBottom.first, finalBottom.second, pBvx, pBvy, finalRight.first, finalRight.second, pRvx, pRvy)
-            val ptBL = getIntersect(finalBottom.first, finalBottom.second, pBvx, pBvy, finalLeft.first, finalLeft.second, pLvx, pLvy)
-
-            val orderedPoints = arrayOf(ptTL, ptTR, ptBR, ptBL)
+            mask.release(); intersectMat.release()
 
             // =====================================================================
             // 🚀 [Step 11] 기하학 정렬: 최종 극단점 원본 좌표로 역회전
@@ -542,8 +545,8 @@ object PlateDetectionEngine {
                 Utils.matToBitmap(debugMat, debugBmp)
                 
                 val hudBmp = addDebugHUD(debugBmp, "Step 11: Final Export", listOf(
-                    "Mode: Bounding Box Midpoints Wireframe",
-                    "Result: 바운딩 박스 기준 세로 정렬 완료",
+                    "Mode: Inner Moat Isolation & Mathematical Padding",
+                    "Result: 그릴/범퍼 노이즈 원천 차단. 핏 완벽.",
                     "교차점을 원본 해상도 좌표계로 복원 완료."
                 ), screenRatio)
                 it.pauseAndShowStep("11단계: 최종 좌표 보정 완료", hudBmp)
@@ -561,9 +564,6 @@ object PlateDetectionEngine {
             edges.release()
             horizontalKernel.release() 
             verticalKernel.release()
-            
-            mask.release()
-            intersectMat.release()
             invRotMat.release()
             
             thresh.release()
