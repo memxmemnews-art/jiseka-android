@@ -193,7 +193,7 @@ object PlateDetectionEngine {
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
         
         // =====================================================================
-        // [Step 5] 바운딩 박스 기반 뼈대 구축 및 군집화
+        // [Step 5] 바운딩 박스 기반 뼈대 구축 및 KOR 마크 동적 필터링
         // =====================================================================
         val tempContours = ArrayList<MatOfPoint>()
         val tempHierarchy = Mat()
@@ -242,23 +242,23 @@ object PlateDetectionEngine {
 
         val validChars = (clusters.maxByOrNull { it.size } ?: sortedChars).toMutableList()
 
-        // =====================================================================
-        // 🚀 [추가됨] 파란색 KOR 마크 정밀 타격 및 탈락 (안전장치)
-        // =====================================================================
+        // 💡 파란색 KOR 마크 정밀 타격 및 깃발(Flag) 꽂기
+        var hasKorMark = false
+
         if (validChars.size > 2) {
-            val firstChar = validChars.first() // 항상 맨 왼쪽 요소만 검사
+            val firstChar = validChars.first() 
             val roi = looseMat.submat(firstChar.rect)
             val meanColor = Core.mean(roi)
-            roi.release() // 메모리 즉시 해제
+            roi.release() 
             
-            // RGBA 채널: 0=Red, 1=Green, 2=Blue
             val r = meanColor.`val`[0]
             val g = meanColor.`val`[1]
             val b = meanColor.`val`[2]
             
             // KOR 마크는 파란 바탕이므로 B 채널이 R, G보다 확연히 높음
             if (b > r + 20 && b > g + 10) {
-                validChars.removeAt(0) // KOR 마크 확인됨 -> 뼈대에서 즉시 제외
+                hasKorMark = true // 깃발 기억
+                validChars.removeAt(0) // 뼈대에서 KOR 마크 탈락
             }
         }
 
@@ -339,8 +339,8 @@ object PlateDetectionEngine {
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
             val hudBmp = addDebugHUD(debugBmp, "Step 3~5: Base Wireframe", listOf(
-                "Method: 바운딩 박스 기반 기초 뼈대 구축 완료",
-                "초록 박스: 통과 / 빨간 박스: 탈락",
+                "Method: 기초 뼈대 구축 및 KOR 마크 동적 판별 완료",
+                "Status: KOR Mark Detected = $hasKorMark",
                 "이 뼈대가 가림막 크기 역산의 기준이 됩니다."
             ), screenRatio)
             it.pauseAndShowStep("3~5단계: 노이즈 필터링 및 기초 뼈대 확정", hudBmp)
@@ -352,44 +352,54 @@ object PlateDetectionEngine {
         leftPts.release(); rightPts.release(); leftLine.release(); rightLine.release()
 
         // =====================================================================
-        // 🚀 [Step 6] 3D 원근(사다리꼴 왜곡)을 보존하는 신형 번호판 규격 역산
+        // 🚀 [Step 6] 가로/세로 축 분리 스케일링 기반 3D 원근 보존 핏팅
         // =====================================================================
         var resultPoints: List<ImmutablePoint>? = null
 
         try {
             val avgH = validChars.map { it.height }.average()
-            val midX = (initTL.x + initTR.x + initBR.x + initBL.x) / 4.0
-            val midY = (initTL.y + initTR.y + initBR.y + initBL.y) / 4.0
-            
-            // 신형 번호판 규격 비율 및 가로세로 확장 배율(Scale Factor) 계산
-            val textOccupancyY = 0.45 // 세로 대비 글자 비율 (약 45%)
-            val scaleY = 1.0 / textOccupancyY
-            
-            val estimatedPlateH = avgH * scaleY
-            val estimatedPlateW = estimatedPlateH * (520.0 / 110.0) // 대한민국 신형 번호판 표준 비율 4.727
-            
-            // 기울어진 텍스트 와이어프레임의 실제 가로 폭 계산 (원근 스케일링용)
             val textW = hypot(initTR.x - initTL.x, initTR.y - initTL.y)
-            val scaleX = estimatedPlateW / textW
+            
+            var midX = (initTL.x + initTR.x + initBR.x + initBL.x) / 4.0
+            var midY = (initTL.y + initTR.y + initBR.y + initBL.y) / 4.0
 
-            // 직교 수직 벡터 계산 (nX, nY)
+            // 1. 세로축 독립 팽창 계수 (글자 높이의 1.35배)
+            val scaleY = 1.35 
+
+            // 2. 가로축 독립 팽창 계수 및 무게중심 이동(Shift) 결정
+            var scaleX = 1.0
+            var shiftNorm = 0.0
+
+            if (hasKorMark) {
+                // [케이스 A] KOR 마크가 뼈대에 포함된 경우 (오분류 혹은 KOR 포함 군집)
+                // 이미 텍스트가 번호판 가로의 대부분을 차지하므로 좌우 끝 여백만 살짝 덧댐
+                scaleX = 1.08
+                shiftNorm = 0.0 // 중심점 이동 없음
+            } else {
+                // [케이스 B] KOR 마크가 걸러진 순수 숫자 뼈대인 경우 (기본 로직)
+                // 숫자는 가로의 약 74%를 차지하므로 1.35배 팽창
+                scaleX = 1.35
+                // 팽창된 마스크를 KOR 마크가 있는 좌측(-vx 방향)으로 전체 너비의 4.5%만큼 밀어줌
+                shiftNorm = -0.045 * (textW * scaleX)
+            }
+
+            // 중심점 좌표 보정 (이동된 센터 기준으로 스케일링)
+            midX += vx * shiftNorm
+            midY += vy * shiftNorm
+
             val nX = -vy; val nY = vx
 
-            // 각 꼭짓점을 로컬 축 기준으로 독립 확장하여 사다리꼴 왜곡 보존
+            // 로컬 좌표계에서 가로/세로를 독립적으로 곱해 사다리꼴 왜곡을 방어하며 팽창
             val finalPts = listOf(initTL, initTR, initBR, initBL).map { pt ->
-                // 중심점으로부터의 거리
                 val dx = pt.x - midX
                 val dy = pt.y - midY
                 
-                // 로컬 좌표계 분리
                 val localX = dx * vx + dy * vy
                 val localY = dx * nX + dy * nY
                 
-                // 독립 팽창 적용
                 val scaledX = localX * scaleX
                 val scaledY = localY * scaleY
                 
-                // 원본 이미지 좌표계로 복원
                 Point(
                     midX + scaledX * vx + scaledY * nX + looseRect.x,
                     midY + scaledX * vy + scaledY * nY + looseRect.y
@@ -407,15 +417,18 @@ object PlateDetectionEngine {
                     Imgproc.circle(debugMat, finalPts[i], 15, colors[i], -1)
                     Imgproc.putText(debugMat, labels[i], Point(finalPts[i].x - 20, finalPts[i].y - 20), Imgproc.FONT_HERSHEY_SIMPLEX, 1.8, colors[i], 4)
                 }
-                
+
+                // 보정된 핏팅 중심점을 시각적으로 표시
+                Imgproc.circle(debugMat, Point(midX + looseRect.x, midY + looseRect.y), 8, Scalar(0.0, 255.0, 255.0, 255.0), -1)
+
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "Step 6: Perspective Plate Estimation", listOf(
-                    "Target: 3D 측면 원근 왜곡 대응 가림막 생성",
-                    "Formula: Text Height -> Plate Size -> Local Vector Expansion",
-                    "Result: KOR 마크가 제외된 순수 뼈대 기반 정밀 가림막 도출 완료"
+                val hudBmp = addDebugHUD(debugBmp, "Step 6: Decoupled Axis Estimation", listOf(
+                    "Mode: 가로/세로 독립 스케일링 방어 체계 작동",
+                    "Status: hasKorMark = $hasKorMark (ScaleX: $scaleX)",
+                    "Result: 번호판 흰색 철판 규격에 정확히 들어맞는 핏 구현 완료"
                 ), screenRatio)
-                it.pauseAndShowStep("최종 단계: 원근 보존 가림막 좌표 확정", hudBmp)
+                it.pauseAndShowStep("최종 단계: 독립 제어 가림막 좌표 확정", hudBmp)
                 debugMat.release(); debugBmp.recycle()
             }
 
