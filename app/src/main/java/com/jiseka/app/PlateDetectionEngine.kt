@@ -260,6 +260,7 @@ object PlateDetectionEngine {
                 maxGap
             }
 
+            // 💡 [복구된 Y축 방어막] X축 간격이 허용치 안이어도, Y축 높이가 45% 이상 심하게 어긋나면 무조건 단절!
             if (gap > localMaxGap || yDiff > avgH * 0.45) {
                 clusters.add(currentCluster) 
                 currentCluster = mutableListOf(curr) 
@@ -271,9 +272,7 @@ object PlateDetectionEngine {
 
         val validChars = (clusters.maxByOrNull { it.size } ?: sortedChars).toMutableList()
 
-        // =====================================================================
-        // KOR 마크 검출 및 제거
-        // =====================================================================
+        // 💡 KOR 마크 검출 및 뼈대에서 제거 (텍스트 정중앙 계산을 위해 필수)
         var hasKorMark = false
         val firstChar = validChars.first() 
         val roi = looseMat.submat(firstChar.rect)
@@ -295,31 +294,6 @@ object PlateDetectionEngine {
                 
                 if (leftMean.`val`[2] > leftMean.`val`[0] + 15 && leftMean.`val`[2] > leftMean.`val`[1] + 5) {
                     hasKorMark = true
-                }
-            }
-        }
-
-        // =====================================================================
-        // 💡 [수정] 양끝단(Ends) 국소 비교를 통한 꼬리 자르기 (Hitchhiker Trim)
-        // =====================================================================
-        if (validChars.size >= 4) {
-            // [우측 꼬리 자르기]
-            // 끝(last)과 그 앞(last-1)의 간격을, 바로 옆의 확실한 숫자들(last-1과 last-2)의 간격과 비교
-            val rightEndGap = validChars.last().center.x - validChars[validChars.size - 2].center.x
-            val rightSafeGap = validChars[validChars.size - 2].center.x - validChars[validChars.size - 3].center.x
-
-            // 우측 끝이 바로 옆 안전 간격보다 3.0배 이상 떨어져 있으면 꼬리를 자름
-            if (rightEndGap > rightSafeGap * 3.0) {
-                validChars.removeAt(validChars.size - 1)
-            }
-            
-            // [좌측 꼬리 자르기] (우측이 잘린 후의 size로 재검사)
-            if (validChars.size >= 4) {
-                val leftEndGap = validChars[1].center.x - validChars[0].center.x
-                val leftSafeGap = validChars[2].center.x - validChars[1].center.x
-
-                if (leftEndGap > leftSafeGap * 3.0) {
-                    validChars.removeAt(0)
                 }
             }
         }
@@ -402,9 +376,9 @@ object PlateDetectionEngine {
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
             val hudBmp = addDebugHUD(debugBmp, "Step 3~5: Base Wireframe", listOf(
-                "Method: 양끝단(Ends) 국소 비교 기반 꼬리 자르기",
-                "Status: Tail trimmed successfully.",
-                "결과: 중앙 한글과 무관하게 맨 끝 노이즈만 안전하게 단절"
+                "Method: 고스트 점프 및 사각지대 텍스트 분리 완료",
+                "Status: KOR Mark Detected = $hasKorMark",
+                "결과: KOR 마크가 제외된 순수 숫자 뼈대 생성"
             ), screenRatio)
             it.pauseAndShowStep("3~5단계: 노이즈 필터링 및 기초 뼈대 확정", hudBmp)
             debugMat.release(); debugBmp.recycle()
@@ -415,29 +389,35 @@ object PlateDetectionEngine {
         leftPts.release(); rightPts.release(); leftLine.release(); rightLine.release()
 
         // =====================================================================
-        // 🚀 [Step 6] 중심점 대칭 스케일링
+        // 🚀 [Step 6] 중심점 대칭 스케일링 (수학적 함정 제거 및 완전 통합)
         // =====================================================================
         var resultPoints: List<ImmutablePoint>? = null
 
         try {
+            // 💡 [핵심] KOR 마크와 여백은 완벽하게 대칭입니다! 이동(Shift) 없이 정중앙 유지
             val midX = (initTL.x + initTR.x + initBR.x + initBL.x) / 4.0
             val midY = (initTL.y + initTR.y + initBR.y + initBL.y) / 4.0
 
+            // 상하좌우 동일하게 1.35배 대칭 팽창 (이 비율 하나로 모든 520mm 번호판 커버)
             val scaleY = 1.35 
             val scaleX = 1.35 
 
             val nX = -vy; val nY = vx
 
             val finalPts = listOf(initTL, initTR, initBR, initBL).map { pt ->
+                // 원래 중심점을 기준으로 거리 계산
                 val dx = pt.x - midX
                 val dy = pt.y - midY
                 
+                // 로컬 벡터 투영
                 val localX = dx * vx + dy * vy
                 val localY = dx * nX + dy * nY
                 
+                // 대칭 스케일링
                 val scaledX = localX * scaleX
                 val scaledY = localY * scaleY
                 
+                // 어떠한 인위적인 Shift 없이 그 자리에서 팽창
                 Point(
                     midX + scaledX * vx + scaledY * nX + looseRect.x,
                     midY + scaledX * vy + scaledY * nY + looseRect.y
@@ -461,7 +441,7 @@ object PlateDetectionEngine {
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
                 val hudBmp = addDebugHUD(debugBmp, "Step 6: Symmetric Scaling", listOf(
-                    "Mode: 대칭 팽창 (수학적 편향 완전 제거)",
+                    "Mode: 대칭 팽창 (수학적 편향 및 오차 완전 제거)",
                     "Status: Shift 0.0 (Perfectly Centered)",
                     "Result: KOR 마크와 우측 빈 공간이 완벽하게 1:1 대칭 커버됨"
                 ), screenRatio)
