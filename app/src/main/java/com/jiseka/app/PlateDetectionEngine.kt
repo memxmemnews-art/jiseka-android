@@ -193,7 +193,7 @@ object PlateDetectionEngine {
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
         
         // =====================================================================
-        // [Step 5] 바운딩 박스 기반 뼈대 구축 및 KOR 마크 동적 필터링
+        // 🚀 [Step 5] 바운딩 박스 기반 뼈대 구축 및 한글 문자 구출 작전
         // =====================================================================
         val tempContours = ArrayList<MatOfPoint>()
         val tempHierarchy = Mat()
@@ -201,25 +201,65 @@ object PlateDetectionEngine {
 
         class CharData(val center: Point, val width: Double, val height: Double, val rect: Rect)
         val charList = mutableListOf<CharData>()
+        val rejectedList = mutableListOf<CharData>() // 💡 1차 탈락자(한글 후보) 보관소
 
         for (contour in tempContours) {
             val rect = Imgproc.boundingRect(contour)
             val area = rect.area()
             val ratio = rect.height.toDouble() / max(rect.width.toDouble(), 1.0)
+            val center = Point(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
             
-            if (ratio in 1.2..4.2 && area > 120 && rect.height >= 40 && area < looseRect.area() * 0.08) {
-                val center = Point(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
-                charList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect))
+            // 공통 노이즈 필터 통과
+            if (area > 120 && rect.height >= 40 && area < looseRect.area() * 0.08) {
+                if (ratio in 1.2..4.2) {
+                    // 길쭉한 비율 -> 숫자 후보 합격
+                    charList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect))
+                } else if (ratio in 0.5..1.2) {
+                    // 넓적한 비율 -> 한글 후보 보류
+                    rejectedList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect))
+                }
             }
         }
         tempContours.forEach { it.release() }; tempHierarchy.release(); tempOpen.release(); tempClose.release()
 
-        if (charList.size < 2) {
+        if (charList.isEmpty()) {
             thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
             return null
         }
 
-        val sortedChars = charList.sortedBy { it.center.x }
+        // 💡 [핵심] 한글 구출 작전 (Rescue Merge)
+        var sortedChars = charList.sortedBy { it.center.x }.toMutableList()
+        val rescueCandidates = mutableListOf<CharData>()
+
+        for (i in 0 until sortedChars.size - 1) {
+            val leftChar = sortedChars[i]
+            val rightChar = sortedChars[i + 1]
+            val gapX = rightChar.center.x - leftChar.center.x
+            val avgW = (leftChar.width + rightChar.width) / 2.0
+
+            // 숫자들이 비정상적으로 멀리 떨어져 있다면 (한글 공백 의심)
+            if (gapX > avgW * 1.5) {
+                val avgH = (leftChar.height + rightChar.height) / 2.0
+                val avgY = (leftChar.center.y + rightChar.center.y) / 2.0
+
+                // 빈 공간 안(X축)에 있으면서 같은 높이(Y축)를 가진 탈락자를 검색
+                val rescuer = rejectedList.find { r ->
+                    r.center.x > leftChar.center.x && r.center.x < rightChar.center.x && 
+                    abs(r.center.y - avgY) < avgH * 0.3 
+                }
+
+                if (rescuer != null) {
+                    rescueCandidates.add(rescuer) // 구출 완료
+                }
+            }
+        }
+        
+        // 구출된 한글 멤버를 합류시키고 재정렬
+        sortedChars.addAll(rescueCandidates)
+        sortedChars = sortedChars.sortedBy { it.center.x }.toMutableList()
+
+        // ---------------------------------------------------------------------
+        // 💡 [안전한 클러스터링] 징검다리가 생겼으므로 maxGap은 타이트하게 1.8배 유지
         val gaps = (1 until sortedChars.size).map { sortedChars[it].center.x - sortedChars[it - 1].center.x }
         val medianGap = if (gaps.isNotEmpty()) gaps.sorted()[gaps.size / 2] else 0.0
         val avgWidth = sortedChars.map { it.width }.average()
@@ -327,10 +367,19 @@ object PlateDetectionEngine {
         
         debugListener?.let {
             val debugMat = looseMat.clone()
+            
+            // 모든 글자(탈락자 포함) 박스 그리기
             for (charData in charList) {
                 val color = if (validChars.contains(charData)) Scalar(0.0, 255.0, 0.0, 255.0) else Scalar(255.0, 0.0, 0.0, 255.0)
                 Imgproc.rectangle(debugMat, charData.rect, color, 2)
             }
+            // 구출된 한글은 파란색 박스로 특별 표시
+            for (charData in rescueCandidates) {
+                if (validChars.contains(charData)) {
+                    Imgproc.rectangle(debugMat, charData.rect, Scalar(0.0, 255.0, 255.0, 255.0), 3) // 노란색 박스로 강조
+                }
+            }
+
             for (i in 0..3) {
                 val pts = arrayOf(initTL, initTR, initBR, initBL)
                 Imgproc.line(debugMat, pts[i], pts[(i+1)%4], Scalar(255.0, 0.0, 255.0, 255.0), 3)
@@ -339,9 +388,9 @@ object PlateDetectionEngine {
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
             val hudBmp = addDebugHUD(debugBmp, "Step 3~5: Base Wireframe", listOf(
-                "Method: 기초 뼈대 구축 및 KOR 마크 동적 판별 완료",
+                "Method: 기초 뼈대 구축 및 구출 작전 완료",
                 "Status: KOR Mark Detected = $hasKorMark",
-                "이 뼈대가 가림막 크기 역산의 기준이 됩니다."
+                "노란 박스: 기하학적 검증으로 구출된 징검다리(한글)"
             ), screenRatio)
             it.pauseAndShowStep("3~5단계: 노이즈 필터링 및 기초 뼈대 확정", hudBmp)
             debugMat.release(); debugBmp.recycle()
