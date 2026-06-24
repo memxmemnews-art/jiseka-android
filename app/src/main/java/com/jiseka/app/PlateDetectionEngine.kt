@@ -148,9 +148,6 @@ object PlateDetectionEngine {
             debugMat.release(); debugBmp.recycle()
         }
 
-        // =====================================================================
-        // [Step 2] 초기 ROI 설정
-        // =====================================================================
         val roiWidth = (fullMat.cols() * 0.22).toInt() 
         val roiHeight = (roiWidth / 2.0).toInt()       
 
@@ -170,18 +167,13 @@ object PlateDetectionEngine {
             Imgproc.rectangle(debugMat, looseRect, Scalar(0.0, 255.0, 0.0, 255.0), 8)
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
-            val hudBmp = addDebugHUD(debugBmp, "Step 2: Downsized ROI (Ratio 2:1)", listOf(
-                "ROI Width: $roiWidth px",
-                "ROI Height: $roiHeight px",
+            val hudBmp = addDebugHUD(debugBmp, "Step 2: Downsized ROI", listOf(
                 "Rect Bounds: [L:$looseLeft, T:$looseTop, R:$looseRight, B:$looseBottom]"
             ), screenRatio)
             it.pauseAndShowStep("2단계: 컴팩트 탐색 구역 설정", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
 
-        // =====================================================================
-        // [Step 3 & 4] 1차 이진화 및 모폴로지
-        // =====================================================================
         val thresh = Mat()
         Imgproc.medianBlur(looseGray, looseGray, 3)
         Imgproc.GaussianBlur(looseGray, thresh, Size(5.0, 5.0), 0.0)
@@ -192,16 +184,13 @@ object PlateDetectionEngine {
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_OPEN, tempOpen)
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
         
-        // =====================================================================
-        // 🚀 [Step 5] 바운딩 박스 기반 뼈대 구축 및 한글 문자 구출 작전
-        // =====================================================================
         val tempContours = ArrayList<MatOfPoint>()
         val tempHierarchy = Mat()
         Imgproc.findContours(thresh, tempContours, tempHierarchy, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE)
 
         class CharData(val center: Point, val width: Double, val height: Double, val rect: Rect)
         val charList = mutableListOf<CharData>()
-        val rejectedList = mutableListOf<CharData>() // 💡 1차 탈락자(한글 후보) 보관소
+        val rejectedList = mutableListOf<CharData>() 
 
         for (contour in tempContours) {
             val rect = Imgproc.boundingRect(contour)
@@ -209,13 +198,10 @@ object PlateDetectionEngine {
             val ratio = rect.height.toDouble() / max(rect.width.toDouble(), 1.0)
             val center = Point(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
             
-            // 공통 노이즈 필터 통과
             if (area > 120 && rect.height >= 40 && area < looseRect.area() * 0.08) {
                 if (ratio in 1.2..4.2) {
-                    // 길쭉한 비율 -> 숫자 후보 합격
                     charList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect))
                 } else if (ratio in 0.5..1.2) {
-                    // 넓적한 비율 -> 한글 후보 보류
                     rejectedList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect))
                 }
             }
@@ -227,7 +213,6 @@ object PlateDetectionEngine {
             return null
         }
 
-        // 💡 [핵심] 한글 구출 작전 (Rescue Merge)
         var sortedChars = charList.sortedBy { it.center.x }.toMutableList()
         val rescueCandidates = mutableListOf<CharData>()
 
@@ -237,33 +222,23 @@ object PlateDetectionEngine {
             val gapX = rightChar.center.x - leftChar.center.x
             val avgW = (leftChar.width + rightChar.width) / 2.0
 
-            // 숫자들이 비정상적으로 멀리 떨어져 있다면 (한글 공백 의심)
             if (gapX > avgW * 1.5) {
                 val avgH = (leftChar.height + rightChar.height) / 2.0
                 val avgY = (leftChar.center.y + rightChar.center.y) / 2.0
-
-                // 빈 공간 안(X축)에 있으면서 같은 높이(Y축)를 가진 탈락자를 검색
                 val rescuer = rejectedList.find { r ->
                     r.center.x > leftChar.center.x && r.center.x < rightChar.center.x && 
                     abs(r.center.y - avgY) < avgH * 0.3 
                 }
-
-                if (rescuer != null) {
-                    rescueCandidates.add(rescuer) // 구출 완료
-                }
+                if (rescuer != null) rescueCandidates.add(rescuer) 
             }
         }
         
-        // 구출된 한글 멤버를 합류시키고 재정렬
         sortedChars.addAll(rescueCandidates)
         sortedChars = sortedChars.sortedBy { it.center.x }.toMutableList()
 
-        // ---------------------------------------------------------------------
-        // 💡 [안전한 클러스터링] 징검다리가 생겼으므로 maxGap은 타이트하게 1.8배 유지
         val gaps = (1 until sortedChars.size).map { sortedChars[it].center.x - sortedChars[it - 1].center.x }
         val medianGap = if (gaps.isNotEmpty()) gaps.sorted()[gaps.size / 2] else 0.0
         val avgWidth = sortedChars.map { it.width }.average()
-        
         val maxGap = max(medianGap * 1.7, avgWidth * 1.8) 
 
         val clusters = mutableListOf<MutableList<CharData>>()
@@ -282,23 +257,34 @@ object PlateDetectionEngine {
 
         val validChars = (clusters.maxByOrNull { it.size } ?: sortedChars).toMutableList()
 
-        // 💡 파란색 KOR 마크 정밀 타격 및 깃발(Flag) 꽂기
+        // =====================================================================
+        // 💡 2중 KOR 마크 정밀 타격망 (윤곽선 판별 + 사각지대 직접 스캔)
+        // =====================================================================
         var hasKorMark = false
-
-        if (validChars.size > 2) {
-            val firstChar = validChars.first() 
-            val roi = looseMat.submat(firstChar.rect)
-            val meanColor = Core.mean(roi)
-            roi.release() 
+        val firstChar = validChars.first() 
+        val roi = looseMat.submat(firstChar.rect)
+        val meanColor = Core.mean(roi)
+        roi.release() 
+        
+        // 1. 박스가 잡힌 경우: 파란 바탕인지 색상 검사
+        if (meanColor.`val`[2] > meanColor.`val`[0] + 20 && meanColor.`val`[2] > meanColor.`val`[1] + 10) {
+            hasKorMark = true 
+            validChars.removeAt(0) // KOR 마크 탈락 (순수 숫자 뼈대만 유지)
+        } else {
+            // 2. 박스가 안 잡힌 경우: 첫 번째 숫자 왼쪽의 사각지대 영역 직접 스캔
+            val checkW = firstChar.rect.width.toInt() * 2
+            val leftX = max(0, firstChar.rect.x - checkW)
+            val scanW = firstChar.rect.x - leftX
             
-            val r = meanColor.`val`[0]
-            val g = meanColor.`val`[1]
-            val b = meanColor.`val`[2]
-            
-            // KOR 마크는 파란 바탕이므로 B 채널이 R, G보다 확연히 높음
-            if (b > r + 20 && b > g + 10) {
-                hasKorMark = true // 깃발 기억
-                validChars.removeAt(0) // 뼈대에서 KOR 마크 탈락
+            if (scanW > 10) {
+                val leftRoi = looseMat.submat(Rect(leftX, firstChar.rect.y, scanW, firstChar.rect.height))
+                val leftMean = Core.mean(leftRoi)
+                leftRoi.release()
+                
+                // 파란색 스펙트럼이 감지되면 KOR 번호판으로 확정
+                if (leftMean.`val`[2] > leftMean.`val`[0] + 15 && leftMean.`val`[2] > leftMean.`val`[1] + 5) {
+                    hasKorMark = true
+                }
             }
         }
 
@@ -310,7 +296,10 @@ object PlateDetectionEngine {
         val pointsMat = MatOfPoint2f(*validChars.map { it.center }.toTypedArray())
         val line = Mat()
         Imgproc.fitLine(pointsMat, line, Imgproc.DIST_L2, 0.0, 0.01, 0.01)
-        val vx = line.get(0, 0)[0]; val vy = line.get(1, 0)[0]
+        
+        var vx = line.get(0, 0)[0]; var vy = line.get(1, 0)[0]
+        // 💡 [수정] 무조건 오른쪽 방향(양수)을 향하도록 벡터 강제 정렬 (역방향 Shift 버그 차단)
+        if (vx < 0) { vx = -vx; vy = -vy } 
         
         val topPtsArray = validChars.map { Point(it.center.x, it.rect.y.toDouble()) }.toTypedArray()
         val bottomPtsArray = validChars.map { Point(it.center.x, it.rect.y.toDouble() + it.rect.height) }.toTypedArray()
@@ -327,30 +316,27 @@ object PlateDetectionEngine {
         val bvx = bottomLineMat.get(0, 0)[0]; val bvy = bottomLineMat.get(1, 0)[0]
         val bx0 = bottomLineMat.get(2, 0)[0]; val by0 = bottomLineMat.get(3, 0)[0]
 
-        val firstChar = validChars.first()
-        val lastChar = validChars.last()
+        val leftTopMid = Point(validChars.first().rect.x + validChars.first().rect.width / 2.0, validChars.first().rect.y.toDouble())
+        val leftCenter = validChars.first().center
+        val leftBottomMid = Point(validChars.first().rect.x + validChars.first().rect.width / 2.0, validChars.first().rect.y + validChars.first().rect.height.toDouble())
 
-        val leftTopMid = Point(firstChar.rect.x + firstChar.rect.width / 2.0, firstChar.rect.y.toDouble())
-        val leftCenter = firstChar.center
-        val leftBottomMid = Point(firstChar.rect.x + firstChar.rect.width / 2.0, firstChar.rect.y + firstChar.rect.height.toDouble())
-
-        val rightTopMid = Point(lastChar.rect.x + lastChar.rect.width / 2.0, lastChar.rect.y.toDouble())
-        val rightCenter = lastChar.center
-        val rightBottomMid = Point(lastChar.rect.x + lastChar.rect.width / 2.0, lastChar.rect.y + lastChar.rect.height.toDouble())
+        val rightTopMid = Point(validChars.last().rect.x + validChars.last().rect.width / 2.0, validChars.last().rect.y.toDouble())
+        val rightCenter = validChars.last().center
+        val rightBottomMid = Point(validChars.last().rect.x + validChars.last().rect.width / 2.0, validChars.last().rect.y + validChars.last().rect.height.toDouble())
 
         val leftPts = MatOfPoint2f(leftTopMid, leftCenter, leftBottomMid)
         val leftLine = Mat()
         Imgproc.fitLine(leftPts, leftLine, Imgproc.DIST_L2, 0.0, 0.01, 0.01)
         var lvx = leftLine.get(0, 0)[0]; var lvy = leftLine.get(1, 0)[0]
         if (lvy < 0) { lvx = -lvx; lvy = -lvy }
-        val lx0 = firstChar.center.x; val ly0 = firstChar.center.y
+        val lx0 = validChars.first().center.x; val ly0 = validChars.first().center.y
 
         val rightPts = MatOfPoint2f(rightTopMid, rightCenter, rightBottomMid)
         val rightLine = Mat()
         Imgproc.fitLine(rightPts, rightLine, Imgproc.DIST_L2, 0.0, 0.01, 0.01)
         var rvx = rightLine.get(0, 0)[0]; var rvy = rightLine.get(1, 0)[0]
         if (rvy < 0) { rvx = -rvx; rvy = -rvy }
-        val rx0 = lastChar.center.x; val ry0 = lastChar.center.y
+        val rx0 = validChars.last().center.x; val ry0 = validChars.last().center.y
 
         fun getIntersect(x1: Double, y1: Double, vx1: Double, vy1: Double, x2: Double, y2: Double, vx2: Double, vy2: Double): Point {
             val dx = x2 - x1; val dy = y2 - y1
@@ -367,30 +353,23 @@ object PlateDetectionEngine {
         
         debugListener?.let {
             val debugMat = looseMat.clone()
-            
-            // 모든 글자(탈락자 포함) 박스 그리기
             for (charData in charList) {
                 val color = if (validChars.contains(charData)) Scalar(0.0, 255.0, 0.0, 255.0) else Scalar(255.0, 0.0, 0.0, 255.0)
                 Imgproc.rectangle(debugMat, charData.rect, color, 2)
             }
-            // 구출된 한글은 파란색 박스로 특별 표시
             for (charData in rescueCandidates) {
-                if (validChars.contains(charData)) {
-                    Imgproc.rectangle(debugMat, charData.rect, Scalar(0.0, 255.0, 255.0, 255.0), 3) // 노란색 박스로 강조
-                }
+                if (validChars.contains(charData)) Imgproc.rectangle(debugMat, charData.rect, Scalar(0.0, 255.0, 255.0, 255.0), 3) 
             }
-
             for (i in 0..3) {
                 val pts = arrayOf(initTL, initTR, initBR, initBL)
                 Imgproc.line(debugMat, pts[i], pts[(i+1)%4], Scalar(255.0, 0.0, 255.0, 255.0), 3)
             }
-
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
             val hudBmp = addDebugHUD(debugBmp, "Step 3~5: Base Wireframe", listOf(
-                "Method: 기초 뼈대 구축 및 구출 작전 완료",
+                "Method: 구출 작전 및 사각지대 스캔 완료",
                 "Status: KOR Mark Detected = $hasKorMark",
-                "노란 박스: 기하학적 검증으로 구출된 징검다리(한글)"
+                "Direction Vector (vx) Normalized."
             ), screenRatio)
             it.pauseAndShowStep("3~5단계: 노이즈 필터링 및 기초 뼈대 확정", hudBmp)
             debugMat.release(); debugBmp.recycle()
@@ -401,7 +380,7 @@ object PlateDetectionEngine {
         leftPts.release(); rightPts.release(); leftLine.release(); rightLine.release()
 
         // =====================================================================
-        // 🚀 [Step 6] 가로/세로 축 분리 스케일링 기반 3D 원근 보존 핏팅
+        // 🚀 [Step 6] 가로/세로 축 분리 스케일링 (완전 통합본)
         // =====================================================================
         var resultPoints: List<ImmutablePoint>? = null
 
@@ -412,33 +391,18 @@ object PlateDetectionEngine {
             var midX = (initTL.x + initTR.x + initBR.x + initBL.x) / 4.0
             var midY = (initTL.y + initTR.y + initBR.y + initBL.y) / 4.0
 
-            // 1. 세로축 독립 팽창 계수 (글자 높이의 1.35배)
+            // KOR 마크는 항상 뼈대에서 제외되므로 순수 숫자 기준 팽창 비율(1.35)로 통일
             val scaleY = 1.35 
+            val scaleX = 1.35 
 
-            // 2. 가로축 독립 팽창 계수 및 무게중심 이동(Shift) 결정
-            var scaleX = 1.0
-            var shiftNorm = 0.0
+            // 💡 KOR 마크가 스캔되었다면, 전체 마스크를 좌측(-vx 방향)으로 5.5% 밀어서 덮음
+            val shiftNorm = if (hasKorMark) -0.055 * (textW * scaleX) else 0.0
 
-            if (hasKorMark) {
-                // [케이스 A] KOR 마크가 뼈대에 포함된 경우 (오분류 혹은 KOR 포함 군집)
-                // 이미 텍스트가 번호판 가로의 대부분을 차지하므로 좌우 끝 여백만 살짝 덧댐
-                scaleX = 1.08
-                shiftNorm = 0.0 // 중심점 이동 없음
-            } else {
-                // [케이스 B] KOR 마크가 걸러진 순수 숫자 뼈대인 경우 (기본 로직)
-                // 숫자는 가로의 약 74%를 차지하므로 1.35배 팽창
-                scaleX = 1.35
-                // 팽창된 마스크를 KOR 마크가 있는 좌측(-vx 방향)으로 전체 너비의 4.5%만큼 밀어줌
-                shiftNorm = -0.045 * (textW * scaleX)
-            }
-
-            // 중심점 좌표 보정 (이동된 센터 기준으로 스케일링)
             midX += vx * shiftNorm
             midY += vy * shiftNorm
 
             val nX = -vy; val nY = vx
 
-            // 로컬 좌표계에서 가로/세로를 독립적으로 곱해 사다리꼴 왜곡을 방어하며 팽창
             val finalPts = listOf(initTL, initTR, initBR, initBL).map { pt ->
                 val dx = pt.x - midX
                 val dy = pt.y - midY
@@ -467,15 +431,14 @@ object PlateDetectionEngine {
                     Imgproc.putText(debugMat, labels[i], Point(finalPts[i].x - 20, finalPts[i].y - 20), Imgproc.FONT_HERSHEY_SIMPLEX, 1.8, colors[i], 4)
                 }
 
-                // 보정된 핏팅 중심점을 시각적으로 표시
                 Imgproc.circle(debugMat, Point(midX + looseRect.x, midY + looseRect.y), 8, Scalar(0.0, 255.0, 255.0, 255.0), -1)
 
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
                 val hudBmp = addDebugHUD(debugBmp, "Step 6: Decoupled Axis Estimation", listOf(
-                    "Mode: 가로/세로 독립 스케일링 방어 체계 작동",
-                    "Status: hasKorMark = $hasKorMark (ScaleX: $scaleX)",
-                    "Result: 번호판 흰색 철판 규격에 정확히 들어맞는 핏 구현 완료"
+                    "Mode: 통합 스케일링 및 좌측 스프트 방어 작동",
+                    "Status: hasKorMark = $hasKorMark (Shift applied)",
+                    "Result: 투명해진 KOR 마크까지 완벽하게 스캔하여 덮음"
                 ), screenRatio)
                 it.pauseAndShowStep("최종 단계: 독립 제어 가림막 좌표 확정", hudBmp)
                 debugMat.release(); debugBmp.recycle()
