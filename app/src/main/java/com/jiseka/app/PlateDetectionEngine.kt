@@ -192,17 +192,18 @@ object PlateDetectionEngine {
         val charList = mutableListOf<CharData>()
         val rejectedList = mutableListOf<CharData>() 
 
+        // 💡 1차 검열 조건 대폭 완화 (파편화된 한글 싹쓸이)
         for (contour in tempContours) {
             val rect = Imgproc.boundingRect(contour)
             val area = rect.area()
             val ratio = rect.height.toDouble() / max(rect.width.toDouble(), 1.0)
             val center = Point(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
             
-            if (area > 120 && rect.height >= 40 && area < looseRect.area() * 0.08) {
-                if (ratio in 1.2..4.2) {
-                    charList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect))
-                } else if (ratio in 0.5..1.2) {
-                    rejectedList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect))
+            if (area > 80 && area < looseRect.area() * 0.08) {
+                if (ratio in 1.1..4.5 && rect.height >= 25) {
+                    charList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect)) // 숫자
+                } else if (ratio in 0.25..1.5 && rect.height >= 15) {
+                    rejectedList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect)) // 한글 파편 후보
                 }
             }
         }
@@ -216,20 +217,24 @@ object PlateDetectionEngine {
         var sortedChars = charList.sortedBy { it.center.x }.toMutableList()
         val rescueCandidates = mutableListOf<CharData>()
 
+        // 💡 파편화된 징검다리 싹쓸이 구출 (filter 사용)
         for (i in 0 until sortedChars.size - 1) {
             val leftChar = sortedChars[i]
             val rightChar = sortedChars[i + 1]
             val gapX = rightChar.center.x - leftChar.center.x
             val avgW = (leftChar.width + rightChar.width) / 2.0
 
-            if (gapX > avgW * 1.5) {
+            if (gapX > avgW * 1.2) { // 간격 조건도 살짝 완화
                 val avgH = (leftChar.height + rightChar.height) / 2.0
                 val avgY = (leftChar.center.y + rightChar.center.y) / 2.0
-                val rescuer = rejectedList.find { r ->
-                    r.center.x > leftChar.center.x && r.center.x < rightChar.center.x && 
-                    abs(r.center.y - avgY) < avgH * 0.3 
+                
+                // 해당 공간에 있는 '모든' 탈락 파편을 주워옴 (Y축 허용치 50%로 넉넉하게)
+                val rescuers = rejectedList.filter { r ->
+                    r.center.x > leftChar.center.x + leftChar.width * 0.4 && 
+                    r.center.x < rightChar.center.x - rightChar.width * 0.4 && 
+                    abs(r.center.y - avgY) < avgH * 0.5 
                 }
-                if (rescuer != null) rescueCandidates.add(rescuer) 
+                rescueCandidates.addAll(rescuers) 
             }
         }
         
@@ -239,18 +244,32 @@ object PlateDetectionEngine {
         val gaps = (1 until sortedChars.size).map { sortedChars[it].center.x - sortedChars[it - 1].center.x }
         val medianGap = if (gaps.isNotEmpty()) gaps.sorted()[gaps.size / 2] else 0.0
         val avgWidth = sortedChars.map { it.width }.average()
+        
         val maxGap = max(medianGap * 1.7, avgWidth * 1.8) 
 
         val clusters = mutableListOf<MutableList<CharData>>()
         var currentCluster = mutableListOf(sortedChars.first())
 
+        // 💡 [핵심] 군집화: 고스트 점프 (Phantom Hangul Failsafe) 적용
         for (i in 1 until sortedChars.size) {
-            val gap = sortedChars[i].center.x - sortedChars[i - 1].center.x
-            if (gap > maxGap) {
-                clusters.add(currentCluster) 
-                currentCluster = mutableListOf(sortedChars[i]) 
+            val prev = sortedChars[i - 1]
+            val curr = sortedChars[i]
+            val gap = curr.center.x - prev.center.x
+            val yDiff = abs(curr.center.y - prev.center.y)
+            val avgH = (prev.height + curr.height) / 2.0
+
+            // 한글이 증발해서 공백이 정확히 1글자 넓이(1.5 ~ 3.5배)만큼 나고, 위아래 정렬이 완벽하다면 예외적으로 점프 허용!
+            val localMaxGap = if (gap > maxGap && gap < avgWidth * 3.5 && yDiff < avgH * 0.3) {
+                avgWidth * 3.5 
             } else {
-                currentCluster.add(sortedChars[i])
+                maxGap
+            }
+
+            if (gap > localMaxGap) {
+                clusters.add(currentCluster) 
+                currentCluster = mutableListOf(curr) 
+            } else {
+                currentCluster.add(curr)
             }
         }
         clusters.add(currentCluster)
@@ -258,7 +277,7 @@ object PlateDetectionEngine {
         val validChars = (clusters.maxByOrNull { it.size } ?: sortedChars).toMutableList()
 
         // =====================================================================
-        // 💡 2중 KOR 마크 정밀 타격망 (윤곽선 판별 + 사각지대 직접 스캔)
+        // KOR 마크 정밀 타격망 (윤곽선 판별 + 사각지대 직접 스캔)
         // =====================================================================
         var hasKorMark = false
         val firstChar = validChars.first() 
@@ -266,12 +285,10 @@ object PlateDetectionEngine {
         val meanColor = Core.mean(roi)
         roi.release() 
         
-        // 1. 박스가 잡힌 경우: 파란 바탕인지 색상 검사
         if (meanColor.`val`[2] > meanColor.`val`[0] + 20 && meanColor.`val`[2] > meanColor.`val`[1] + 10) {
             hasKorMark = true 
-            validChars.removeAt(0) // KOR 마크 탈락 (순수 숫자 뼈대만 유지)
+            validChars.removeAt(0) 
         } else {
-            // 2. 박스가 안 잡힌 경우: 첫 번째 숫자 왼쪽의 사각지대 영역 직접 스캔
             val checkW = firstChar.rect.width.toInt() * 2
             val leftX = max(0, firstChar.rect.x - checkW)
             val scanW = firstChar.rect.x - leftX
@@ -281,7 +298,6 @@ object PlateDetectionEngine {
                 val leftMean = Core.mean(leftRoi)
                 leftRoi.release()
                 
-                // 파란색 스펙트럼이 감지되면 KOR 번호판으로 확정
                 if (leftMean.`val`[2] > leftMean.`val`[0] + 15 && leftMean.`val`[2] > leftMean.`val`[1] + 5) {
                     hasKorMark = true
                 }
@@ -298,7 +314,6 @@ object PlateDetectionEngine {
         Imgproc.fitLine(pointsMat, line, Imgproc.DIST_L2, 0.0, 0.01, 0.01)
         
         var vx = line.get(0, 0)[0]; var vy = line.get(1, 0)[0]
-        // 💡 [수정] 무조건 오른쪽 방향(양수)을 향하도록 벡터 강제 정렬 (역방향 Shift 버그 차단)
         if (vx < 0) { vx = -vx; vy = -vy } 
         
         val topPtsArray = validChars.map { Point(it.center.x, it.rect.y.toDouble()) }.toTypedArray()
@@ -367,9 +382,9 @@ object PlateDetectionEngine {
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
             val hudBmp = addDebugHUD(debugBmp, "Step 3~5: Base Wireframe", listOf(
-                "Method: 구출 작전 및 사각지대 스캔 완료",
-                "Status: KOR Mark Detected = $hasKorMark",
-                "Direction Vector (vx) Normalized."
+                "Method: 고스트 점프(Failsafe) 및 파편 싹쓸이 완료",
+                "Status: KOR Mark = $hasKorMark",
+                "결과: 빨간색 '264'가 초록색으로 묶여 뼈대에 편입됨"
             ), screenRatio)
             it.pauseAndShowStep("3~5단계: 노이즈 필터링 및 기초 뼈대 확정", hudBmp)
             debugMat.release(); debugBmp.recycle()
@@ -380,7 +395,7 @@ object PlateDetectionEngine {
         leftPts.release(); rightPts.release(); leftLine.release(); rightLine.release()
 
         // =====================================================================
-        // 🚀 [Step 6] 가로/세로 축 분리 스케일링 (완전 통합본)
+        // 🚀 [Step 6] 가로/세로 축 분리 스케일링
         // =====================================================================
         var resultPoints: List<ImmutablePoint>? = null
 
@@ -391,11 +406,9 @@ object PlateDetectionEngine {
             var midX = (initTL.x + initTR.x + initBR.x + initBL.x) / 4.0
             var midY = (initTL.y + initTR.y + initBR.y + initBL.y) / 4.0
 
-            // KOR 마크는 항상 뼈대에서 제외되므로 순수 숫자 기준 팽창 비율(1.35)로 통일
             val scaleY = 1.35 
             val scaleX = 1.35 
 
-            // 💡 KOR 마크가 스캔되었다면, 전체 마스크를 좌측(-vx 방향)으로 5.5% 밀어서 덮음
             val shiftNorm = if (hasKorMark) -0.055 * (textW * scaleX) else 0.0
 
             midX += vx * shiftNorm
