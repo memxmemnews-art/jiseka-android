@@ -186,7 +186,9 @@ object PlateDetectionEngine {
         
         val tempContours = ArrayList<MatOfPoint>()
         val tempHierarchy = Mat()
-        Imgproc.findContours(thresh, tempContours, tempHierarchy, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE)
+        
+        // 💡 RETR_EXTERNAL 적용: 숫자 안쪽 노이즈 원천 차단
+        Imgproc.findContours(thresh, tempContours, tempHierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
         class CharData(val center: Point, val width: Double, val height: Double, val rect: Rect)
         val charList = mutableListOf<CharData>()
@@ -198,10 +200,10 @@ object PlateDetectionEngine {
             val ratio = rect.height.toDouble() / max(rect.width.toDouble(), 1.0)
             val center = Point(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
             
-            if (area > 80 && area < looseRect.area() * 0.08) {
-                if (ratio in 1.1..4.5 && rect.height >= 25) {
+            if (area > 100 && area < looseRect.area() * 0.08) {
+                if (ratio in 1.1..4.5 && rect.height >= 30) {
                     charList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect)) 
-                } else if (ratio in 0.25..1.5 && rect.height >= 15) {
+                } else if (ratio in 0.3..1.5 && rect.height >= 15) {
                     rejectedList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect)) 
                 }
             }
@@ -260,8 +262,8 @@ object PlateDetectionEngine {
                 maxGap
             }
 
-            // 💡 [복구된 Y축 방어막] X축 간격이 허용치 안이어도, Y축 높이가 45% 이상 심하게 어긋나면 무조건 단절!
-            if (gap > localMaxGap || yDiff > avgH * 0.45) {
+            // 💡 [이상적 타협점 적용] Y축 고도 제한 35%로 강화
+            if (gap > localMaxGap || yDiff > avgH * 0.35) {
                 clusters.add(currentCluster) 
                 currentCluster = mutableListOf(curr) 
             } else {
@@ -272,14 +274,58 @@ object PlateDetectionEngine {
 
         val validChars = (clusters.maxByOrNull { it.size } ?: sortedChars).toMutableList()
 
-        // 💡 KOR 마크 검출 및 뼈대에서 제거 (텍스트 정중앙 계산을 위해 필수)
+        if (validChars.size < 2) {
+            thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
+            return null
+        }
+
+        // =====================================================================
+        // 🚀 [이상적 타협점 적용] 문자 중심선(Line Consistency) 검증 (20% 강화)
+        // =====================================================================
+        val pointsMatTemp = MatOfPoint2f(*validChars.map { it.center }.toTypedArray())
+        val lineTemp = Mat()
+        Imgproc.fitLine(pointsMatTemp, lineTemp, Imgproc.DIST_L2, 0.0, 0.01, 0.01)
+        
+        val vxTemp = lineTemp.get(0, 0)[0]
+        val vyTemp = lineTemp.get(1, 0)[0]
+        val x0Temp = lineTemp.get(2, 0)[0]
+        val y0Temp = lineTemp.get(3, 0)[0]
+        
+        pointsMatTemp.release(); lineTemp.release()
+
+        val A = vyTemp
+        val B = -vxTemp
+        val C = vxTemp * y0Temp - vyTemp * x0Temp
+        val denominator = hypot(A, B)
+
+        val localAvgHeight = validChars.map { it.height }.average()
+
+        val iterator = validChars.iterator()
+        while (iterator.hasNext()) {
+            val charData = iterator.next()
+            val dist = abs(A * charData.center.x + B * charData.center.y + C) / denominator
+            
+            // 💡 직선에서 글자 높이의 20% 이상 떨어져 있으면 그릴 노이즈로 간주하고 완벽 차단!
+            if (dist > localAvgHeight * 0.20) {
+                iterator.remove()
+            }
+        }
+
+        if (validChars.size < 2) {
+            thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
+            return null
+        }
+
+        // =====================================================================
+        // KOR 마크 검출 및 뼈대에서 제거 (그림자 대응)
+        // =====================================================================
         var hasKorMark = false
         val firstChar = validChars.first() 
         val roi = looseMat.submat(firstChar.rect)
         val meanColor = Core.mean(roi)
         roi.release() 
         
-        if (meanColor.`val`[2] > meanColor.`val`[0] + 20 && meanColor.`val`[2] > meanColor.`val`[1] + 10) {
+        if (meanColor.`val`[2] > meanColor.`val`[0] + 10 && meanColor.`val`[2] > meanColor.`val`[1] + 5) {
             hasKorMark = true 
             validChars.removeAt(0) 
         } else {
@@ -292,7 +338,7 @@ object PlateDetectionEngine {
                 val leftMean = Core.mean(leftRoi)
                 leftRoi.release()
                 
-                if (leftMean.`val`[2] > leftMean.`val`[0] + 15 && leftMean.`val`[2] > leftMean.`val`[1] + 5) {
+                if (leftMean.`val`[2] > leftMean.`val`[0] + 10 && leftMean.`val`[2] > leftMean.`val`[1] + 5) {
                     hasKorMark = true
                 }
             }
@@ -376,9 +422,9 @@ object PlateDetectionEngine {
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
             val hudBmp = addDebugHUD(debugBmp, "Step 3~5: Base Wireframe", listOf(
-                "Method: 고스트 점프 및 사각지대 텍스트 분리 완료",
+                "Method: 문자 중심선(Line Consistency) 검증 포함 (오차 20% 타이트)",
                 "Status: KOR Mark Detected = $hasKorMark",
-                "결과: KOR 마크가 제외된 순수 숫자 뼈대 생성"
+                "결과: 렌즈 왜곡 방어 및 지그재그 패턴 완벽 차단"
             ), screenRatio)
             it.pauseAndShowStep("3~5단계: 노이즈 필터링 및 기초 뼈대 확정", hudBmp)
             debugMat.release(); debugBmp.recycle()
@@ -389,35 +435,29 @@ object PlateDetectionEngine {
         leftPts.release(); rightPts.release(); leftLine.release(); rightLine.release()
 
         // =====================================================================
-        // 🚀 [Step 6] 중심점 대칭 스케일링 (수학적 함정 제거 및 완전 통합)
+        // 🚀 [Step 6] 중심점 대칭 스케일링
         // =====================================================================
         var resultPoints: List<ImmutablePoint>? = null
 
         try {
-            // 💡 [핵심] KOR 마크와 여백은 완벽하게 대칭입니다! 이동(Shift) 없이 정중앙 유지
             val midX = (initTL.x + initTR.x + initBR.x + initBL.x) / 4.0
             val midY = (initTL.y + initTR.y + initBR.y + initBL.y) / 4.0
 
-            // 상하좌우 동일하게 1.35배 대칭 팽창 (이 비율 하나로 모든 520mm 번호판 커버)
             val scaleY = 1.35 
             val scaleX = 1.35 
 
             val nX = -vy; val nY = vx
 
             val finalPts = listOf(initTL, initTR, initBR, initBL).map { pt ->
-                // 원래 중심점을 기준으로 거리 계산
                 val dx = pt.x - midX
                 val dy = pt.y - midY
                 
-                // 로컬 벡터 투영
                 val localX = dx * vx + dy * vy
                 val localY = dx * nX + dy * nY
                 
-                // 대칭 스케일링
                 val scaledX = localX * scaleX
                 val scaledY = localY * scaleY
                 
-                // 어떠한 인위적인 Shift 없이 그 자리에서 팽창
                 Point(
                     midX + scaledX * vx + scaledY * nX + looseRect.x,
                     midY + scaledX * vy + scaledY * nY + looseRect.y
