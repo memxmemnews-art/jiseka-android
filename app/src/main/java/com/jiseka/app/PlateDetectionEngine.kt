@@ -88,9 +88,9 @@ object PlateDetectionEngine {
         paint.textSize = 32f
         for (log in logs) {
             if (log.startsWith("->") || log.startsWith("[경고]")) {
-                paint.color = Color.parseColor("#FF5555") // 에러/경고성 로그는 붉은색
+                paint.color = Color.parseColor("#FF5555")
             } else if (log.startsWith("[진단")) {
-                paint.color = Color.parseColor("#55FF55") // 진단 제목은 녹색
+                paint.color = Color.parseColor("#55FF55")
             } else {
                 paint.color = Color.WHITE
             }
@@ -184,9 +184,9 @@ object PlateDetectionEngine {
         Imgproc.GaussianBlur(looseGray, thresh, Size(5.0, 5.0), 0.0)
         Imgproc.adaptiveThreshold(thresh, thresh, 255.0, Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, Imgproc.THRESH_BINARY_INV, 31, 7.0)
 
-        // 💡 기존의 깐깐한 모폴로지 셋업 복원 (원인 1 재현용)
-        val tempOpen = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
-        val tempClose = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 5.0))
+        // 모폴로지 2x2/3x3 유지 (글자 보존력 극대화)
+        val tempOpen = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
+        val tempClose = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_OPEN, tempOpen)
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
         
@@ -198,11 +198,10 @@ object PlateDetectionEngine {
         val charList = mutableListOf<CharData>()
         val rejectedList = mutableListOf<CharData>() 
 
-        // 💡 모든 로그와 실패 원인을 저장할 변수
         val step3_5_logs = mutableListOf<String>()
         var failReason = ""
 
-        step3_5_logs.add("[진단 1] 모폴로지 및 비율 검증 (원인 1 확인)")
+        step3_5_logs.add("[진단 1] 모폴로지 및 비율 검증")
         step3_5_logs.add(" -> 발견된 덩어리(Contours): ${tempContours.size}개")
 
         for (contour in tempContours) {
@@ -212,8 +211,7 @@ object PlateDetectionEngine {
             val center = Point(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
             
             if (area > 100 && area < looseRect.area() * 0.08) {
-                // 기존의 깐깐한 비율 1.1..4.5 적용
-                if (ratio in 1.1..4.5 && rect.height >= 25) {
+                if (ratio in 0.9..5.5 && rect.height >= 20) {
                     charList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect)) 
                 } else if (ratio in 0.25..1.5 && rect.height >= 15) {
                     rejectedList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect)) 
@@ -261,9 +259,13 @@ object PlateDetectionEngine {
             val maxGap = max(medianGap * 1.7, avgWidth * 1.8) 
 
             var currentCluster = mutableListOf(sortedChars.first())
+            
+            // =====================================================================
+            // 💡 [핵심 해결] 기울기 흐름 검증(Slope Consistency) 기반 동적 군집화 
+            // =====================================================================
             for (i in 1 until sortedChars.size) {
-                val prev = sortedChars[i - 1]
                 val curr = sortedChars[i]
+                val prev = sortedChars[i - 1]
                 val gap = curr.center.x - prev.center.x
                 val yDiff = abs(curr.center.y - prev.center.y)
                 val avgH = (prev.height + curr.height) / 2.0
@@ -274,8 +276,25 @@ object PlateDetectionEngine {
                     maxGap
                 }
 
-                // 💡 사선 왜곡 시 가장 잘 끊어지는 Y축 45% 오차 제한 (원인 2 재현용)
-                if (gap > localMaxGap || yDiff > avgH * 0.45) {
+                // 1. 기본 검증 (가장 엄격한 45% 단차 허용)
+                var isSplit = gap > localMaxGap || yDiff > avgH * 0.45
+
+                // 2. 동적 사선 예외 허용 (Slope Consistency)
+                // Y단차가 45%를 넘더라도, 가로 간격이 매우 가깝고 이전 기울기 흐름을 따른다면 예외적 통과 (단차 85%까지 허용)
+                if (isSplit && gap < avgWidth * 1.3 && yDiff <= avgH * 0.85 && currentCluster.size >= 2) {
+                    val prev1 = currentCluster.last()
+                    val prev2 = currentCluster[currentCluster.size - 2]
+                    
+                    val slope1 = (prev1.center.y - prev2.center.y) / max(prev1.center.x - prev2.center.x, 1.0)
+                    val slope2 = (curr.center.y - prev1.center.y) / max(curr.center.x - prev1.center.x, 1.0)
+                    
+                    // 기울기 차이가 0.2 이하(직선에 가까움)면 단절 취소!
+                    if (abs(slope1 - slope2) < 0.2) {
+                        isSplit = false 
+                    }
+                }
+
+                if (isSplit) {
                     clusters.add(currentCluster) 
                     currentCluster = mutableListOf(curr) 
                 } else {
@@ -285,13 +304,12 @@ object PlateDetectionEngine {
             clusters.add(currentCluster)
 
             validChars = (clusters.maxByOrNull { it.size } ?: sortedChars).toMutableList()
-            step3_5_logs.add("[진단 2] 군집화 Y축 오차 45% 방어막 (원인 2 확인)")
+            step3_5_logs.add("[진단 2] 사선 흐름(Slope) 동적 군집화")
             step3_5_logs.add(" -> 군집화 후 최대 그룹 사이즈: ${validChars.size}개")
 
             if (validChars.size < 2) {
-                failReason = "원인 2: Y축 사선 왜곡 오차(45%)를 넘겨 뼈대 토막남"
+                failReason = "원인 2: Y축 앵글 왜곡 또는 거리가 너무 멀어 뼈대 토막남"
             } else {
-                // 직선 정렬 검사
                 val pointsMatTemp = MatOfPoint2f(*validChars.map { it.center }.toTypedArray())
                 val lineTemp = Mat()
                 Imgproc.fitLine(pointsMatTemp, lineTemp, Imgproc.DIST_L2, 0.0, 0.01, 0.01)
@@ -318,8 +336,7 @@ object PlateDetectionEngine {
                 if (validChars.size < 2) {
                     failReason = "직선 배열 검증 과정에서 글자 삭제됨"
                 } else {
-                    // 💡 조명에 의해 파란색 착각을 유발하는 기존 KOR 마크 기준 (원인 3 재현용)
-                    step3_5_logs.add("[진단 3] KOR 마크 검출 (원인 3 조명 착시 확인)")
+                    step3_5_logs.add("[진단 3] 2-Track KOR 마크 검출")
                     
                     val firstChar = validChars.first() 
                     val roi = looseMat.submat(firstChar.rect)
@@ -331,10 +348,9 @@ object PlateDetectionEngine {
                     val b = meanColor.`val`[2].toInt()
                     step3_5_logs.add(" -> 첫 글자 RGB 스캔: R:$r, G:$g, B:$b")
                     
-                    // 기존 완화된 기준 (B > R+10)
-                    if (b > r + 10 && b > g + 5) {
+                    if (b > r + 25 && b > g + 15) {
                         validChars.removeAt(0) 
-                        step3_5_logs.add(" -> [경고] B > R+10 충족! KOR로 오인하여 첫 글자 파괴됨")
+                        step3_5_logs.add(" -> [완벽 차단] 찐파랑 확인, KOR 마크로 정상 처리됨")
                     } else {
                         val checkW = firstChar.rect.width.toInt() * 2
                         val leftX = max(0, firstChar.rect.x - checkW)
@@ -343,38 +359,31 @@ object PlateDetectionEngine {
                             val leftRoi = looseMat.submat(Rect(leftX, firstChar.rect.y, scanW, firstChar.rect.height))
                             val leftMean = Core.mean(leftRoi)
                             leftRoi.release()
+                            if (leftMean.`val`[2] > leftMean.`val`[0] + 10 && leftMean.`val`[2] > leftMean.`val`[1] + 5) {
+                                step3_5_logs.add(" -> [완벽 차단] 첫 글자는 보호, 사각지대에서 KOR 흔적 발견")
+                            }
                         }
                     }
 
                     if (validChars.size < 2) {
-                        failReason = "원인 3: KOR 조명 착시로 숫자 삭제 후 뼈대 무너짐"
+                        failReason = "원인 3: KOR 처리 과정 오류"
                     } else {
-                        step3_5_logs.add(" -> KOR 검증 후 뼈대 유지 성공 (최종 ${validChars.size}개)")
+                        step3_5_logs.add(" -> 뼈대 유지 성공 (최종 ${validChars.size}개)")
                     }
                 }
             }
         }
 
-        // =====================================================================
-        // 🚀 통합 디버그 뷰: 실패 시에도 무조건 화면에 띄우고 종료!
-        // =====================================================================
         debugListener?.let {
             val debugMat = looseMat.clone()
-            
-            // 1. 모든 윤곽선(Contours)을 회색으로 그림 (떡짐, 지워짐 확인용)
             Imgproc.drawContours(debugMat, tempContours, -1, Scalar(150.0, 150.0, 150.0, 200.0), 1)
             
-            // 2. 1차 탈락한 보류소 박스를 진한 회색으로 그림
             for (charData in rejectedList) {
                 Imgproc.rectangle(debugMat, charData.rect, Scalar(80.0, 80.0, 80.0, 255.0), 1)
             }
-            
-            // 3. 1차 합격한 후보군 박스를 빨간색으로 그림
             for (charData in charList) {
                 Imgproc.rectangle(debugMat, charData.rect, Scalar(255.0, 0.0, 0.0, 255.0), 2)
             }
-            
-            // 4. 최종 생존한 뼈대를 초록색으로 그리고 보라색 선으로 연결
             if (validChars.isNotEmpty()) {
                 for (i in 0 until validChars.size) {
                     Imgproc.rectangle(debugMat, validChars[i].rect, Scalar(0.0, 255.0, 0.0, 255.0), 3)
@@ -390,15 +399,12 @@ object PlateDetectionEngine {
             val title = if (failReason.isNotEmpty()) "3~5단계: 분석 중단 ($failReason)" else "3~5단계: 정상 뼈대 구축"
             val hudBmp = addDebugHUD(debugBmp, title, step3_5_logs, screenRatio)
             
-            // 💡 앱이 이 단계를 절대 스킵하지 않도록 표준 네이밍 사용
             it.pauseAndShowStep("3~5단계: 디버그 분석", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
 
-        // 디버그 뷰를 다 그린 후에 메모리 해제
         tempContours.forEach { it.release() }; tempHierarchy.release(); tempOpen.release(); tempClose.release()
 
-        // 💡 에러가 발생했으면 디버그를 띄워준 직후 여기서 조용히 null 반환 (앱은 정상 실패 처리)
         if (failReason.isNotEmpty() || validChars.size < 2) {
             thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
             return null
