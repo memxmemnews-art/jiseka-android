@@ -66,32 +66,32 @@ object PlateDetectionEngine {
 
         val paint = Paint().apply {
             color = Color.WHITE
-            textSize = 32f
+            textSize = 38f
             isAntiAlias = true
             setShadowLayer(5f, 0f, 0f, Color.BLACK)
         }
 
-        val paddingX = 60f
-        val lineHeight = 48f
+        val paddingX = 80f
+        val lineHeight = 55f
         val maxTextWidth = canvasWidth - (paddingX * 2)
-        var currentY = 80f 
+        var currentY = 100f 
         
         paint.color = Color.YELLOW
         paint.isFakeBoldText = true
-        paint.textSize = 40f
+        paint.textSize = 45f
         currentY = drawTextWithWrap(canvas, title, paddingX, currentY, paint, maxTextWidth, lineHeight)
 
-        currentY += 15f 
+        currentY += 20f 
 
         paint.color = Color.WHITE
         paint.isFakeBoldText = false
-        paint.textSize = 30f
+        paint.textSize = 35f
         for (log in logs) {
             currentY = drawTextWithWrap(canvas, log, paddingX, currentY, paint, maxTextWidth, lineHeight)
         }
 
-        val textBottom = currentY + 20f 
-        val margin = 40f
+        val textBottom = currentY + 30f 
+        val margin = 50f
         
         val maxImgWidth = canvasWidth - (margin * 2)
         val maxImgHeight = canvasHeight - textBottom - margin 
@@ -140,7 +140,9 @@ object PlateDetectionEngine {
             Utils.matToBitmap(debugMat, debugBmp)
             val hudBmp = addDebugHUD(debugBmp, "Step 1: User Touch Point", listOf(
                 "Action: 터치 좌표 수신 완료",
-                "Touch Point X: ${cx.toInt()} px, Y: ${cy.toInt()} px"
+                "Touch Point X: ${cx.toInt()} px", 
+                "Touch Point Y: ${cy.toInt()} px",
+                "Resolution: ${fullMat.cols()} x ${fullMat.rows()}"
             ), screenRatio)
             it.pauseAndShowStep("1단계: 터치 좌표 매핑", hudBmp)
             debugMat.release(); debugBmp.recycle()
@@ -177,14 +179,15 @@ object PlateDetectionEngine {
         Imgproc.GaussianBlur(looseGray, thresh, Size(5.0, 5.0), 0.0)
         Imgproc.adaptiveThreshold(thresh, thresh, 255.0, Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, Imgproc.THRESH_BINARY_INV, 31, 7.0)
 
-        val tempOpen = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
-        val tempClose = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 5.0))
+        val tempOpen = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
+        val tempClose = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_OPEN, tempOpen)
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
         
         val tempContours = ArrayList<MatOfPoint>()
         val tempHierarchy = Mat()
-        Imgproc.findContours(thresh, tempContours, tempHierarchy, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE)
+        
+        Imgproc.findContours(thresh, tempContours, tempHierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
         class CharData(val center: Point, val width: Double, val height: Double, val rect: Rect)
         val charList = mutableListOf<CharData>()
@@ -196,8 +199,8 @@ object PlateDetectionEngine {
             val ratio = rect.height.toDouble() / max(rect.width.toDouble(), 1.0)
             val center = Point(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
             
-            if (area > 80 && area < looseRect.area() * 0.08) {
-                if (ratio in 1.1..4.5 && rect.height >= 25) {
+            if (area > 100 && area < looseRect.area() * 0.08) {
+                if (ratio in 0.9..5.5 && rect.height >= 20) {
                     charList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect)) 
                 } else if (ratio in 0.25..1.5 && rect.height >= 15) {
                     rejectedList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect)) 
@@ -206,20 +209,7 @@ object PlateDetectionEngine {
         }
         tempContours.forEach { it.release() }; tempHierarchy.release(); tempOpen.release(); tempClose.release()
 
-        // 🔍 [원인 1 검증지점] 모폴로지 후 문자 후보군 확인 강제 디버그뷰
         if (charList.isEmpty()) {
-            debugListener?.let {
-                val debugMat = looseMat.clone()
-                val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
-                Utils.matToBitmap(debugMat, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "원인 1 검증: charList가 비어있음", listOf(
-                    "총 발견된 윤곽선 수: ${tempContours.size}",
-                    "보류소(rejectedList) 크기: ${rejectedList.size}",
-                    "진단: 모폴로지 단계에서 글자가 지워졌거나 뭉개졌을 확률이 높음"
-                ), screenRatio)
-                it.pauseAndShowStep("오류 지점: 문자 후보 탐지 실패", hudBmp)
-                debugMat.release(); debugBmp.recycle()
-            }
             thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
             return null
         }
@@ -257,7 +247,6 @@ object PlateDetectionEngine {
 
         val clusters = mutableListOf<MutableList<CharData>>()
         var currentCluster = mutableListOf(sortedChars.first())
-        val clusteringHistory = mutableListOf<String>() // 추적 데이터 저장용
 
         for (i in 1 until sortedChars.size) {
             val prev = sortedChars[i - 1]
@@ -266,16 +255,13 @@ object PlateDetectionEngine {
             val yDiff = abs(curr.center.y - prev.center.y)
             val avgH = (prev.height + curr.height) / 2.0
 
-            val localMaxGap = if (gap > maxGap && gap < avgWidth * 3.5 && yDiff < avgH * 0.3) {
+            val localMaxGap = if (gap > maxGap && gap < avgWidth * 3.5 && yDiff < avgH * 0.35) {
                 avgWidth * 3.5 
             } else {
                 maxGap
             }
 
-            val isSplit = gap > localMaxGap || yDiff > avgH * 0.45
-            clusteringHistory.add("Idx $i -> X간격: ${gap.toInt()}(최대:${localMaxGap.toInt()}) | Y차이: ${yDiff.toInt()}(최대:${(avgH*0.45).toInt()}) ${if(isSplit) "[단절]" else "[연결]"}")
-
-            if (isSplit) {
+            if (gap > localMaxGap || yDiff > avgH * 0.35) {
                 clusters.add(currentCluster) 
                 currentCluster = mutableListOf(curr) 
             } else {
@@ -286,27 +272,13 @@ object PlateDetectionEngine {
 
         val validChars = (clusters.maxByOrNull { it.size } ?: sortedChars).toMutableList()
 
-        // 🔍 [원인 2 검증지점] 군집화 단절로 인한 파편화 확인 강제 디버그뷰
         if (validChars.size < 2) {
-            debugListener?.let {
-                val debugMat = looseMat.clone()
-                for (idx in sortedChars.indices) {
-                    Imgproc.rectangle(debugMat, sortedChars[idx].rect, Scalar(0.0, 0.0, 255.0, 255.0), 2)
-                    Imgproc.putText(debugMat, idx.toString(), Point(sortedChars[idx].rect.x.toDouble(), sortedChars[idx].rect.y.toDouble() - 5), Imgproc.FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0.0, 0.0, 255.0, 255.0), 2)
-                }
-                val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
-                Utils.matToBitmap(debugMat, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "원인 2 검증: 군집화 분리 현상", 
-                    listOf("총 군집 수: ${clusters.size}개", "최대 군집 내 글자 수: ${validChars.size}개") + clusteringHistory, screenRatio)
-                it.pauseAndShowStep("오류 지점: 군집화 크기 조건 미달", hudBmp)
-                debugMat.release(); debugBmp.recycle()
-            }
             thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
             return null
         }
 
         // =====================================================================
-        // 문자 중심선(Line Consistency) 검증 
+        // 문자 중심선(Line Consistency) 검증 (20% 강화)
         // =====================================================================
         val pointsMatTemp = MatOfPoint2f(*validChars.map { it.center }.toTypedArray())
         val lineTemp = Mat()
@@ -325,31 +297,18 @@ object PlateDetectionEngine {
         val denominator = hypot(A, B)
 
         val localAvgHeight = validChars.map { it.height }.average()
-        val lineConsistencyHistory = mutableListOf<String>()
 
         val iterator = validChars.iterator()
-        var checkIdx = 0
         while (iterator.hasNext()) {
             val charData = iterator.next()
             val dist = abs(A * charData.center.x + B * charData.center.y + C) / denominator
-            val isRemoved = dist > localAvgHeight * 0.20
-            lineConsistencyHistory.add("글자 $checkIdx -> 중심선 거리: ${String.format("%.1f", dist)} px (허용:${String.format("%.1f", localAvgHeight * 0.20)}) ${if(isRemoved) "[축출]" else "[유지]"}")
             
-            if (isRemoved) {
+            if (dist > localAvgHeight * 0.20) {
                 iterator.remove()
             }
-            checkIdx++
         }
 
         if (validChars.size < 2) {
-            debugListener?.let {
-                val debugMat = looseMat.clone()
-                val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
-                Utils.matToBitmap(debugMat, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "추가 검증: 직선 정렬 검사 단계 탈락", lineConsistencyHistory, screenRatio)
-                it.pauseAndShowStep("오류 지점: 직선 일치성 부족", hudBmp)
-                debugMat.release(); debugBmp.recycle()
-            }
             thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
             return null
         }
@@ -363,10 +322,7 @@ object PlateDetectionEngine {
         val meanColor = Core.mean(roi)
         roi.release() 
         
-        // 🔍 [원인 3 검증 수치] 첫 글자 영역의 실제 연산 색상값 추출
-        val colorLog = "첫 글자 수색결과 -> R: ${meanColor.`val`[0].toInt()} | G: ${meanColor.`val`[1].toInt()} | B: ${meanColor.`val`[2].toInt()} (판별식: B > R + 20)"
-        
-        if (meanColor.`val`[2] > meanColor.`val`[0] + 20 && meanColor.`val`[2] > meanColor.`val`[1] + 10) {
+        if (meanColor.`val`[2] > meanColor.`val`[0] + 25 && meanColor.`val`[2] > meanColor.`val`[1] + 15) {
             hasKorMark = true 
             validChars.removeAt(0) 
         } else {
@@ -379,25 +335,13 @@ object PlateDetectionEngine {
                 val leftMean = Core.mean(leftRoi)
                 leftRoi.release()
                 
-                if (leftMean.`val`[2] > leftMean.`val`[0] + 15 && leftMean.`val`[2] > leftMean.`val`[1] + 5) {
+                if (leftMean.`val`[2] > leftMean.`val`[0] + 10 && leftMean.`val`[2] > leftMean.`val`[1] + 5) {
                     hasKorMark = true
                 }
             }
         }
 
         if (validChars.size < 2) {
-            debugListener?.let {
-                val debugMat = looseMat.clone()
-                val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
-                Utils.matToBitmap(debugMat, debugBmp)
-                val hudBmp = addDebugHUD(debugBmp, "원인 3 검증: KOR 오분류 후 뼈대 파괴", listOf(
-                    colorLog,
-                    "KOR 판정 여부: $hasKorMark",
-                    "진단: 첫 글자(예: '2')를 KOR 마크로 오인하여 삭제했을 가능성 확인 필요"
-                ), screenRatio)
-                it.pauseAndShowStep("오류 지점: KOR 처리 후 유효 글자 부족", hudBmp)
-                debugMat.release(); debugBmp.recycle()
-            }
             thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
             return null
         }
@@ -424,6 +368,7 @@ object PlateDetectionEngine {
         val bvx = bottomLineMat.get(0, 0)[0]; val bvy = bottomLineMat.get(1, 0)[0]
         val bx0 = bottomLineMat.get(2, 0)[0]; val by0 = bottomLineMat.get(3, 0)[0]
 
+        // 💡 쏠림 현상 진단을 위해 '겉 테두리 경계선' 기준이 아닌 '글자 중심점' 기준으로 선을 그어 교차점을 구함
         val leftTopMid = Point(validChars.first().rect.x + validChars.first().rect.width / 2.0, validChars.first().rect.y.toDouble())
         val leftCenter = validChars.first().center
         val leftBottomMid = Point(validChars.first().rect.x + validChars.first().rect.width / 2.0, validChars.first().rect.y + validChars.first().rect.height.toDouble())
@@ -475,11 +420,62 @@ object PlateDetectionEngine {
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
             val hudBmp = addDebugHUD(debugBmp, "Step 3~5: Base Wireframe", listOf(
-                "성공 케이스 로그 출력망",
-                colorLog,
-                "Status: KOR Mark Detected = $hasKorMark"
+                "Method: 2-Track KOR 마크 검증 (조명 착시 오인 차단)",
+                "Status: KOR Mark Detected = $hasKorMark",
+                "결과: 하얀 숫자가 온전히 뼈대로 보존됨"
             ), screenRatio)
-            it.pauseAndShowStep("3~5단계: 정상 확정 상태 확인", hudBmp)
+            it.pauseAndShowStep("3~5단계: 노이즈 필터링 및 기초 뼈대 확정", hudBmp)
+            debugMat.release(); debugBmp.recycle()
+        }
+
+        // =====================================================================
+        // 🔍 [신규 디버그] 모서리 교차점(Intersection) 생성 원리 확인
+        // =====================================================================
+        debugListener?.let {
+            val debugMat = looseMat.clone()
+            
+            // 상단, 하단, 좌측, 우측 무한 연장선(Line) 그리기
+            val scale = 500.0
+            
+            // Top Line (Red)
+            val topPt1 = Point(tx0 - tvx * scale, ty0 - tvy * scale)
+            val topPt2 = Point(tx0 + tvx * scale, ty0 + tvy * scale)
+            Imgproc.line(debugMat, topPt1, topPt2, Scalar(255.0, 0.0, 0.0, 255.0), 2)
+            
+            // Bottom Line (Blue)
+            val botPt1 = Point(bx0 - bvx * scale, by0 - bvy * scale)
+            val botPt2 = Point(bx0 + bvx * scale, by0 + bvy * scale)
+            Imgproc.line(debugMat, botPt1, botPt2, Scalar(0.0, 0.0, 255.0, 255.0), 2)
+
+            // Left Line (Green)
+            val leftPt1 = Point(lx0 - lvx * scale, ly0 - lvy * scale)
+            val leftPt2 = Point(lx0 + lvx * scale, ly0 + lvy * scale)
+            Imgproc.line(debugMat, leftPt1, leftPt2, Scalar(0.0, 255.0, 0.0, 255.0), 2)
+
+            // Right Line (Yellow)
+            val rightPt1 = Point(rx0 - rvx * scale, ry0 - rvy * scale)
+            val rightPt2 = Point(rx0 + rvx * scale, ry0 + rvy * scale)
+            Imgproc.line(debugMat, rightPt1, rightPt2, Scalar(255.0, 255.0, 0.0, 255.0), 2)
+
+            // 교차점(Corners) 원으로 표시
+            val pts = arrayOf(initTL, initTR, initBR, initBL)
+            for (pt in pts) {
+                Imgproc.circle(debugMat, pt, 5, Scalar(255.0, 255.0, 255.0, 255.0), -1)
+            }
+
+            val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(debugMat, debugBmp)
+            
+            // 첫 글자(2)와 마지막 글자(6)의 폭(Width) 비교 출력
+            val firstW = validChars.first().width.toInt()
+            val lastW = validChars.last().width.toInt()
+            
+            val hudBmp = addDebugHUD(debugBmp, "Step 5.5: Intersection Diagnosis", listOf(
+                "분석: 가림막 모서리 생성을 위한 가상 교차선 검증",
+                "첫 글자 폭: ${firstW}px | 마지막 글자 폭: ${lastW}px",
+                "진단: 두 글자의 폭이 다르면 중심점 기반 교차 시 쏠림 발생"
+            ), screenRatio)
+            it.pauseAndShowStep("5.5단계: 교차선 쏠림 원인 진단", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
 
@@ -534,8 +530,9 @@ object PlateDetectionEngine {
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
                 val hudBmp = addDebugHUD(debugBmp, "Step 6: Symmetric Scaling", listOf(
-                    "Mode: 대칭 팽창 완료",
-                    "Status: Shift 0.0"
+                    "Mode: 대칭 팽창",
+                    "Status: Shift 0.0 (Perfectly Centered)",
+                    "Result: 우측 쏠림 발생"
                 ), screenRatio)
                 it.pauseAndShowStep("최종 단계: 대칭 팽창 가림막 좌표 확정", hudBmp)
                 debugMat.release(); debugBmp.recycle()
