@@ -186,8 +186,6 @@ object PlateDetectionEngine {
         
         val tempContours = ArrayList<MatOfPoint>()
         val tempHierarchy = Mat()
-        
-        // 💡 RETR_EXTERNAL 적용: 숫자 안쪽 노이즈 원천 차단
         Imgproc.findContours(thresh, tempContours, tempHierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
         class CharData(val center: Point, val width: Double, val height: Double, val rect: Rect)
@@ -262,7 +260,6 @@ object PlateDetectionEngine {
                 maxGap
             }
 
-            // 💡 [이상적 타협점 적용] Y축 고도 제한 35%로 강화
             if (gap > localMaxGap || yDiff > avgH * 0.35) {
                 clusters.add(currentCluster) 
                 currentCluster = mutableListOf(curr) 
@@ -280,7 +277,7 @@ object PlateDetectionEngine {
         }
 
         // =====================================================================
-        // 🚀 [이상적 타협점 적용] 문자 중심선(Line Consistency) 검증 (20% 강화)
+        // 🚀 문자 중심선(Line Consistency) 검증
         // =====================================================================
         val pointsMatTemp = MatOfPoint2f(*validChars.map { it.center }.toTypedArray())
         val lineTemp = Mat()
@@ -305,7 +302,6 @@ object PlateDetectionEngine {
             val charData = iterator.next()
             val dist = abs(A * charData.center.x + B * charData.center.y + C) / denominator
             
-            // 💡 직선에서 글자 높이의 20% 이상 떨어져 있으면 그릴 노이즈로 간주하고 완벽 차단!
             if (dist > localAvgHeight * 0.20) {
                 iterator.remove()
             }
@@ -317,7 +313,7 @@ object PlateDetectionEngine {
         }
 
         // =====================================================================
-        // KOR 마크 검출 및 뼈대에서 제거 (그림자 대응)
+        // 💡 [핵심 해결] 2-Track KOR 마크 검출 및 뼈대 제거 로직
         // =====================================================================
         var hasKorMark = false
         val firstChar = validChars.first() 
@@ -325,10 +321,14 @@ object PlateDetectionEngine {
         val meanColor = Core.mean(roi)
         roi.release() 
         
-        if (meanColor.`val`[2] > meanColor.`val`[0] + 10 && meanColor.`val`[2] > meanColor.`val`[1] + 5) {
+        // 1. 박스 직접 삭제 (Strict Mode) : 압도적인 찐파랑(B > R + 25)일 때만 번호판에서 삭제
+        // 푸른 형광등 조명 아래에서 하얀 숫자가 파랗게 오인되어 잘려나가는 대참사 방지
+        if (meanColor.`val`[2] > meanColor.`val`[0] + 25 && meanColor.`val`[2] > meanColor.`val`[1] + 15) {
             hasKorMark = true 
             validChars.removeAt(0) 
         } else {
+            // 2. 왼쪽 사각지대 스캔 (Relaxed Mode) : 첫 글자가 잘리지 않았다면 왼쪽 배경 스캔
+            // 이곳은 글자가 없으므로, 그림자 속 파란색을 찾기 위해 기존처럼 완화된 기준 적용
             val checkW = firstChar.rect.width.toInt() * 2
             val leftX = max(0, firstChar.rect.x - checkW)
             val scanW = firstChar.rect.x - leftX
@@ -422,9 +422,9 @@ object PlateDetectionEngine {
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
             val hudBmp = addDebugHUD(debugBmp, "Step 3~5: Base Wireframe", listOf(
-                "Method: 문자 중심선(Line Consistency) 검증 포함 (오차 20% 타이트)",
+                "Method: 2-Track KOR 마크 검증 (조명 착시 오인 차단)",
                 "Status: KOR Mark Detected = $hasKorMark",
-                "결과: 렌즈 왜곡 방어 및 지그재그 패턴 완벽 차단"
+                "결과: 하얀 숫자가 온전히 뼈대로 보존됨"
             ), screenRatio)
             it.pauseAndShowStep("3~5단계: 노이즈 필터링 및 기초 뼈대 확정", hudBmp)
             debugMat.release(); debugBmp.recycle()
