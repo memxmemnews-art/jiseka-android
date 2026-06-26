@@ -184,10 +184,14 @@ object PlateDetectionEngine {
         Imgproc.GaussianBlur(looseGray, thresh, Size(5.0, 5.0), 0.0)
         Imgproc.adaptiveThreshold(thresh, thresh, 255.0, Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, Imgproc.THRESH_BINARY_INV, 31, 7.0)
 
-        val tempOpen = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
+        // 💡 핵심 수정: 모폴로지 연산 순서 정상화 (CLOSE 선행 ➔ OPEN 후행)
+        // 1. 뚫린 구멍 메우고 파편화된 글자를 한 덩어리로 묶음
         val tempClose = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
-        Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_OPEN, tempOpen)
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
+        
+        // 2. 외곽에 붙은 잔여 노이즈를 깎아내어 다듬음
+        val tempOpen = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
+        Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_OPEN, tempOpen)
         
         val tempContours = ArrayList<MatOfPoint>()
         val tempHierarchy = Mat()
@@ -197,8 +201,6 @@ object PlateDetectionEngine {
         val charList = mutableListOf<CharData>()
         val rejectedList = mutableListOf<CharData>() 
         val totalRejectedRects = mutableListOf<Rect>() 
-        
-        // 💡 디버그 화면에 텍스트를 그리기 위한 리스트
         val onScreenDebugTexts = mutableListOf<Pair<Rect, String>>()
 
         val step3_5_logs = mutableListOf<String>()
@@ -213,10 +215,8 @@ object PlateDetectionEngine {
             val ratio = rect.height.toDouble() / max(rect.width.toDouble(), 1.0)
             val center = Point(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
             
-            // 비율을 소수점 1자리로 포맷팅
             val ratioStr = (ratio * 10.0).toInt() / 10.0
             
-            // 💡 텍스트가 너무 겹쳐서 앱이 뻗거나 까맣게 덮이는 것을 막기 위해, 너무 미세한 노이즈(Area < 60)는 텍스트 출력 생략
             if (area > 60) {
                 onScreenDebugTexts.add(Pair(rect, "W:${rect.width} H:${rect.height} A:${area.toInt()} R:$ratioStr"))
             }
@@ -387,11 +387,9 @@ object PlateDetectionEngine {
             val debugMat = looseMat.clone()
             Imgproc.drawContours(debugMat, tempContours, -1, Scalar(150.0, 150.0, 150.0, 200.0), 1)
             
-            // 💡 시각화: 가장 밑바탕에 완전 탈락(파란색) 박스 렌더링
             for (rect in totalRejectedRects) {
                 Imgproc.rectangle(debugMat, rect, Scalar(0.0, 0.0, 255.0, 255.0), 1)
             }
-            
             for (charData in rejectedList) {
                 Imgproc.rectangle(debugMat, charData.rect, Scalar(80.0, 80.0, 80.0, 255.0), 1)
             }
@@ -407,9 +405,7 @@ object PlateDetectionEngine {
                 }
             }
             
-            // 💡 시각화: 이미지 자체에 디버그 데이터 직접 텍스트 출력 (가장 위에 덮어쓰기)
             for ((rect, text) in onScreenDebugTexts) {
-                // 노란색 글씨로 박스 상단에 출력 (R:255, G:255, B:0, A:255)
                 Imgproc.putText(debugMat, text, Point(rect.x.toDouble(), rect.y.toDouble() - 4), Imgproc.FONT_HERSHEY_SIMPLEX, 0.45, Scalar(255.0, 255.0, 0.0, 255.0), 1)
             }
             
@@ -553,6 +549,7 @@ object PlateDetectionEngine {
             thresh.release()
             looseMat.release(); looseGray.release()
             fullMat.release(); fullGray.release()
+            tempOpen.release(); tempClose.release()
         }
 
         return resultPoints
