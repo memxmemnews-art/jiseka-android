@@ -184,7 +184,6 @@ object PlateDetectionEngine {
         Imgproc.GaussianBlur(looseGray, thresh, Size(5.0, 5.0), 0.0)
         Imgproc.adaptiveThreshold(thresh, thresh, 255.0, Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, Imgproc.THRESH_BINARY_INV, 31, 7.0)
 
-        // 모폴로지 2x2/3x3 유지 (글자 보존력 극대화)
         val tempOpen = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
         val tempClose = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_OPEN, tempOpen)
@@ -197,6 +196,10 @@ object PlateDetectionEngine {
         class CharData(val center: Point, val width: Double, val height: Double, val rect: Rect)
         val charList = mutableListOf<CharData>()
         val rejectedList = mutableListOf<CharData>() 
+        val totalRejectedRects = mutableListOf<Rect>() 
+        
+        // 💡 디버그 화면에 텍스트를 그리기 위한 리스트
+        val onScreenDebugTexts = mutableListOf<Pair<Rect, String>>()
 
         val step3_5_logs = mutableListOf<String>()
         var failReason = ""
@@ -204,28 +207,35 @@ object PlateDetectionEngine {
         step3_5_logs.add("[진단 1] 모폴로지 및 비율 검증")
         step3_5_logs.add(" -> 발견된 덩어리(Contours): ${tempContours.size}개")
 
-        // =====================================================================
-        // 💡 [핵심 수정] 동적 최소 크기 기준 설정 (그릴 등 노이즈 덩어리 원천 차단)
-        // =====================================================================
-        val minArea = max(150.0, looseRect.area() * 0.001)   // ROI 면적의 최소 0.1% 이상
-        val minHeight = max(20.0, looseRect.height * 0.08) // ROI 높이의 최소 8% 이상
-
         for (contour in tempContours) {
             val rect = Imgproc.boundingRect(contour)
             val area = rect.area()
             val ratio = rect.height.toDouble() / max(rect.width.toDouble(), 1.0)
             val center = Point(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
             
-            if (area > minArea && area < looseRect.area() * 0.08) {
-                if (ratio in 0.9..5.5 && rect.height >= minHeight) {
+            // 비율을 소수점 1자리로 포맷팅
+            val ratioStr = (ratio * 10.0).toInt() / 10.0
+            
+            // 💡 텍스트가 너무 겹쳐서 앱이 뻗거나 까맣게 덮이는 것을 막기 위해, 너무 미세한 노이즈(Area < 60)는 텍스트 출력 생략
+            if (area > 60) {
+                onScreenDebugTexts.add(Pair(rect, "W:${rect.width} H:${rect.height} A:${area.toInt()} R:$ratioStr"))
+            }
+
+            if (area > 100 && area < looseRect.area() * 0.08) {
+                if (ratio in 0.9..5.5 && rect.height >= 20) {
                     charList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect)) 
-                } else if (ratio in 0.25..1.5 && rect.height >= minHeight * 0.75) {
+                } else if (ratio in 0.25..1.5 && rect.height >= 15) {
                     rejectedList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect)) 
+                } else {
+                    totalRejectedRects.add(rect)
                 }
+            } else {
+                totalRejectedRects.add(rect)
             }
         }
         
         step3_5_logs.add(" -> 1차 통과 후보: ${charList.size}개")
+        step3_5_logs.add(" -> 디버그: 파란 박스(탈락) ${totalRejectedRects.size}개")
 
         var sortedChars = mutableListOf<CharData>()
         var validChars = mutableListOf<CharData>()
@@ -279,10 +289,8 @@ object PlateDetectionEngine {
                     maxGap
                 }
 
-                // 1. 기본 검증 (가장 엄격한 45% 단차 허용)
                 var isSplit = gap > localMaxGap || yDiff > avgH * 0.45
 
-                // 2. 동적 사선 예외 허용 (Slope Consistency)
                 if (isSplit && gap < avgWidth * 1.3 && yDiff <= avgH * 0.85 && currentCluster.size >= 2) {
                     val prev1 = currentCluster.last()
                     val prev2 = currentCluster[currentCluster.size - 2]
@@ -379,6 +387,11 @@ object PlateDetectionEngine {
             val debugMat = looseMat.clone()
             Imgproc.drawContours(debugMat, tempContours, -1, Scalar(150.0, 150.0, 150.0, 200.0), 1)
             
+            // 💡 시각화: 가장 밑바탕에 완전 탈락(파란색) 박스 렌더링
+            for (rect in totalRejectedRects) {
+                Imgproc.rectangle(debugMat, rect, Scalar(0.0, 0.0, 255.0, 255.0), 1)
+            }
+            
             for (charData in rejectedList) {
                 Imgproc.rectangle(debugMat, charData.rect, Scalar(80.0, 80.0, 80.0, 255.0), 1)
             }
@@ -392,6 +405,12 @@ object PlateDetectionEngine {
                         Imgproc.line(debugMat, validChars[i-1].center, validChars[i].center, Scalar(255.0, 0.0, 255.0, 255.0), 2)
                     }
                 }
+            }
+            
+            // 💡 시각화: 이미지 자체에 디버그 데이터 직접 텍스트 출력 (가장 위에 덮어쓰기)
+            for ((rect, text) in onScreenDebugTexts) {
+                // 노란색 글씨로 박스 상단에 출력 (R:255, G:255, B:0, A:255)
+                Imgproc.putText(debugMat, text, Point(rect.x.toDouble(), rect.y.toDouble() - 4), Imgproc.FONT_HERSHEY_SIMPLEX, 0.45, Scalar(255.0, 255.0, 0.0, 255.0), 1)
             }
             
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
