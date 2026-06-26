@@ -71,36 +71,38 @@ object PlateDetectionEngine {
             setShadowLayer(5f, 0f, 0f, Color.BLACK)
         }
 
-        val paddingX = 60f
-        val lineHeight = 45f // HUD 텍스트 라인 간격 축소 (정보량이 많으므로)
+        val paddingX = 40f
+        val lineHeight = 35f 
         val maxTextWidth = canvasWidth - (paddingX * 2)
-        var currentY = 70f 
+        var currentY = 60f 
         
         paint.color = Color.YELLOW
         paint.isFakeBoldText = true
-        paint.textSize = 40f
+        paint.textSize = 38f
         currentY = drawTextWithWrap(canvas, title, paddingX, currentY, paint, maxTextWidth, lineHeight)
 
-        currentY += 15f 
+        currentY += 10f 
 
         paint.color = Color.WHITE
         paint.isFakeBoldText = false
-        paint.textSize = 30f // 로그 텍스트 크기 소폭 축소
+        paint.textSize = 26f 
         for (log in logs) {
             if (log.startsWith("->") || log.startsWith("[경고]")) {
-                paint.color = Color.parseColor("#FF5555")
+                paint.color = Color.parseColor("#FF8888") 
             } else if (log.startsWith("[진단")) {
                 paint.color = Color.parseColor("#55FF55")
-            } else if (log.startsWith("[정보]")) {
-                paint.color = Color.parseColor("#55FFFF") // 통계 정보용 색상 (Cyan)
+            } else if (log.startsWith("[정보]") || log.startsWith("[기준]")) {
+                paint.color = Color.parseColor("#55FFFF") 
+            } else if (log.contains("FAIL") || log.contains("삭제")) {
+                paint.color = Color.parseColor("#FF5555") 
             } else {
                 paint.color = Color.WHITE
             }
             currentY = drawTextWithWrap(canvas, log, paddingX, currentY, paint, maxTextWidth, lineHeight)
         }
 
-        val textBottom = currentY + 20f 
-        val margin = 30f
+        val textBottom = currentY + 15f 
+        val margin = 20f
         
         val maxImgWidth = canvasWidth - (margin * 2)
         val maxImgHeight = canvasHeight - textBottom - margin 
@@ -141,20 +143,6 @@ object PlateDetectionEngine {
         val screenRatio = fullMat.rows().toFloat() / fullMat.cols().toFloat()
         val cx = touchX.toDouble(); val cy = touchY.toDouble()
 
-        debugListener?.let {
-            val debugMat = fullMat.clone()
-            Imgproc.circle(debugMat, Point(cx, cy), 20, Scalar(255.0, 0.0, 0.0, 255.0), -1)
-            Imgproc.circle(debugMat, Point(cx, cy), 25, Scalar(255.0, 255.0, 255.0, 255.0), 4)
-            val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
-            Utils.matToBitmap(debugMat, debugBmp)
-            val hudBmp = addDebugHUD(debugBmp, "Step 1: User Touch Point", listOf(
-                "Action: 터치 좌표 수신 완료",
-                "Touch Point X: ${cx.toInt()} px, Y: ${cy.toInt()} px"
-            ), screenRatio)
-            it.pauseAndShowStep("1단계: 터치 좌표 매핑", hudBmp)
-            debugMat.release(); debugBmp.recycle()
-        }
-
         val roiWidth = (fullMat.cols() * 0.22).toInt() 
         val roiHeight = (roiWidth / 2.0).toInt()       
 
@@ -169,24 +157,11 @@ object PlateDetectionEngine {
         fullMat.submat(looseRect).copyTo(looseMat)
         fullGray.submat(looseRect).copyTo(looseGray)
 
-        debugListener?.let {
-            val debugMat = fullMat.clone()
-            Imgproc.rectangle(debugMat, looseRect, Scalar(0.0, 255.0, 0.0, 255.0), 8)
-            val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
-            Utils.matToBitmap(debugMat, debugBmp)
-            val hudBmp = addDebugHUD(debugBmp, "Step 2: Downsized ROI", listOf(
-                "Rect Bounds: [L:$looseLeft, T:$looseTop, R:$looseRight, B:$looseBottom]"
-            ), screenRatio)
-            it.pauseAndShowStep("2단계: 컴팩트 탐색 구역 설정", hudBmp)
-            debugMat.release(); debugBmp.recycle()
-        }
-
         val thresh = Mat()
         Imgproc.medianBlur(looseGray, looseGray, 3)
         Imgproc.GaussianBlur(looseGray, thresh, Size(5.0, 5.0), 0.0)
         Imgproc.adaptiveThreshold(thresh, thresh, 255.0, Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, Imgproc.THRESH_BINARY_INV, 31, 7.0)
 
-        // CLOSE -> OPEN 모폴로지 순서 정상화
         val tempClose = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
         val tempOpen = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
@@ -196,22 +171,22 @@ object PlateDetectionEngine {
         val tempHierarchy = Mat()
         Imgproc.findContours(thresh, tempContours, tempHierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
-        // 💡 디버그용 확장 데이터 클래스
         class CharData(val center: Point, val width: Double, val height: Double, val rect: Rect, var rejectReason: String = "")
         val charList = mutableListOf<CharData>()
         val rejectedList = mutableListOf<CharData>() 
-        val totalRejectedRects = mutableListOf<CharData>() // Rect 대신 CharData로 변경하여 탈락 사유 저장
-        val onScreenDebugTexts = mutableListOf<Pair<Rect, String>>()
-
-        val step3_5_logs = mutableListOf<String>()
+        val totalRejectedRects = mutableListOf<CharData>() 
+        
         var failReason = ""
 
-        step3_5_logs.add("[진단 1] 모폴로지 및 비율 검증")
-        step3_5_logs.add(" -> 발견된 덩어리(Contours): ${tempContours.size}개")
-
-        android.util.Log.d("JISEKA_DEBUG", "========== [1차 검증 시작] ==========")
+        // ==========================================================
+        // [디버그 화면 1] 1차 검증 및 이진화 뷰
+        // ==========================================================
+        val step1Logs = mutableListOf<String>()
+        step1Logs.add("[진단 1] 1차 통과 분석 (${tempContours.size}개 발견)")
 
         val maxAreaBound = looseRect.area() * 0.08
+        val onScreenTextsStep1 = mutableListOf<Pair<Rect, List<String>>>()
+
         for (contour in tempContours) {
             val rect = Imgproc.boundingRect(contour)
             val area = rect.area()
@@ -219,15 +194,13 @@ object PlateDetectionEngine {
             val center = Point(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
             
             var rReason = ""
-
-            // 탈락 사유 세분화 (A: Area, R: Ratio, H: Height)
             if (area <= 100) rReason = "A(Min)"
             else if (area >= maxAreaBound) rReason = "A(Max)"
             else {
                 if (ratio in 0.9..5.5 && rect.height >= 20) {
                     // Pass
                 } else if (ratio in 0.25..1.5 && rect.height >= 15) {
-                    // Rescue Pass
+                    // Rescue
                 } else {
                     if (ratio !in 0.25..5.5) rReason = "R(${String.format("%.1f", ratio)})"
                     else rReason = "H(${rect.height})"
@@ -237,247 +210,259 @@ object PlateDetectionEngine {
             if (rReason.isEmpty()) {
                 if (ratio in 0.9..5.5 && rect.height >= 20) {
                     charList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect)) 
-                    android.util.Log.d("JISEKA_DEBUG", "[PASS] X:${rect.x} W:${rect.width} H:${rect.height}")
+                    onScreenTextsStep1.add(Pair(rect, listOf("C(${center.x.toInt()},${center.y.toInt()})", "W:${rect.width} H:${rect.height}")))
                 } else {
                     rejectedList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect, "Rescue")) 
                 }
             } else {
                 totalRejectedRects.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect, rReason))
             }
+        }
+        
+        step1Logs.add(" -> 1차 생존: ${charList.size}개 / 완전 탈락: ${totalRejectedRects.size}개")
+        if (charList.isEmpty()) failReason = "원인 1: 1차 검증 글자 전멸"
 
-            // 큰 노이즈 위주로 텍스트 출력 제한 완화
-            if (area > 80) {
-                onScreenDebugTexts.add(Pair(rect, "W:${rect.width} H:${rect.height}"))
+        debugListener?.let {
+            val debugMat1 = Mat()
+            Imgproc.cvtColor(thresh, debugMat1, Imgproc.COLOR_GRAY2RGBA)
+            
+            for (charData in totalRejectedRects) {
+                Imgproc.rectangle(debugMat1, charData.rect, Scalar(0.0, 0.0, 255.0, 255.0), 1)
+                val bgRect = Rect(charData.rect.x, charData.rect.y + 2, 45, 12)
+                val roi = debugMat1.submat(bgRect)
+                val colorMat = Mat(roi.size(), roi.type(), Scalar(0.0, 0.0, 0.0, 150.0))
+                Core.addWeighted(roi, 0.4, colorMat, 0.6, 0.0, roi)
+                roi.release(); colorMat.release()
+                Imgproc.putText(debugMat1, charData.rejectReason, Point(charData.rect.x.toDouble() + 2, charData.rect.y.toDouble() + 11), Imgproc.FONT_HERSHEY_SIMPLEX, 0.35, Scalar(0.0, 255.0, 255.0, 255.0), 1)
+            }
+            
+            for (charData in rejectedList) {
+                Imgproc.rectangle(debugMat1, charData.rect, Scalar(80.0, 80.0, 80.0, 255.0), 1)
+            }
+            for (charData in charList) {
+                Imgproc.rectangle(debugMat1, charData.rect, Scalar(255.0, 0.0, 0.0, 255.0), 2)
+            }
+            
+            for ((rect, lines) in onScreenTextsStep1) {
+                for (idx in lines.indices) {
+                    val textY = rect.y.toDouble() - 4 - (12 * (lines.size - 1 - idx))
+                    val bgRect = Rect(rect.x, textY.toInt() - 9, 85, 11)
+                    val roi = debugMat1.submat(bgRect)
+                    val colorMat = Mat(roi.size(), roi.type(), Scalar(0.0, 0.0, 0.0, 150.0))
+                    Core.addWeighted(roi, 0.4, colorMat, 0.6, 0.0, roi)
+                    roi.release(); colorMat.release()
+                    Imgproc.putText(debugMat1, lines[idx], Point(rect.x.toDouble() + 2, textY), Imgproc.FONT_HERSHEY_SIMPLEX, 0.35, Scalar(255.0, 255.0, 0.0, 255.0), 1)
+                }
+            }
+            
+            val debugBmp1 = Bitmap.createBitmap(debugMat1.cols(), debugMat1.rows(), Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(debugMat1, debugBmp1)
+            val title = if (failReason.isNotEmpty()) "디버그 1/3 중단 ($failReason)" else "디버그 1/3: 1차 검증 (이진화 뷰)"
+            val hudBmp1 = addDebugHUD(debugBmp1, title, step1Logs, screenRatio)
+            it.pauseAndShowStep("디버그 1/3: 이진화 뷰", hudBmp1)
+            debugMat1.release(); debugBmp1.recycle()
+        }
+
+        if (failReason.isNotEmpty()) {
+            thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
+            tempOpen.release(); tempClose.release(); tempContours.forEach { it.release() }; tempHierarchy.release()
+            return null
+        }
+
+        // ==========================================================
+        // [디버그 화면 2] 군집화 의사결정 추적
+        // ==========================================================
+        var sortedChars = charList.sortedBy { it.center.x }.toMutableList()
+        val rescueCandidates = mutableListOf<CharData>()
+
+        for (i in 0 until sortedChars.size - 1) {
+            val leftChar = sortedChars[i]
+            val rightChar = sortedChars[i + 1]
+            val gapX = rightChar.center.x - leftChar.center.x
+            val avgW = (leftChar.width + rightChar.width) / 2.0
+
+            if (gapX > avgW * 1.2) { 
+                val avgH = (leftChar.height + rightChar.height) / 2.0
+                val avgY = (leftChar.center.y + rightChar.center.y) / 2.0
+                val rescuers = rejectedList.filter { r ->
+                    r.center.x > leftChar.center.x + leftChar.width * 0.4 && 
+                    r.center.x < rightChar.center.x - rightChar.width * 0.4 && 
+                    abs(r.center.y - avgY) < avgH * 0.5 
+                }
+                rescueCandidates.addAll(rescuers) 
             }
         }
         
-        step3_5_logs.add(" -> 1차 통과 후보: ${charList.size}개")
-        step3_5_logs.add(" -> 디버그: 파란 박스(탈락) ${totalRejectedRects.size}개")
+        sortedChars.addAll(rescueCandidates)
+        sortedChars = sortedChars.sortedBy { it.center.x }.toMutableList()
 
-        var sortedChars = mutableListOf<CharData>()
-        var validChars = mutableListOf<CharData>()
+        val gaps = (1 until sortedChars.size).map { sortedChars[it].center.x - sortedChars[it - 1].center.x }
+        val medianGap = if (gaps.isNotEmpty()) gaps.sorted()[gaps.size / 2] else 0.0
+        val avgWidth = sortedChars.map { it.width }.average()
+        val maxGap = max(medianGap * 1.7, avgWidth * 1.8) 
+        
+        val step2Logs = mutableListOf<String>()
+        step2Logs.add("[기준] AvgW:${String.format("%.1f", avgWidth)} / MedGap:${String.format("%.1f", medianGap)} / BaseMaxGap:${String.format("%.1f", maxGap)}")
+        
         var clusters = mutableListOf<MutableList<CharData>>()
-        // 💡 군집 기록용 (디버그 시각화 목적)
         val allClustersForDebug = mutableListOf<List<CharData>>()
+        var currentCluster = mutableListOf(sortedChars.first())
+        
+        for (i in 1 until sortedChars.size) {
+            val curr = sortedChars[i]
+            val prev = sortedChars[i - 1]
+            val gap = curr.center.x - prev.center.x
+            val yDiff = abs(curr.center.y - prev.center.y)
+            val avgH = (prev.height + curr.height) / 2.0
 
-        if (charList.isEmpty()) {
-            failReason = "원인 1: 1차 비율 검증에서 글자 전멸 (떡짐/지워짐)"
-        } else {
-            sortedChars = charList.sortedBy { it.center.x }.toMutableList()
-            val rescueCandidates = mutableListOf<CharData>()
+            val localMaxGap = if (gap > maxGap && gap < avgWidth * 3.5 && yDiff < avgH * 0.45) avgWidth * 3.5 else maxGap
+            val yLimit = avgH * 0.45
+            
+            val gapFail = gap > localMaxGap
+            val yFail = yDiff > yLimit
+            var isSplit = gapFail || yFail
+            var splitReason = if (gapFail && yFail) "Gap+Y" else if (gapFail) "Gap" else "Y축"
 
-            for (i in 0 until sortedChars.size - 1) {
-                val leftChar = sortedChars[i]
-                val rightChar = sortedChars[i + 1]
-                val gapX = rightChar.center.x - leftChar.center.x
-                val avgW = (leftChar.width + rightChar.width) / 2.0
-
-                if (gapX > avgW * 1.2) { 
-                    val avgH = (leftChar.height + rightChar.height) / 2.0
-                    val avgY = (leftChar.center.y + rightChar.center.y) / 2.0
-                    
-                    val rescuers = rejectedList.filter { r ->
-                        r.center.x > leftChar.center.x + leftChar.width * 0.4 && 
-                        r.center.x < rightChar.center.x - rightChar.width * 0.4 && 
-                        abs(r.center.y - avgY) < avgH * 0.5 
-                    }
-                    rescueCandidates.addAll(rescuers) 
+            if (isSplit && gap < avgWidth * 1.3 && yDiff <= avgH * 0.85 && currentCluster.size >= 2) {
+                val prev1 = currentCluster.last()
+                val prev2 = currentCluster[currentCluster.size - 2]
+                val slope1 = (prev1.center.y - prev2.center.y) / max(prev1.center.x - prev2.center.x, 1.0)
+                val slope2 = (curr.center.y - prev1.center.y) / max(curr.center.x - prev1.center.x, 1.0)
+                
+                if (abs(slope1 - slope2) < 0.2) {
+                    isSplit = false 
+                    splitReason = "예외(사선)"
                 }
             }
-            
-            sortedChars.addAll(rescueCandidates)
-            sortedChars = sortedChars.sortedBy { it.center.x }.toMutableList()
 
-            val gaps = (1 until sortedChars.size).map { sortedChars[it].center.x - sortedChars[it - 1].center.x }
-            val medianGap = if (gaps.isNotEmpty()) gaps.sorted()[gaps.size / 2] else 0.0
-            val avgWidth = sortedChars.map { it.width }.average()
-            val maxGap = max(medianGap * 1.7, avgWidth * 1.8) 
-            val totalAvgHeight = sortedChars.map { it.height }.average()
+            val statusMsg = if (isSplit) "FAIL($splitReason)" else "PASS"
+            step2Logs.add(" -> [${i-1}→$i] G:${String.format("%.1f", gap)}(${String.format("%.1f", localMaxGap)}) Y:${String.format("%.1f", yDiff)}(${String.format("%.1f", yLimit)}) => $statusMsg")
 
-            step3_5_logs.add("[정보] AvgW:${String.format("%.1f", avgWidth)} / AvgH:${String.format("%.1f", totalAvgHeight)} / MedGap:${String.format("%.1f", medianGap)}")
-
-            android.util.Log.d("JISEKA_DEBUG", "========== [사선 흐름 및 군집화] ==========")
-            android.util.Log.d("JISEKA_DEBUG", "Base MaxGap:${String.format("%.1f", maxGap)}")
-
-            var currentCluster = mutableListOf(sortedChars.first())
-            
-            for (i in 1 until sortedChars.size) {
-                val curr = sortedChars[i]
-                val prev = sortedChars[i - 1]
-                val gap = curr.center.x - prev.center.x
-                val yDiff = abs(curr.center.y - prev.center.y)
-                val avgH = (prev.height + curr.height) / 2.0
-
-                val localMaxGap = if (gap > maxGap && gap < avgWidth * 3.5 && yDiff < avgH * 0.45) {
-                    avgWidth * 3.5 
-                } else {
-                    maxGap
-                }
-
-                var isSplit = gap > localMaxGap || yDiff > avgH * 0.45
-                var splitReason = if(gap > localMaxGap) "Gap초과(Limit:${String.format("%.1f", localMaxGap)})" else "yDiff초과(Limit:${String.format("%.1f", avgH * 0.45)})"
-
-                if (isSplit && gap < avgWidth * 1.3 && yDiff <= avgH * 0.85 && currentCluster.size >= 2) {
-                    val prev1 = currentCluster.last()
-                    val prev2 = currentCluster[currentCluster.size - 2]
-                    
-                    val slope1 = (prev1.center.y - prev2.center.y) / max(prev1.center.x - prev2.center.x, 1.0)
-                    val slope2 = (curr.center.y - prev1.center.y) / max(curr.center.x - prev1.center.x, 1.0)
-                    
-                    if (abs(slope1 - slope2) < 0.2) {
-                        isSplit = false 
-                        splitReason = "사선 예외 통과"
-                    }
-                }
-
-                android.util.Log.d("JISEKA_DEBUG", "[Char ${i-1} -> Char $i] Gap:${String.format("%.1f", gap)} / yDiff:${String.format("%.1f", yDiff)} => ${if(isSplit) "SPLIT ($splitReason)" else "KEEP"}")
-
-                if (isSplit) {
-                    clusters.add(currentCluster) 
-                    allClustersForDebug.add(currentCluster.toList())
-                    currentCluster = mutableListOf(curr) 
-                } else {
-                    currentCluster.add(curr)
-                }
-            }
-            clusters.add(currentCluster)
-            allClustersForDebug.add(currentCluster.toList())
-
-            validChars = (clusters.maxByOrNull { it.size } ?: sortedChars).toMutableList()
-            step3_5_logs.add("[진단 2] 사선 흐름(Slope) 동적 군집화")
-            step3_5_logs.add(" -> 총 생성된 군집 수: ${clusters.size}개")
-            step3_5_logs.add(" -> 군집화 후 최대 그룹 사이즈: ${validChars.size}개")
-
-            if (validChars.size < 2) {
-                failReason = "원인 2: Y축 앵글 왜곡 또는 거리가 너무 멀어 뼈대 토막남"
+            if (isSplit) {
+                clusters.add(currentCluster) 
+                allClustersForDebug.add(currentCluster.toList())
+                currentCluster = mutableListOf(curr) 
             } else {
-                android.util.Log.d("JISEKA_DEBUG", "========== [fitLine 검증] ==========")
-                val pointsMatTemp = MatOfPoint2f(*validChars.map { it.center }.toTypedArray())
-                val lineTemp = Mat()
-                Imgproc.fitLine(pointsMatTemp, lineTemp, Imgproc.DIST_L2, 0.0, 0.01, 0.01)
+                currentCluster.add(curr)
+            }
+        }
+        clusters.add(currentCluster)
+        allClustersForDebug.add(currentCluster.toList())
+
+        var validChars = (clusters.maxByOrNull { it.size } ?: sortedChars).toMutableList()
+        if (validChars.size < 2) failReason = "원인 2: 군집 토막남 (최대 1개)"
+
+        debugListener?.let {
+            val debugMat2 = looseMat.clone()
+            
+            for (i in 0 until sortedChars.size) {
+                val charData = sortedChars[i]
+                Imgproc.rectangle(debugMat2, charData.rect, Scalar(255.0, 255.0, 255.0, 255.0), 2)
                 
-                val vxTemp = lineTemp.get(0, 0)[0]; val vyTemp = lineTemp.get(1, 0)[0]
-                val x0Temp = lineTemp.get(2, 0)[0]; val y0Temp = lineTemp.get(3, 0)[0]
-                pointsMatTemp.release(); lineTemp.release()
-
-                val A = vyTemp; val B = -vxTemp; val C = vxTemp * y0Temp - vyTemp * x0Temp
-                val denominator = hypot(A, B)
-                val localAvgHeight = validChars.map { it.height }.average()
-                val fitLineLimit = localAvgHeight * 0.20
-
-                val iterator = validChars.iterator()
-                while (iterator.hasNext()) {
-                    val charData = iterator.next()
-                    val dist = abs(A * charData.center.x + B * charData.center.y + C) / denominator
-                    
-                    if (dist > fitLineLimit) {
-                        android.util.Log.d("JISEKA_DEBUG", "[fitLine 삭제] X:${charData.rect.x} / Dist:${String.format("%.1f", dist)} / 허용:${String.format("%.1f", fitLineLimit)}")
-                        iterator.remove()
-                    } else {
-                        android.util.Log.d("JISEKA_DEBUG", "[fitLine 통과] X:${charData.rect.x} / Dist:${String.format("%.1f", dist)}")
-                    }
-                }
+                val bgRect = Rect(charData.rect.x, charData.rect.y - 20, 25, 20)
+                val roi = debugMat2.submat(bgRect)
+                val colorMat = Mat(roi.size(), roi.type(), Scalar(0.0, 0.0, 0.0, 180.0))
+                Core.addWeighted(roi, 0.4, colorMat, 0.6, 0.0, roi)
+                roi.release(); colorMat.release()
                 
-                step3_5_logs.add(" -> 직선(fitLine) 검증 후: ${validChars.size}개 생존")
+                Imgproc.putText(debugMat2, "$i", Point(charData.rect.x.toDouble() + 4, charData.rect.y.toDouble() - 4), Imgproc.FONT_HERSHEY_SIMPLEX, 0.6, Scalar(255.0, 255.0, 0.0, 255.0), 2)
+            }
+            
+            val debugBmp2 = Bitmap.createBitmap(debugMat2.cols(), debugMat2.rows(), Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(debugMat2, debugBmp2)
+            val title = if (failReason.isNotEmpty()) "디버그 2/3 중단 ($failReason)" else "디버그 2/3: 군집화 의사결정 추적"
+            val hudBmp2 = addDebugHUD(debugBmp2, title, step2Logs, screenRatio)
+            it.pauseAndShowStep("디버그 2/3: 군집화 판별", hudBmp2)
+            debugMat2.release(); debugBmp2.recycle()
+        }
 
-                if (validChars.size < 2) {
-                    failReason = "직선 배열 검증 과정에서 글자 삭제됨"
-                } else {
-                    step3_5_logs.add("[진단 3] 2-Track KOR 마크 검출")
-                    
-                    val firstChar = validChars.first() 
-                    val roi = looseMat.submat(firstChar.rect)
-                    val meanColor = Core.mean(roi)
-                    roi.release() 
-                    
-                    val r = meanColor.`val`[0].toInt()
-                    val g = meanColor.`val`[1].toInt()
-                    val b = meanColor.`val`[2].toInt()
-                    step3_5_logs.add(" -> 첫 글자 RGB 스캔: R:$r, G:$g, B:$b")
-                    
-                    if (b > r + 25 && b > g + 15) {
-                        validChars.removeAt(0) 
-                        step3_5_logs.add(" -> [완벽 차단] 찐파랑 확인, KOR 마크로 정상 처리됨")
-                    } else {
-                        val checkW = firstChar.rect.width.toInt() * 2
-                        val leftX = max(0, firstChar.rect.x - checkW)
-                        val scanW = firstChar.rect.x - leftX
-                        if (scanW > 10) {
-                            val leftRoi = looseMat.submat(Rect(leftX, firstChar.rect.y, scanW, firstChar.rect.height))
-                            val leftMean = Core.mean(leftRoi)
-                            leftRoi.release()
-                            if (leftMean.`val`[2] > leftMean.`val`[0] + 10 && leftMean.`val`[2] > leftMean.`val`[1] + 5) {
-                                step3_5_logs.add(" -> [완벽 차단] 첫 글자는 보호, 사각지대에서 KOR 흔적 발견")
-                            }
-                        }
-                    }
+        if (failReason.isNotEmpty()) {
+            thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
+            tempOpen.release(); tempClose.release(); tempContours.forEach { it.release() }; tempHierarchy.release()
+            return null
+        }
 
-                    if (validChars.size < 2) {
-                        failReason = "원인 3: KOR 처리 과정 오류"
-                    } else {
-                        step3_5_logs.add(" -> 뼈대 유지 성공 (최종 ${validChars.size}개)")
-                    }
-                }
+        // ==========================================================
+        // [디버그 화면 3] 최종 군집 및 fitLine 검증
+        // ==========================================================
+        val step3Logs = mutableListOf<String>()
+        var clusterSummary = "[정보] 군집 결과: "
+        for (idx in 0 until allClustersForDebug.size) clusterSummary += "G$idx(${allClustersForDebug[idx].size}개) "
+        step3Logs.add(clusterSummary)
+
+        val pointsMatTemp = MatOfPoint2f(*validChars.map { it.center }.toTypedArray())
+        val lineTemp = Mat()
+        Imgproc.fitLine(pointsMatTemp, lineTemp, Imgproc.DIST_L2, 0.0, 0.01, 0.01)
+        
+        val vxTemp = lineTemp.get(0, 0)[0]; val vyTemp = lineTemp.get(1, 0)[0]
+        val x0Temp = lineTemp.get(2, 0)[0]; val y0Temp = lineTemp.get(3, 0)[0]
+        pointsMatTemp.release(); lineTemp.release()
+
+        val A = vyTemp; val B = -vxTemp; val C = vxTemp * y0Temp - vyTemp * x0Temp
+        val denominator = hypot(A, B)
+        val localAvgHeight = validChars.map { it.height }.average()
+        val fitLineLimit = localAvgHeight * 0.20
+
+        val iterator = validChars.iterator()
+        val fitLineRemovedChars = mutableListOf<CharData>()
+        while (iterator.hasNext()) {
+            val charData = iterator.next()
+            val dist = abs(A * charData.center.x + B * charData.center.y + C) / denominator
+            
+            if (dist > fitLineLimit) {
+                step3Logs.add(" -> [삭제] X:${charData.center.x.toInt()} (Dist:${String.format("%.1f", dist)} > Lim:${String.format("%.1f", fitLineLimit)})")
+                fitLineRemovedChars.add(charData)
+                iterator.remove()
+            }
+        }
+        
+        step3Logs.add("[진단 3] fitLine ${fitLineRemovedChars.size}개 삭제, 최종 ${validChars.size}개 생존")
+
+        if (validChars.size < 2) {
+            failReason = "직선 검증 중 삭제되어 2개 미만 됨"
+        } else {
+            val firstChar = validChars.first() 
+            val roi = looseMat.submat(firstChar.rect)
+            val meanColor = Core.mean(roi)
+            roi.release() 
+            
+            val r = meanColor.`val`[0].toInt(); val g = meanColor.`val`[1].toInt(); val b = meanColor.`val`[2].toInt()
+            if (b > r + 25 && b > g + 15) {
+                validChars.removeAt(0) 
+                step3Logs.add(" -> [정보] KOR 파랑 인식 삭제 완료")
             }
         }
 
         debugListener?.let {
-            val debugMat = looseMat.clone()
-            Imgproc.drawContours(debugMat, tempContours, -1, Scalar(150.0, 150.0, 150.0, 200.0), 1)
+            val debugMat3 = looseMat.clone()
             
-            // 💡 1. 가장 밑바탕: 완전 탈락(파란색) 박스 및 탈락 사유(알파벳) 렌더링
-            for (charData in totalRejectedRects) {
-                Imgproc.rectangle(debugMat, charData.rect, Scalar(0.0, 0.0, 255.0, 255.0), 1)
-                // 탈락 사유를 파란 박스 모서리에 작게 출력
-                Imgproc.putText(debugMat, charData.rejectReason, Point(charData.rect.x.toDouble(), charData.rect.y.toDouble() + 10), Imgproc.FONT_HERSHEY_SIMPLEX, 0.35, Scalar(0.0, 255.0, 255.0, 255.0), 1)
-            }
-            
-            for (charData in rejectedList) {
-                Imgproc.rectangle(debugMat, charData.rect, Scalar(80.0, 80.0, 80.0, 255.0), 1)
-            }
-            
-            // 💡 2. 군집별 색상 분리 (1차 통과군)
-            val clusterColors = arrayOf(
-                Scalar(255.0, 255.0, 0.0, 255.0), // 노랑
-                Scalar(255.0, 0.0, 255.0, 255.0), // 보라
-                Scalar(0.0, 255.0, 255.0, 255.0), // 시안
-                Scalar(255.0, 150.0, 0.0, 255.0)  // 주황
-            )
-            
+            val clusterColors = arrayOf(Scalar(255.0, 255.0, 0.0, 255.0), Scalar(255.0, 0.0, 255.0, 255.0), Scalar(0.0, 255.0, 255.0, 255.0), Scalar(255.0, 150.0, 0.0, 255.0))
             for (clusterIndex in 0 until allClustersForDebug.size) {
                 val cluster = allClustersForDebug[clusterIndex]
                 val color = if (clusterIndex < clusterColors.size) clusterColors[clusterIndex] else Scalar(200.0, 200.0, 200.0, 255.0)
-                
                 for (charData in cluster) {
-                    Imgproc.rectangle(debugMat, charData.rect, color, 2)
-                    // 그룹 번호 표시 (ex: G0, G1)
-                    Imgproc.putText(debugMat, "G$clusterIndex", Point(charData.rect.x.toDouble(), (charData.rect.y + charData.rect.height).toDouble() - 5), Imgproc.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                    Imgproc.rectangle(debugMat3, charData.rect, color, 1)
                 }
             }
 
-            // 💡 3. 최종 생존군 (초록색 굵은 박스 및 연결선)
+            for (charData in fitLineRemovedChars) {
+                Imgproc.line(debugMat3, Point(charData.rect.x.toDouble(), charData.rect.y.toDouble()), Point((charData.rect.x + charData.rect.width).toDouble(), (charData.rect.y + charData.rect.height).toDouble()), Scalar(0.0, 0.0, 255.0, 255.0), 2)
+                Imgproc.line(debugMat3, Point((charData.rect.x + charData.rect.width).toDouble(), charData.rect.y.toDouble()), Point(charData.rect.x.toDouble(), (charData.rect.y + charData.rect.height).toDouble()), Scalar(0.0, 0.0, 255.0, 255.0), 2)
+            }
+
             if (validChars.isNotEmpty()) {
                 for (i in 0 until validChars.size) {
-                    Imgproc.rectangle(debugMat, validChars[i].rect, Scalar(0.0, 255.0, 0.0, 255.0), 3)
-                    if (i > 0) {
-                        Imgproc.line(debugMat, validChars[i-1].center, validChars[i].center, Scalar(0.0, 255.0, 0.0, 255.0), 2)
-                    }
+                    Imgproc.rectangle(debugMat3, validChars[i].rect, Scalar(0.0, 255.0, 0.0, 255.0), 3)
+                    if (i > 0) Imgproc.line(debugMat3, validChars[i-1].center, validChars[i].center, Scalar(0.0, 255.0, 0.0, 255.0), 2)
                 }
             }
             
-            // 💡 4. 크기 데이터 (Width, Height) 출력
-            for ((rect, text) in onScreenDebugTexts) {
-                Imgproc.putText(debugMat, text, Point(rect.x.toDouble(), rect.y.toDouble() - 4), Imgproc.FONT_HERSHEY_SIMPLEX, 0.40, Scalar(255.0, 255.0, 0.0, 255.0), 1)
-            }
-            
-            val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
-            Utils.matToBitmap(debugMat, debugBmp)
-            
-            val title = if (failReason.isNotEmpty()) "3~5단계: 분석 중단 ($failReason)" else "3~5단계: 정상 뼈대 구축"
-            val hudBmp = addDebugHUD(debugBmp, title, step3_5_logs, screenRatio)
-            
-            it.pauseAndShowStep("3~5단계: 디버그 분석", hudBmp)
-            debugMat.release(); debugBmp.recycle()
+            val debugBmp3 = Bitmap.createBitmap(debugMat3.cols(), debugMat3.rows(), Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(debugMat3, debugBmp3)
+            val title = if (failReason.isNotEmpty()) "디버그 3/3 중단 ($failReason)" else "디버그 3/3: 최종 뼈대 확정"
+            val hudBmp3 = addDebugHUD(debugBmp3, title, step3Logs, screenRatio)
+            it.pauseAndShowStep("디버그 3/3: 최종 뼈대", hudBmp3)
+            debugMat3.release(); debugBmp3.recycle()
         }
 
         tempContours.forEach { it.release() }; tempHierarchy.release(); tempOpen.release(); tempClose.release()
@@ -487,6 +472,9 @@ object PlateDetectionEngine {
             return null
         }
 
+        // ==========================================================
+        // [정상 루틴] 모서리선 생성 및 최종 스케일링
+        // ==========================================================
         val pointsMat = MatOfPoint2f(*validChars.map { it.center }.toTypedArray())
         val line = Mat()
         Imgproc.fitLine(pointsMat, line, Imgproc.DIST_L2, 0.0, 0.01, 0.01)
