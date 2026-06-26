@@ -72,33 +72,35 @@ object PlateDetectionEngine {
         }
 
         val paddingX = 60f
-        val lineHeight = 50f
+        val lineHeight = 45f // HUD 텍스트 라인 간격 축소 (정보량이 많으므로)
         val maxTextWidth = canvasWidth - (paddingX * 2)
-        var currentY = 80f 
+        var currentY = 70f 
         
         paint.color = Color.YELLOW
         paint.isFakeBoldText = true
-        paint.textSize = 42f
+        paint.textSize = 40f
         currentY = drawTextWithWrap(canvas, title, paddingX, currentY, paint, maxTextWidth, lineHeight)
 
-        currentY += 20f 
+        currentY += 15f 
 
         paint.color = Color.WHITE
         paint.isFakeBoldText = false
-        paint.textSize = 32f
+        paint.textSize = 30f // 로그 텍스트 크기 소폭 축소
         for (log in logs) {
             if (log.startsWith("->") || log.startsWith("[경고]")) {
                 paint.color = Color.parseColor("#FF5555")
             } else if (log.startsWith("[진단")) {
                 paint.color = Color.parseColor("#55FF55")
+            } else if (log.startsWith("[정보]")) {
+                paint.color = Color.parseColor("#55FFFF") // 통계 정보용 색상 (Cyan)
             } else {
                 paint.color = Color.WHITE
             }
             currentY = drawTextWithWrap(canvas, log, paddingX, currentY, paint, maxTextWidth, lineHeight)
         }
 
-        val textBottom = currentY + 30f 
-        val margin = 40f
+        val textBottom = currentY + 20f 
+        val margin = 30f
         
         val maxImgWidth = canvasWidth - (margin * 2)
         val maxImgHeight = canvasHeight - textBottom - margin 
@@ -184,12 +186,9 @@ object PlateDetectionEngine {
         Imgproc.GaussianBlur(looseGray, thresh, Size(5.0, 5.0), 0.0)
         Imgproc.adaptiveThreshold(thresh, thresh, 255.0, Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, Imgproc.THRESH_BINARY_INV, 31, 7.0)
 
-        // 💡 핵심 수정: 모폴로지 연산 순서 정상화 (CLOSE 선행 ➔ OPEN 후행)
-        // 1. 뚫린 구멍 메우고 파편화된 글자를 한 덩어리로 묶음
+        // CLOSE -> OPEN 모폴로지 순서 정상화
         val tempClose = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
-        
-        // 2. 외곽에 붙은 잔여 노이즈를 깎아내어 다듬음
         val tempOpen = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_OPEN, tempOpen)
         
@@ -197,10 +196,11 @@ object PlateDetectionEngine {
         val tempHierarchy = Mat()
         Imgproc.findContours(thresh, tempContours, tempHierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
-        class CharData(val center: Point, val width: Double, val height: Double, val rect: Rect)
+        // 💡 디버그용 확장 데이터 클래스
+        class CharData(val center: Point, val width: Double, val height: Double, val rect: Rect, var rejectReason: String = "")
         val charList = mutableListOf<CharData>()
         val rejectedList = mutableListOf<CharData>() 
-        val totalRejectedRects = mutableListOf<Rect>() 
+        val totalRejectedRects = mutableListOf<CharData>() // Rect 대신 CharData로 변경하여 탈락 사유 저장
         val onScreenDebugTexts = mutableListOf<Pair<Rect, String>>()
 
         val step3_5_logs = mutableListOf<String>()
@@ -209,28 +209,45 @@ object PlateDetectionEngine {
         step3_5_logs.add("[진단 1] 모폴로지 및 비율 검증")
         step3_5_logs.add(" -> 발견된 덩어리(Contours): ${tempContours.size}개")
 
+        android.util.Log.d("JISEKA_DEBUG", "========== [1차 검증 시작] ==========")
+
+        val maxAreaBound = looseRect.area() * 0.08
         for (contour in tempContours) {
             val rect = Imgproc.boundingRect(contour)
             val area = rect.area()
             val ratio = rect.height.toDouble() / max(rect.width.toDouble(), 1.0)
             val center = Point(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
             
-            val ratioStr = (ratio * 10.0).toInt() / 10.0
-            
-            if (area > 60) {
-                onScreenDebugTexts.add(Pair(rect, "W:${rect.width} H:${rect.height} A:${area.toInt()} R:$ratioStr"))
+            var rReason = ""
+
+            // 탈락 사유 세분화 (A: Area, R: Ratio, H: Height)
+            if (area <= 100) rReason = "A(Min)"
+            else if (area >= maxAreaBound) rReason = "A(Max)"
+            else {
+                if (ratio in 0.9..5.5 && rect.height >= 20) {
+                    // Pass
+                } else if (ratio in 0.25..1.5 && rect.height >= 15) {
+                    // Rescue Pass
+                } else {
+                    if (ratio !in 0.25..5.5) rReason = "R(${String.format("%.1f", ratio)})"
+                    else rReason = "H(${rect.height})"
+                }
             }
 
-            if (area > 100 && area < looseRect.area() * 0.08) {
+            if (rReason.isEmpty()) {
                 if (ratio in 0.9..5.5 && rect.height >= 20) {
                     charList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect)) 
-                } else if (ratio in 0.25..1.5 && rect.height >= 15) {
-                    rejectedList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect)) 
+                    android.util.Log.d("JISEKA_DEBUG", "[PASS] X:${rect.x} W:${rect.width} H:${rect.height}")
                 } else {
-                    totalRejectedRects.add(rect)
+                    rejectedList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect, "Rescue")) 
                 }
             } else {
-                totalRejectedRects.add(rect)
+                totalRejectedRects.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect, rReason))
+            }
+
+            // 큰 노이즈 위주로 텍스트 출력 제한 완화
+            if (area > 80) {
+                onScreenDebugTexts.add(Pair(rect, "W:${rect.width} H:${rect.height}"))
             }
         }
         
@@ -240,6 +257,8 @@ object PlateDetectionEngine {
         var sortedChars = mutableListOf<CharData>()
         var validChars = mutableListOf<CharData>()
         var clusters = mutableListOf<MutableList<CharData>>()
+        // 💡 군집 기록용 (디버그 시각화 목적)
+        val allClustersForDebug = mutableListOf<List<CharData>>()
 
         if (charList.isEmpty()) {
             failReason = "원인 1: 1차 비율 검증에서 글자 전멸 (떡짐/지워짐)"
@@ -273,6 +292,12 @@ object PlateDetectionEngine {
             val medianGap = if (gaps.isNotEmpty()) gaps.sorted()[gaps.size / 2] else 0.0
             val avgWidth = sortedChars.map { it.width }.average()
             val maxGap = max(medianGap * 1.7, avgWidth * 1.8) 
+            val totalAvgHeight = sortedChars.map { it.height }.average()
+
+            step3_5_logs.add("[정보] AvgW:${String.format("%.1f", avgWidth)} / AvgH:${String.format("%.1f", totalAvgHeight)} / MedGap:${String.format("%.1f", medianGap)}")
+
+            android.util.Log.d("JISEKA_DEBUG", "========== [사선 흐름 및 군집화] ==========")
+            android.util.Log.d("JISEKA_DEBUG", "Base MaxGap:${String.format("%.1f", maxGap)}")
 
             var currentCluster = mutableListOf(sortedChars.first())
             
@@ -290,6 +315,7 @@ object PlateDetectionEngine {
                 }
 
                 var isSplit = gap > localMaxGap || yDiff > avgH * 0.45
+                var splitReason = if(gap > localMaxGap) "Gap초과(Limit:${String.format("%.1f", localMaxGap)})" else "yDiff초과(Limit:${String.format("%.1f", avgH * 0.45)})"
 
                 if (isSplit && gap < avgWidth * 1.3 && yDiff <= avgH * 0.85 && currentCluster.size >= 2) {
                     val prev1 = currentCluster.last()
@@ -300,25 +326,32 @@ object PlateDetectionEngine {
                     
                     if (abs(slope1 - slope2) < 0.2) {
                         isSplit = false 
+                        splitReason = "사선 예외 통과"
                     }
                 }
 
+                android.util.Log.d("JISEKA_DEBUG", "[Char ${i-1} -> Char $i] Gap:${String.format("%.1f", gap)} / yDiff:${String.format("%.1f", yDiff)} => ${if(isSplit) "SPLIT ($splitReason)" else "KEEP"}")
+
                 if (isSplit) {
                     clusters.add(currentCluster) 
+                    allClustersForDebug.add(currentCluster.toList())
                     currentCluster = mutableListOf(curr) 
                 } else {
                     currentCluster.add(curr)
                 }
             }
             clusters.add(currentCluster)
+            allClustersForDebug.add(currentCluster.toList())
 
             validChars = (clusters.maxByOrNull { it.size } ?: sortedChars).toMutableList()
             step3_5_logs.add("[진단 2] 사선 흐름(Slope) 동적 군집화")
+            step3_5_logs.add(" -> 총 생성된 군집 수: ${clusters.size}개")
             step3_5_logs.add(" -> 군집화 후 최대 그룹 사이즈: ${validChars.size}개")
 
             if (validChars.size < 2) {
                 failReason = "원인 2: Y축 앵글 왜곡 또는 거리가 너무 멀어 뼈대 토막남"
             } else {
+                android.util.Log.d("JISEKA_DEBUG", "========== [fitLine 검증] ==========")
                 val pointsMatTemp = MatOfPoint2f(*validChars.map { it.center }.toTypedArray())
                 val lineTemp = Mat()
                 Imgproc.fitLine(pointsMatTemp, lineTemp, Imgproc.DIST_L2, 0.0, 0.01, 0.01)
@@ -330,13 +363,18 @@ object PlateDetectionEngine {
                 val A = vyTemp; val B = -vxTemp; val C = vxTemp * y0Temp - vyTemp * x0Temp
                 val denominator = hypot(A, B)
                 val localAvgHeight = validChars.map { it.height }.average()
+                val fitLineLimit = localAvgHeight * 0.20
 
                 val iterator = validChars.iterator()
                 while (iterator.hasNext()) {
                     val charData = iterator.next()
                     val dist = abs(A * charData.center.x + B * charData.center.y + C) / denominator
-                    if (dist > localAvgHeight * 0.20) {
+                    
+                    if (dist > fitLineLimit) {
+                        android.util.Log.d("JISEKA_DEBUG", "[fitLine 삭제] X:${charData.rect.x} / Dist:${String.format("%.1f", dist)} / 허용:${String.format("%.1f", fitLineLimit)}")
                         iterator.remove()
+                    } else {
+                        android.util.Log.d("JISEKA_DEBUG", "[fitLine 통과] X:${charData.rect.x} / Dist:${String.format("%.1f", dist)}")
                     }
                 }
                 
@@ -387,26 +425,49 @@ object PlateDetectionEngine {
             val debugMat = looseMat.clone()
             Imgproc.drawContours(debugMat, tempContours, -1, Scalar(150.0, 150.0, 150.0, 200.0), 1)
             
-            for (rect in totalRejectedRects) {
-                Imgproc.rectangle(debugMat, rect, Scalar(0.0, 0.0, 255.0, 255.0), 1)
+            // 💡 1. 가장 밑바탕: 완전 탈락(파란색) 박스 및 탈락 사유(알파벳) 렌더링
+            for (charData in totalRejectedRects) {
+                Imgproc.rectangle(debugMat, charData.rect, Scalar(0.0, 0.0, 255.0, 255.0), 1)
+                // 탈락 사유를 파란 박스 모서리에 작게 출력
+                Imgproc.putText(debugMat, charData.rejectReason, Point(charData.rect.x.toDouble(), charData.rect.y.toDouble() + 10), Imgproc.FONT_HERSHEY_SIMPLEX, 0.35, Scalar(0.0, 255.0, 255.0, 255.0), 1)
             }
+            
             for (charData in rejectedList) {
                 Imgproc.rectangle(debugMat, charData.rect, Scalar(80.0, 80.0, 80.0, 255.0), 1)
             }
-            for (charData in charList) {
-                Imgproc.rectangle(debugMat, charData.rect, Scalar(255.0, 0.0, 0.0, 255.0), 2)
+            
+            // 💡 2. 군집별 색상 분리 (1차 통과군)
+            val clusterColors = arrayOf(
+                Scalar(255.0, 255.0, 0.0, 255.0), // 노랑
+                Scalar(255.0, 0.0, 255.0, 255.0), // 보라
+                Scalar(0.0, 255.0, 255.0, 255.0), // 시안
+                Scalar(255.0, 150.0, 0.0, 255.0)  // 주황
+            )
+            
+            for (clusterIndex in 0 until allClustersForDebug.size) {
+                val cluster = allClustersForDebug[clusterIndex]
+                val color = if (clusterIndex < clusterColors.size) clusterColors[clusterIndex] else Scalar(200.0, 200.0, 200.0, 255.0)
+                
+                for (charData in cluster) {
+                    Imgproc.rectangle(debugMat, charData.rect, color, 2)
+                    // 그룹 번호 표시 (ex: G0, G1)
+                    Imgproc.putText(debugMat, "G$clusterIndex", Point(charData.rect.x.toDouble(), (charData.rect.y + charData.rect.height).toDouble() - 5), Imgproc.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                }
             }
+
+            // 💡 3. 최종 생존군 (초록색 굵은 박스 및 연결선)
             if (validChars.isNotEmpty()) {
                 for (i in 0 until validChars.size) {
                     Imgproc.rectangle(debugMat, validChars[i].rect, Scalar(0.0, 255.0, 0.0, 255.0), 3)
                     if (i > 0) {
-                        Imgproc.line(debugMat, validChars[i-1].center, validChars[i].center, Scalar(255.0, 0.0, 255.0, 255.0), 2)
+                        Imgproc.line(debugMat, validChars[i-1].center, validChars[i].center, Scalar(0.0, 255.0, 0.0, 255.0), 2)
                     }
                 }
             }
             
+            // 💡 4. 크기 데이터 (Width, Height) 출력
             for ((rect, text) in onScreenDebugTexts) {
-                Imgproc.putText(debugMat, text, Point(rect.x.toDouble(), rect.y.toDouble() - 4), Imgproc.FONT_HERSHEY_SIMPLEX, 0.45, Scalar(255.0, 255.0, 0.0, 255.0), 1)
+                Imgproc.putText(debugMat, text, Point(rect.x.toDouble(), rect.y.toDouble() - 4), Imgproc.FONT_HERSHEY_SIMPLEX, 0.40, Scalar(255.0, 255.0, 0.0, 255.0), 1)
             }
             
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
@@ -549,7 +610,6 @@ object PlateDetectionEngine {
             thresh.release()
             looseMat.release(); looseGray.release()
             fullMat.release(); fullGray.release()
-            tempOpen.release(); tempClose.release()
         }
 
         return resultPoints
