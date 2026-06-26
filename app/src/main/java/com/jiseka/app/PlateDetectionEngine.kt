@@ -204,16 +204,22 @@ object PlateDetectionEngine {
         step3_5_logs.add("[진단 1] 모폴로지 및 비율 검증")
         step3_5_logs.add(" -> 발견된 덩어리(Contours): ${tempContours.size}개")
 
+        // =====================================================================
+        // 💡 [핵심 수정] 동적 최소 크기 기준 설정 (그릴 등 노이즈 덩어리 원천 차단)
+        // =====================================================================
+        val minArea = max(150.0, looseRect.area() * 0.001)   // ROI 면적의 최소 0.1% 이상
+        val minHeight = max(20.0, looseRect.height * 0.08) // ROI 높이의 최소 8% 이상
+
         for (contour in tempContours) {
             val rect = Imgproc.boundingRect(contour)
             val area = rect.area()
             val ratio = rect.height.toDouble() / max(rect.width.toDouble(), 1.0)
             val center = Point(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
             
-            if (area > 100 && area < looseRect.area() * 0.08) {
-                if (ratio in 0.9..5.5 && rect.height >= 20) {
+            if (area > minArea && area < looseRect.area() * 0.08) {
+                if (ratio in 0.9..5.5 && rect.height >= minHeight) {
                     charList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect)) 
-                } else if (ratio in 0.25..1.5 && rect.height >= 15) {
+                } else if (ratio in 0.25..1.5 && rect.height >= minHeight * 0.75) {
                     rejectedList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect)) 
                 }
             }
@@ -260,9 +266,6 @@ object PlateDetectionEngine {
 
             var currentCluster = mutableListOf(sortedChars.first())
             
-            // =====================================================================
-            // 💡 [핵심 해결] 기울기 흐름 검증(Slope Consistency) 기반 동적 군집화 
-            // =====================================================================
             for (i in 1 until sortedChars.size) {
                 val curr = sortedChars[i]
                 val prev = sortedChars[i - 1]
@@ -280,7 +283,6 @@ object PlateDetectionEngine {
                 var isSplit = gap > localMaxGap || yDiff > avgH * 0.45
 
                 // 2. 동적 사선 예외 허용 (Slope Consistency)
-                // Y단차가 45%를 넘더라도, 가로 간격이 매우 가깝고 이전 기울기 흐름을 따른다면 예외적 통과 (단차 85%까지 허용)
                 if (isSplit && gap < avgWidth * 1.3 && yDiff <= avgH * 0.85 && currentCluster.size >= 2) {
                     val prev1 = currentCluster.last()
                     val prev2 = currentCluster[currentCluster.size - 2]
@@ -288,7 +290,6 @@ object PlateDetectionEngine {
                     val slope1 = (prev1.center.y - prev2.center.y) / max(prev1.center.x - prev2.center.x, 1.0)
                     val slope2 = (curr.center.y - prev1.center.y) / max(curr.center.x - prev1.center.x, 1.0)
                     
-                    // 기울기 차이가 0.2 이하(직선에 가까움)면 단절 취소!
                     if (abs(slope1 - slope2) < 0.2) {
                         isSplit = false 
                     }
@@ -410,9 +411,6 @@ object PlateDetectionEngine {
             return null
         }
 
-        // =====================================================================
-        // 모서리선 생성 및 최종 스케일링 (이후 정상 로직 동일)
-        // =====================================================================
         val pointsMat = MatOfPoint2f(*validChars.map { it.center }.toTypedArray())
         val line = Mat()
         Imgproc.fitLine(pointsMat, line, Imgproc.DIST_L2, 0.0, 0.01, 0.01)
@@ -477,9 +475,6 @@ object PlateDetectionEngine {
         topLineMat.release(); bottomLineMat.release()
         leftPts.release(); rightPts.release(); leftLine.release(); rightLine.release()
 
-        // =====================================================================
-        // 🚀 [Step 6] 중심점 대칭 스케일링
-        // =====================================================================
         var resultPoints: List<ImmutablePoint>? = null
 
         try {
