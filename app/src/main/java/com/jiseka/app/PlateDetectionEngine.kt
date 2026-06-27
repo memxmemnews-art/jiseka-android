@@ -228,11 +228,9 @@ object PlateDetectionEngine {
             
             for (charData in totalRejectedRects) {
                 Imgproc.rectangle(debugMat1, charData.rect, Scalar(0.0, 0.0, 255.0, 255.0), 1)
-                val bgRect = Rect(charData.rect.x, charData.rect.y + 2, 45, 12)
-                val roi = debugMat1.submat(bgRect)
-                val colorMat = Mat(roi.size(), roi.type(), Scalar(0.0, 0.0, 0.0, 150.0))
-                Core.addWeighted(roi, 0.4, colorMat, 0.6, 0.0, roi)
-                roi.release(); colorMat.release()
+                
+                // 💡 크래시 픽스: submat 대신 안전한 Imgproc.rectangle (두께 -1) 채우기 방식 사용
+                Imgproc.rectangle(debugMat1, Point(charData.rect.x.toDouble(), charData.rect.y.toDouble() + 2), Point(charData.rect.x.toDouble() + 45, charData.rect.y.toDouble() + 14), Scalar(0.0, 0.0, 0.0, 255.0), -1)
                 Imgproc.putText(debugMat1, charData.rejectReason, Point(charData.rect.x.toDouble() + 2, charData.rect.y.toDouble() + 11), Imgproc.FONT_HERSHEY_SIMPLEX, 0.35, Scalar(0.0, 255.0, 255.0, 255.0), 1)
             }
             
@@ -246,11 +244,9 @@ object PlateDetectionEngine {
             for ((rect, lines) in onScreenTextsStep1) {
                 for (idx in lines.indices) {
                     val textY = rect.y.toDouble() - 4 - (12 * (lines.size - 1 - idx))
-                    val bgRect = Rect(rect.x, textY.toInt() - 9, 85, 11)
-                    val roi = debugMat1.submat(bgRect)
-                    val colorMat = Mat(roi.size(), roi.type(), Scalar(0.0, 0.0, 0.0, 150.0))
-                    Core.addWeighted(roi, 0.4, colorMat, 0.6, 0.0, roi)
-                    roi.release(); colorMat.release()
+                    
+                    // 💡 크래시 픽스: submat 교체
+                    Imgproc.rectangle(debugMat1, Point(rect.x.toDouble(), textY - 9), Point(rect.x.toDouble() + 85, textY + 2), Scalar(0.0, 0.0, 0.0, 255.0), -1)
                     Imgproc.putText(debugMat1, lines[idx], Point(rect.x.toDouble() + 2, textY), Imgproc.FONT_HERSHEY_SIMPLEX, 0.35, Scalar(255.0, 255.0, 0.0, 255.0), 1)
                 }
             }
@@ -359,12 +355,8 @@ object PlateDetectionEngine {
                 val charData = sortedChars[i]
                 Imgproc.rectangle(debugMat2, charData.rect, Scalar(255.0, 255.0, 255.0, 255.0), 2)
                 
-                val bgRect = Rect(charData.rect.x, charData.rect.y - 20, 25, 20)
-                val roi = debugMat2.submat(bgRect)
-                val colorMat = Mat(roi.size(), roi.type(), Scalar(0.0, 0.0, 0.0, 180.0))
-                Core.addWeighted(roi, 0.4, colorMat, 0.6, 0.0, roi)
-                roi.release(); colorMat.release()
-                
+                // 💡 크래시 픽스: submat 교체
+                Imgproc.rectangle(debugMat2, Point(charData.rect.x.toDouble(), charData.rect.y.toDouble() - 20), Point(charData.rect.x.toDouble() + 25, charData.rect.y.toDouble()), Scalar(0.0, 0.0, 0.0, 255.0), -1)
                 Imgproc.putText(debugMat2, "$i", Point(charData.rect.x.toDouble() + 4, charData.rect.y.toDouble() - 4), Imgproc.FONT_HERSHEY_SIMPLEX, 0.6, Scalar(255.0, 255.0, 0.0, 255.0), 2)
             }
             
