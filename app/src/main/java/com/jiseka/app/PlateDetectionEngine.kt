@@ -93,8 +93,10 @@ object PlateDetectionEngine {
                 paint.color = Color.parseColor("#55FF55")
             } else if (log.startsWith("[정보]") || log.startsWith("[기준]")) {
                 paint.color = Color.parseColor("#55FFFF") 
-            } else if (log.contains("FAIL") || log.contains("삭제")) {
+            } else if (log.contains("FAIL") || log.contains("삭제") || log.contains("Yes")) {
                 paint.color = Color.parseColor("#FF5555") 
+            } else if (log.contains("No")) {
+                paint.color = Color.parseColor("#55FF55")
             } else {
                 paint.color = Color.WHITE
             }
@@ -162,6 +164,30 @@ object PlateDetectionEngine {
         Imgproc.GaussianBlur(looseGray, thresh, Size(5.0, 5.0), 0.0)
         Imgproc.adaptiveThreshold(thresh, thresh, 255.0, Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, Imgproc.THRESH_BINARY_INV, 31, 7.0)
 
+        // ==========================================================
+        // 💡 [디버그 화면 1/4] Threshold 직후 (Morphology 적용 전)
+        // ==========================================================
+        debugListener?.let {
+            val debugMat0 = Mat()
+            Imgproc.cvtColor(thresh, debugMat0, Imgproc.COLOR_GRAY2RGBA)
+            val debugBmp0 = Bitmap.createBitmap(debugMat0.cols(), debugMat0.rows(), Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(debugMat0, debugBmp0)
+            
+            val logs0 = listOf(
+                "[진단 0] Morph 연산 전 순수 Threshold 결과",
+                " -> 확인: 여기서 글자와 테두리가 이미 붙었는가?",
+                " -> (Yes) Threshold 단계에서 이미 Merge 발생",
+                " -> (No) 다음 단계인 Morph Close가 Merge 원인"
+            )
+            
+            val hudBmp0 = addDebugHUD(debugBmp0, "디버그 1/4: Threshold 직후", logs0, screenRatio)
+            it.pauseAndShowStep("디버그 1/4: Threshold 상태 확인", hudBmp0)
+            
+            debugMat0.release()
+            debugBmp0.recycle()
+        }
+
+        // CLOSE -> OPEN 모폴로지
         val tempClose = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
         val tempOpen = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
@@ -175,18 +201,14 @@ object PlateDetectionEngine {
         val charList = mutableListOf<CharData>()
         val rejectedList = mutableListOf<CharData>() 
         val totalRejectedRects = mutableListOf<CharData>() 
-        
+        val onScreenDebugTexts = mutableListOf<Pair<Rect, List<String>>>()
+
+        val step1Logs = mutableListOf<String>()
         var failReason = ""
 
-        // ==========================================================
-        // [디버그 화면 1] 1차 검증 및 이진화 뷰
-        // ==========================================================
-        val step1Logs = mutableListOf<String>()
         step1Logs.add("[진단 1] 1차 통과 분석 (${tempContours.size}개 발견)")
 
         val maxAreaBound = looseRect.area() * 0.08
-        val onScreenTextsStep1 = mutableListOf<Pair<Rect, List<String>>>()
-
         for (contour in tempContours) {
             val rect = Imgproc.boundingRect(contour)
             val area = rect.area()
@@ -210,7 +232,7 @@ object PlateDetectionEngine {
             if (rReason.isEmpty()) {
                 if (ratio in 0.9..5.5 && rect.height >= 20) {
                     charList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect)) 
-                    onScreenTextsStep1.add(Pair(rect, listOf("C(${center.x.toInt()},${center.y.toInt()})", "W:${rect.width} H:${rect.height}")))
+                    onScreenDebugTexts.add(Pair(rect, listOf("C(${center.x.toInt()},${center.y.toInt()})", "W:${rect.width} H:${rect.height}")))
                 } else {
                     rejectedList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect, "Rescue")) 
                 }
@@ -222,14 +244,15 @@ object PlateDetectionEngine {
         step1Logs.add(" -> 1차 생존: ${charList.size}개 / 완전 탈락: ${totalRejectedRects.size}개")
         if (charList.isEmpty()) failReason = "원인 1: 1차 검증 글자 전멸"
 
+        // ==========================================================
+        // [디버그 화면 2/4] Morphology 적용 후 1차 검증
+        // ==========================================================
         debugListener?.let {
             val debugMat1 = Mat()
             Imgproc.cvtColor(thresh, debugMat1, Imgproc.COLOR_GRAY2RGBA)
             
             for (charData in totalRejectedRects) {
                 Imgproc.rectangle(debugMat1, charData.rect, Scalar(0.0, 0.0, 255.0, 255.0), 1)
-                
-                // 💡 크래시 픽스: submat 대신 안전한 Imgproc.rectangle (두께 -1) 채우기 방식 사용
                 Imgproc.rectangle(debugMat1, Point(charData.rect.x.toDouble(), charData.rect.y.toDouble() + 2), Point(charData.rect.x.toDouble() + 45, charData.rect.y.toDouble() + 14), Scalar(0.0, 0.0, 0.0, 255.0), -1)
                 Imgproc.putText(debugMat1, charData.rejectReason, Point(charData.rect.x.toDouble() + 2, charData.rect.y.toDouble() + 11), Imgproc.FONT_HERSHEY_SIMPLEX, 0.35, Scalar(0.0, 255.0, 255.0, 255.0), 1)
             }
@@ -241,11 +264,9 @@ object PlateDetectionEngine {
                 Imgproc.rectangle(debugMat1, charData.rect, Scalar(255.0, 0.0, 0.0, 255.0), 2)
             }
             
-            for ((rect, lines) in onScreenTextsStep1) {
+            for ((rect, lines) in onScreenDebugTexts) {
                 for (idx in lines.indices) {
                     val textY = rect.y.toDouble() - 4 - (12 * (lines.size - 1 - idx))
-                    
-                    // 💡 크래시 픽스: submat 교체
                     Imgproc.rectangle(debugMat1, Point(rect.x.toDouble(), textY - 9), Point(rect.x.toDouble() + 85, textY + 2), Scalar(0.0, 0.0, 0.0, 255.0), -1)
                     Imgproc.putText(debugMat1, lines[idx], Point(rect.x.toDouble() + 2, textY), Imgproc.FONT_HERSHEY_SIMPLEX, 0.35, Scalar(255.0, 255.0, 0.0, 255.0), 1)
                 }
@@ -253,9 +274,9 @@ object PlateDetectionEngine {
             
             val debugBmp1 = Bitmap.createBitmap(debugMat1.cols(), debugMat1.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat1, debugBmp1)
-            val title = if (failReason.isNotEmpty()) "디버그 1/3 중단 ($failReason)" else "디버그 1/3: 1차 검증 (이진화 뷰)"
+            val title = if (failReason.isNotEmpty()) "디버그 2/4 중단 ($failReason)" else "디버그 2/4: 1차 검증 (Morph 후)"
             val hudBmp1 = addDebugHUD(debugBmp1, title, step1Logs, screenRatio)
-            it.pauseAndShowStep("디버그 1/3: 이진화 뷰", hudBmp1)
+            it.pauseAndShowStep("디버그 2/4: 1차 검증", hudBmp1)
             debugMat1.release(); debugBmp1.recycle()
         }
 
@@ -265,9 +286,6 @@ object PlateDetectionEngine {
             return null
         }
 
-        // ==========================================================
-        // [디버그 화면 2] 군집화 의사결정 추적
-        // ==========================================================
         var sortedChars = charList.sortedBy { it.center.x }.toMutableList()
         val rescueCandidates = mutableListOf<CharData>()
 
@@ -348,23 +366,24 @@ object PlateDetectionEngine {
         var validChars = (clusters.maxByOrNull { it.size } ?: sortedChars).toMutableList()
         if (validChars.size < 2) failReason = "원인 2: 군집 토막남 (최대 1개)"
 
+        // ==========================================================
+        // [디버그 화면 3/4] 군집화 의사결정 추적
+        // ==========================================================
         debugListener?.let {
             val debugMat2 = looseMat.clone()
             
             for (i in 0 until sortedChars.size) {
                 val charData = sortedChars[i]
                 Imgproc.rectangle(debugMat2, charData.rect, Scalar(255.0, 255.0, 255.0, 255.0), 2)
-                
-                // 💡 크래시 픽스: submat 교체
                 Imgproc.rectangle(debugMat2, Point(charData.rect.x.toDouble(), charData.rect.y.toDouble() - 20), Point(charData.rect.x.toDouble() + 25, charData.rect.y.toDouble()), Scalar(0.0, 0.0, 0.0, 255.0), -1)
                 Imgproc.putText(debugMat2, "$i", Point(charData.rect.x.toDouble() + 4, charData.rect.y.toDouble() - 4), Imgproc.FONT_HERSHEY_SIMPLEX, 0.6, Scalar(255.0, 255.0, 0.0, 255.0), 2)
             }
             
             val debugBmp2 = Bitmap.createBitmap(debugMat2.cols(), debugMat2.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat2, debugBmp2)
-            val title = if (failReason.isNotEmpty()) "디버그 2/3 중단 ($failReason)" else "디버그 2/3: 군집화 의사결정 추적"
+            val title = if (failReason.isNotEmpty()) "디버그 3/4 중단 ($failReason)" else "디버그 3/4: 군집화 의사결정 추적"
             val hudBmp2 = addDebugHUD(debugBmp2, title, step2Logs, screenRatio)
-            it.pauseAndShowStep("디버그 2/3: 군집화 판별", hudBmp2)
+            it.pauseAndShowStep("디버그 3/4: 군집화 판별", hudBmp2)
             debugMat2.release(); debugBmp2.recycle()
         }
 
@@ -374,9 +393,6 @@ object PlateDetectionEngine {
             return null
         }
 
-        // ==========================================================
-        // [디버그 화면 3] 최종 군집 및 fitLine 검증
-        // ==========================================================
         val step3Logs = mutableListOf<String>()
         var clusterSummary = "[정보] 군집 결과: "
         for (idx in 0 until allClustersForDebug.size) clusterSummary += "G$idx(${allClustersForDebug[idx].size}개) "
@@ -425,6 +441,9 @@ object PlateDetectionEngine {
             }
         }
 
+        // ==========================================================
+        // [디버그 화면 4/4] 최종 군집 및 fitLine 검증
+        // ==========================================================
         debugListener?.let {
             val debugMat3 = looseMat.clone()
             
@@ -451,9 +470,9 @@ object PlateDetectionEngine {
             
             val debugBmp3 = Bitmap.createBitmap(debugMat3.cols(), debugMat3.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat3, debugBmp3)
-            val title = if (failReason.isNotEmpty()) "디버그 3/3 중단 ($failReason)" else "디버그 3/3: 최종 뼈대 확정"
+            val title = if (failReason.isNotEmpty()) "디버그 4/4 중단 ($failReason)" else "디버그 4/4: 최종 뼈대 확정"
             val hudBmp3 = addDebugHUD(debugBmp3, title, step3Logs, screenRatio)
-            it.pauseAndShowStep("디버그 3/3: 최종 뼈대", hudBmp3)
+            it.pauseAndShowStep("디버그 4/4: 최종 뼈대", hudBmp3)
             debugMat3.release(); debugBmp3.recycle()
         }
 
@@ -464,9 +483,6 @@ object PlateDetectionEngine {
             return null
         }
 
-        // ==========================================================
-        // [정상 루틴] 모서리선 생성 및 최종 스케일링
-        // ==========================================================
         val pointsMat = MatOfPoint2f(*validChars.map { it.center }.toTypedArray())
         val line = Mat()
         Imgproc.fitLine(pointsMat, line, Imgproc.DIST_L2, 0.0, 0.01, 0.01)
