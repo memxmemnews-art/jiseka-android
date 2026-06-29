@@ -18,6 +18,12 @@ object PlateDetectionEngine {
         fun pauseAndShowStep(stageName: String, bitmap: Bitmap)
     }
 
+    // 💡 엔진의 실행 결과와 '거대 덩어리 감지 여부'를 함께 반환하는 데이터 클래스 추가
+    private data class CoreResult(
+        val points: List<ImmutablePoint>?,
+        val hasMergedBlob: Boolean
+    )
+
     private fun drawTextWithWrap(canvas: Canvas, text: String, x: Float, y: Float, paint: Paint, maxWidth: Float, lineHeight: Float): Float {
         var currentY = y
         val originalTextSize = paint.textSize
@@ -140,6 +146,34 @@ object PlateDetectionEngine {
         debugListener: DetectionDebugListener? = null
     ): List<ImmutablePoint>? {
         
+        // 1차 시도 (Standard: 일반적인 광범위 커버리지 파라미터)
+        val firstTry = executeDetectionCore(fullBitmap, touchX, touchY, blockSize = 31, C = 7.0, attempt = 1, debugListener)
+        
+        if (firstTry.points != null) {
+            return firstTry.points
+        }
+        
+        // 💡 1차 시도 실패 시 조건부 안전망 발동: 물리적 덩어리(A(Max))가 발견되었을 때만 2차 정밀 이진화 재시도
+        if (firstTry.hasMergedBlob) {
+            android.util.Log.d("JISEKA", "1차 OCR 실패 및 거대 덩어리 병합 감지 -> 파라미터 미세조정 2차 Threshold Fallback 시도")
+            val secondTry = executeDetectionCore(fullBitmap, touchX, touchY, blockSize = 25, C = 9.0, attempt = 2, debugListener)
+            return secondTry.points
+        }
+        
+        return null
+    }
+
+    // 핵심 검출 파이프라인 코어 엔진 (반환 타입 CoreResult 로 변경)
+    private fun executeDetectionCore(
+        fullBitmap: Bitmap,
+        touchX: Float, touchY: Float,
+        blockSize: Int, C: Double,
+        attempt: Int,
+        debugListener: DetectionDebugListener?
+    ): CoreResult {
+        
+        var hasMergedBlob = false // 💡 물리적 덩어리 병합 여부 추적 플래그
+
         val fullMat = Mat(); val fullGray = Mat()
         Utils.bitmapToMat(fullBitmap, fullMat)
         Imgproc.cvtColor(fullMat, fullGray, Imgproc.COLOR_RGBA2GRAY)
@@ -164,7 +198,8 @@ object PlateDetectionEngine {
         val thresh = Mat()
         Imgproc.medianBlur(looseGray, looseGray, 3)
         Imgproc.GaussianBlur(looseGray, thresh, Size(5.0, 5.0), 0.0)
-        Imgproc.adaptiveThreshold(thresh, thresh, 255.0, Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, Imgproc.THRESH_BINARY_INV, 31, 7.0)
+        
+        Imgproc.adaptiveThreshold(thresh, thresh, 255.0, Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, Imgproc.THRESH_BINARY_INV, blockSize, C)
 
         debugListener?.let {
             val debugMat0 = Mat()
@@ -173,13 +208,14 @@ object PlateDetectionEngine {
             Utils.matToBitmap(debugMat0, debugBmp0)
             
             val logs0 = listOf(
+                "[Fallback] 현재 시도 상태: ${attempt}차 시도 (BlockSize: $blockSize, C: $C)",
                 "[진단 0] Morph 연산 전 순수 Threshold 결과",
                 " -> 확인: 여기서 글자와 테두리가 이미 붙었는가?",
                 " -> (Yes) Threshold 단계에서 이미 Merge 발생",
                 " -> (No) 다음 단계인 Morph Close가 Merge 원인"
             )
             
-            val hudBmp0 = addDebugHUD(debugBmp0, "디버그 1/4: Threshold 직후", logs0, screenRatio)
+            val hudBmp0 = addDebugHUD(debugBmp0, "디버그 1/4: Threshold 직후 ($attempt 차 시도)", logs0, screenRatio)
             it.pauseAndShowStep("디버그 1/4: Threshold 상태 확인", hudBmp0)
             
             debugMat0.release()
@@ -215,9 +251,12 @@ object PlateDetectionEngine {
             val center = Point(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
             
             var rReason = ""
-            if (area <= 100) rReason = "A(Min)"
-            else if (area >= maxAreaBound) rReason = "A(Max)"
-            else {
+            if (area <= 100) {
+                rReason = "A(Min)"
+            } else if (area >= maxAreaBound) {
+                rReason = "A(Max)"
+                hasMergedBlob = true // 💡 거대 덩어리 감지! (2차 정밀 이진화의 트리거)
+            } else {
                 if (ratio in 0.9..5.5 && rect.height >= 20) {
                     // Pass
                 } else if (ratio in 0.25..1.5 && rect.height >= 15) {
@@ -326,22 +365,16 @@ object PlateDetectionEngine {
             
             val debugBmp1 = Bitmap.createBitmap(debugMat1.cols(), debugMat1.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat1, debugBmp1)
-            val title = if (failReason.isNotEmpty()) "디버그 2/4 중단 ($failReason)" else "디버그 2/4: 1.5단계 검증 (밀도/명암 반영)"
+            val title = if (failReason.isNotEmpty()) "디버그 2/4 중단 ($failReason)" else "디버그 2/4: 1.5단계 검증 ($attempt 차 시도)"
             val hudBmp1 = addDebugHUD(debugBmp1, title, step1Logs, screenRatio)
             it.pauseAndShowStep("디버그 2/4: 1.5단계 픽셀 검증", hudBmp1)
             debugMat1.release(); debugBmp1.recycle()
         }
 
         if (failReason.isNotEmpty()) {
-            // ==========================================================
-            // 💡 [독립적 Fallback 경로 - 구역 1] 1차 검증 단계 실패 시 가로채기
-            // ==========================================================
-            resultPoints = executeFallbackRoute(tempContours, looseRect, step1Logs, fullMat, screenRatio, debugListener)
-            if (resultPoints != null) return resultPoints
-
             thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
             tempOpen.release(); tempClose.release(); tempContours.forEach { it.release() }; tempHierarchy.release()
-            return null
+            return CoreResult(null, hasMergedBlob) // 💡
         }
 
         var sortedChars = charList.sortedBy { it.center.x }.toMutableList()
@@ -424,9 +457,6 @@ object PlateDetectionEngine {
         var validChars = (clusters.maxByOrNull { it.size } ?: sortedChars).toMutableList()
         if (validChars.size < 2) failReason = "원인 2: 군집 토막남 (최대 1개)"
 
-        // ==========================================================
-        // [디버그 화면 3/4] 군집화 의사결정 추적
-        // ==========================================================
         debugListener?.let {
             val debugMat2 = looseMat.clone()
             
@@ -439,22 +469,16 @@ object PlateDetectionEngine {
             
             val debugBmp2 = Bitmap.createBitmap(debugMat2.cols(), debugMat2.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat2, debugBmp2)
-            val title = if (failReason.isNotEmpty()) "디버그 3/4 중단 ($failReason)" else "디버그 3/4: 군집화 의사결정 추적"
+            val title = if (failReason.isNotEmpty()) "디버그 3/4 중단 ($failReason)" else "디버그 3/4: 군집화 의사결정 추적 ($attempt 차 시도)"
             val hudBmp2 = addDebugHUD(debugBmp2, title, step2Logs, screenRatio)
             it.pauseAndShowStep("디버그 3/4: 군집화 판별", hudBmp2)
             debugMat2.release(); debugBmp2.recycle()
         }
 
         if (failReason.isNotEmpty()) {
-            // ==========================================================
-            // 💡 [독립적 Fallback 경로 - 구역 2] 군집화 단계 실패 시 가로채기
-            // ==========================================================
-            resultPoints = executeFallbackRoute(tempContours, looseRect, step2Logs, fullMat, screenRatio, debugListener)
-            if (resultPoints != null) return resultPoints
-
             thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
             tempOpen.release(); tempClose.release(); tempContours.forEach { it.release() }; tempHierarchy.release()
-            return null
+            return CoreResult(null, hasMergedBlob) // 💡
         }
 
         val step3Logs = mutableListOf<String>()
@@ -505,9 +529,6 @@ object PlateDetectionEngine {
             }
         }
 
-        // ==========================================================
-        // [디버그 화면 4/4] 최종 군집 및 fitLine 검증
-        // ==========================================================
         debugListener?.let {
             val debugMat3 = looseMat.clone()
             
@@ -534,27 +555,19 @@ object PlateDetectionEngine {
             
             val debugBmp3 = Bitmap.createBitmap(debugMat3.cols(), debugMat3.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat3, debugBmp3)
-            val title = if (failReason.isNotEmpty()) "디버그 4/4 중단 ($failReason)" else "디버그 4/4: 최종 뼈대 확정"
+            val title = if (failReason.isNotEmpty()) "디버그 4/4 중단 ($failReason)" else "디버그 4/4: 최종 뼈대 확정 ($attempt 차 시도)"
             val hudBmp3 = addDebugHUD(debugBmp3, title, step3Logs, screenRatio)
             it.pauseAndShowStep("디버그 4/4: 최종 뼈대", hudBmp3)
             debugMat3.release(); debugBmp3.recycle()
         }
 
-        if (failReason.isNotEmpty() || validChars.size < 2) {
-            // ==========================================================
-            // 💡 [독립적 Fallback 경로 - 구역 3] 직선 검증 단계 실패 시 가로채기
-            // ==========================================================
-            resultPoints = executeFallbackRoute(tempContours, looseRect, step3Logs, fullMat, screenRatio, debugListener)
-            if (resultPoints != null) return resultPoints
+        tempContours.forEach { it.release() }; tempHierarchy.release(); tempOpen.release(); tempClose.release()
 
+        if (failReason.isNotEmpty() || validChars.size < 2) {
             thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
-            tempOpen.release(); tempClose.release(); tempContours.forEach { it.release() }; tempHierarchy.release()
-            return null
+            return CoreResult(null, hasMergedBlob) // 💡
         }
 
-        // ==========================================================
-        // [정상 OCR 루틴] 모서리선 생성 및 최종 스케일링
-        // ==========================================================
         val pointsMat = MatOfPoint2f(*validChars.map { it.center }.toTypedArray())
         val line = Mat()
         Imgproc.fitLine(pointsMat, line, Imgproc.DIST_L2, 0.0, 0.01, 0.01)
@@ -653,6 +666,8 @@ object PlateDetectionEngine {
                     Imgproc.putText(debugMat, labels[i], Point(finalPts[i].x - 20, finalPts[i].y - 20), Imgproc.FONT_HERSHEY_SIMPLEX, 1.8, colors[i], 4)
                 }
 
+                Imgproc.circle(debugMat, Point(midX + looseRect.x, midY + looseRect.y), 8, Scalar(0.0, 255.0, 255.0, 255.0), -1)
+
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
                 val hudBmp = addDebugHUD(debugBmp, "Step 6: Symmetric Scaling", listOf(
@@ -673,89 +688,6 @@ object PlateDetectionEngine {
             fullMat.release(); fullGray.release()
         }
 
-        return resultPoints
-    }
-
-    // ==========================================================
-    // 💡 [Fallback 전용 엔진] 번호판의 물리적 회전 각도(Slant)를 보존하여 꼭짓점 추출
-    // ==========================================================
-    private fun executeFallbackRoute(
-        tempContours: List<MatOfPoint>,
-        looseRect: Rect,
-        currentLogs: List<String>,
-        fullMat: Mat,
-        screenRatio: Float,
-        debugListener: DetectionDebugListener?
-    ): List<ImmutablePoint>? {
-        
-        val fallbackLogs = mutableListOf<String>()
-        fallbackLogs.addAll(currentLogs)
-        fallbackLogs.add("[Fallback] 구조 모드 발동: 덩어리 외곽 추적 시작")
-        
-        var bestCandidate: MatOfPoint? = null
-        var bestArea = 0.0
-        
-        val minAreaFallback = looseRect.area() * 0.15 
-        val maxAreaFallback = looseRect.area() * 0.90 
-
-        for (contour in tempContours) {
-            val rect = Imgproc.boundingRect(contour)
-            val area = Imgproc.contourArea(contour)
-            val ratio = rect.width.toDouble() / max(rect.height.toDouble(), 1.0)
-            
-            if (area in minAreaFallback..maxAreaFallback && ratio in 1.8..6.0) {
-                if (area > bestArea) {
-                    bestArea = area
-                    bestCandidate = contour
-                }
-            }
-        }
-
-        if (bestCandidate == null) {
-            fallbackLogs.add("[Fallback] 적합한 번호판 형태의 덩어리가 없음 (구조 실패)")
-            return null
-        }
-
-        fallbackLogs.add("[Fallback] 번호판 윤곽 확인 (Area: ${bestArea.toInt()})")
-        
-        // 💡 핵심 수정: 단순 수평 사각형(boundingRect)이 아닌, 번호판의 실제 '회전 각도'가 반영된 최소 면적 사각형 추출
-        val rotatedRect = Imgproc.minAreaRect(MatOfPoint2f(*bestCandidate.toArray()))
-        val pts = Array(4) { Point() }
-        rotatedRect.points(pts)
-
-        // 4개의 불규칙한 꼭짓점 좌표를 자석 배치 순서(TL -> TR -> BR -> BL)에 맞춰 기하학적 정렬
-        val sortedPts = pts.sortedBy { it.x }
-        val leftTwo = sortedPts.subList(0, 2).sortedBy { it.y }
-        val rightTwo = sortedPts.subList(2, 4).sortedBy { it.y }
-
-        // 로컬 ROI 좌표계에서 전체 원본 이미지 좌표계로 전역 매핑 변환
-        val fbTL = Point(leftTwo[0].x + looseRect.x, leftTwo[0].y + looseRect.y)
-        val fbBL = Point(leftTwo[1].x + looseRect.x, leftTwo[1].y + looseRect.y)
-        val fbTR = Point(rightTwo[0].x + looseRect.x, rightTwo[0].y + looseRect.y)
-        val fbBR = Point(rightTwo[1].x + looseRect.x, rightTwo[1].y + looseRect.y)
-        
-        // 앱의 가림막 이미지 Warp 변환 매트릭스 흐름과 완벽 결합
-        val resultPoints = listOf(fbTL, fbTR, fbBR, fbBL).map { ImmutablePoint(it.x.toFloat(), it.y.toFloat()) }
-        fallbackLogs.add("[Fallback] 번호판 Slant 각도 매핑 완료 -> 가림막 오버레이 준비")
-
-        debugListener?.let {
-            val debugMatFallback = fullMat.clone()
-            val colors = arrayOf(Scalar(255.0, 0.0, 0.0, 255.0), Scalar(0.0, 255.0, 0.0, 255.0), Scalar(0.0, 0.0, 255.0, 255.0), Scalar(255.0, 255.0, 0.0, 255.0))
-            val finalPts = listOf(fbTL, fbTR, fbBR, fbBL)
-            
-            for (i in 0..3) {
-                // 회전된 방향 그대로 가림막 매핑 뼈대선 시각화
-                Imgproc.line(debugMatFallback, finalPts[i], finalPts[(i + 1) % 4], Scalar(0.0, 255.0, 0.0, 255.0), 5) 
-                Imgproc.circle(debugMatFallback, finalPts[i], 15, colors[i], -1)
-            }
-            
-            val debugBmpFallback = Bitmap.createBitmap(debugMatFallback.cols(), debugMatFallback.rows(), Bitmap.Config.ARGB_8888)
-            Utils.matToBitmap(debugMatFallback, debugBmpFallback)
-            val hudBmpFallback = addDebugHUD(debugBmpFallback, "Fallback: 회전각 보존 구조 성공", fallbackLogs, screenRatio)
-            it.pauseAndShowStep("Fallback 정밀 꼭짓점 검증", hudBmpFallback)
-            debugMatFallback.release(); debugBmpFallback.recycle()
-        }
-
-        return resultPoints
+        return CoreResult(resultPoints, hasMergedBlob) // 💡
     }
 }
