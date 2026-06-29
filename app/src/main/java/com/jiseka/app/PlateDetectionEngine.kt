@@ -97,6 +97,8 @@ object PlateDetectionEngine {
                 paint.color = Color.parseColor("#FF5555") 
             } else if (log.contains("No")) {
                 paint.color = Color.parseColor("#55FF55")
+            } else if (log.contains("[Fallback]")) {
+                paint.color = Color.parseColor("#FFA500") 
             } else {
                 paint.color = Color.WHITE
             }
@@ -164,9 +166,6 @@ object PlateDetectionEngine {
         Imgproc.GaussianBlur(looseGray, thresh, Size(5.0, 5.0), 0.0)
         Imgproc.adaptiveThreshold(thresh, thresh, 255.0, Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, Imgproc.THRESH_BINARY_INV, 31, 7.0)
 
-        // ==========================================================
-        // 💡 [디버그 화면 1/4] Threshold 직후 (Morphology 적용 전)
-        // ==========================================================
         debugListener?.let {
             val debugMat0 = Mat()
             Imgproc.cvtColor(thresh, debugMat0, Imgproc.COLOR_GRAY2RGBA)
@@ -187,7 +186,6 @@ object PlateDetectionEngine {
             debugBmp0.recycle()
         }
 
-        // CLOSE -> OPEN 모폴로지
         val tempClose = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
         val tempOpen = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
@@ -197,7 +195,7 @@ object PlateDetectionEngine {
         val tempHierarchy = Mat()
         Imgproc.findContours(thresh, tempContours, tempHierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
-        class CharData(val center: Point, val width: Double, val height: Double, val rect: Rect, var rejectReason: String = "")
+        class CharData(val center: Point, val width: Double, val height: Double, val rect: Rect, var rejectReason: String = "", var contrast: Double = 0.0, var density: Double = 0.0)
         val charList = mutableListOf<CharData>()
         val rejectedList = mutableListOf<CharData>() 
         val totalRejectedRects = mutableListOf<CharData>() 
@@ -205,8 +203,9 @@ object PlateDetectionEngine {
 
         val step1Logs = mutableListOf<String>()
         var failReason = ""
+        var resultPoints: List<ImmutablePoint>? = null
 
-        step1Logs.add("[진단 1] 1차 통과 분석 (${tempContours.size}개 발견)")
+        step1Logs.add("[진단 1] 1차 기하학적 형태 검증 (${tempContours.size}개 발견)")
 
         val maxAreaBound = looseRect.area() * 0.08
         for (contour in tempContours) {
@@ -232,7 +231,6 @@ object PlateDetectionEngine {
             if (rReason.isEmpty()) {
                 if (ratio in 0.9..5.5 && rect.height >= 20) {
                     charList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect)) 
-                    onScreenDebugTexts.add(Pair(rect, listOf("C(${center.x.toInt()},${center.y.toInt()})", "W:${rect.width} H:${rect.height}")))
                 } else {
                     rejectedList.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect, "Rescue")) 
                 }
@@ -240,20 +238,74 @@ object PlateDetectionEngine {
                 totalRejectedRects.add(CharData(center, rect.width.toDouble(), rect.height.toDouble(), rect, rReason))
             }
         }
-        
-        step1Logs.add(" -> 1차 생존: ${charList.size}개 / 완전 탈락: ${totalRejectedRects.size}개")
-        if (charList.isEmpty()) failReason = "원인 1: 1차 검증 글자 전멸"
 
-        // ==========================================================
-        // [디버그 화면 2/4] Morphology 적용 후 1차 검증
-        // ==========================================================
+        if (charList.isNotEmpty() || rejectedList.isNotEmpty()) {
+            var totalContrast = 0.0
+            val allCandidates = charList + rejectedList
+            for (c in allCandidates) {
+                val roiGray = looseGray.submat(c.rect)
+                val minMax = Core.minMaxLoc(roiGray)
+                c.contrast = minMax.maxVal - minMax.minVal
+                roiGray.release()
+
+                val roiThresh = thresh.submat(c.rect)
+                val whitePixelCount = Core.countNonZero(roiThresh)
+                c.density = whitePixelCount.toDouble() / c.rect.area() 
+                roiThresh.release()
+                
+                if (charList.contains(c)) {
+                    totalContrast += c.contrast
+                }
+            }
+
+            val avgContrast = if (charList.isNotEmpty()) totalContrast / charList.size else 0.0
+            step1Logs.add("[기준] 그룹 평균 명암차(AvgC): ${avgContrast.toInt()}")
+            
+            val contrastLimit = max(avgContrast * 0.40, 40.0) 
+
+            val charIter = charList.iterator()
+            while (charIter.hasNext()) {
+                val c = charIter.next()
+                if (c.density < 0.12 || c.density > 0.65) {
+                    c.rejectReason = "D(${(c.density * 100).toInt()}%)"
+                    totalRejectedRects.add(c)
+                    charIter.remove()
+                    continue
+                }
+                if (abs(c.contrast - avgContrast) > contrastLimit) {
+                    c.rejectReason = "C(${c.contrast.toInt()})"
+                    totalRejectedRects.add(c)
+                    charIter.remove()
+                    continue
+                }
+                onScreenDebugTexts.add(Pair(c.rect, listOf("D:${(c.density * 100).toInt()}% C:${c.contrast.toInt()}", "W:${c.rect.width} H:${c.rect.height}")))
+            }
+
+            val rejIter = rejectedList.iterator()
+            while (rejIter.hasNext()) {
+                val c = rejIter.next()
+                if (c.density < 0.12 || c.density > 0.65) {
+                    c.rejectReason = "D(${(c.density * 100).toInt()}%)"
+                    totalRejectedRects.add(c)
+                    rejIter.remove()
+                } else if (abs(c.contrast - avgContrast) > contrastLimit) {
+                    c.rejectReason = "C(${c.contrast.toInt()})"
+                    totalRejectedRects.add(c)
+                    rejIter.remove()
+                }
+            }
+        }
+        
+        step1Logs.add(" -> 1.5단계 후 생존: ${charList.size}개 / 완전 탈락: ${totalRejectedRects.size}개")
+        if (charList.isEmpty()) failReason = "원인 1: 1차 검증 후 글자 전멸"
+
         debugListener?.let {
             val debugMat1 = Mat()
             Imgproc.cvtColor(thresh, debugMat1, Imgproc.COLOR_GRAY2RGBA)
             
             for (charData in totalRejectedRects) {
                 Imgproc.rectangle(debugMat1, charData.rect, Scalar(0.0, 0.0, 255.0, 255.0), 1)
-                Imgproc.rectangle(debugMat1, Point(charData.rect.x.toDouble(), charData.rect.y.toDouble() + 2), Point(charData.rect.x.toDouble() + 45, charData.rect.y.toDouble() + 14), Scalar(0.0, 0.0, 0.0, 255.0), -1)
+                Imgproc.rectangle(debugMat1, Point(charData.rect.x.toDouble(), charData.rect.y.toDouble() + 2), Point(charData.rect.x.toDouble() + 50, charData.rect.y.toDouble() + 14), Scalar(0.0, 0.0, 0.0, 255.0), -1)
                 Imgproc.putText(debugMat1, charData.rejectReason, Point(charData.rect.x.toDouble() + 2, charData.rect.y.toDouble() + 11), Imgproc.FONT_HERSHEY_SIMPLEX, 0.35, Scalar(0.0, 255.0, 255.0, 255.0), 1)
             }
             
@@ -274,13 +326,19 @@ object PlateDetectionEngine {
             
             val debugBmp1 = Bitmap.createBitmap(debugMat1.cols(), debugMat1.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat1, debugBmp1)
-            val title = if (failReason.isNotEmpty()) "디버그 2/4 중단 ($failReason)" else "디버그 2/4: 1차 검증 (Morph 후)"
+            val title = if (failReason.isNotEmpty()) "디버그 2/4 중단 ($failReason)" else "디버그 2/4: 1.5단계 검증 (밀도/명암 반영)"
             val hudBmp1 = addDebugHUD(debugBmp1, title, step1Logs, screenRatio)
-            it.pauseAndShowStep("디버그 2/4: 1차 검증", hudBmp1)
+            it.pauseAndShowStep("디버그 2/4: 1.5단계 픽셀 검증", hudBmp1)
             debugMat1.release(); debugBmp1.recycle()
         }
 
         if (failReason.isNotEmpty()) {
+            // ==========================================================
+            // 💡 [독립적 Fallback 경로 - 구역 1] 1차 검증 단계 실패 시 가로채기
+            // ==========================================================
+            resultPoints = executeFallbackRoute(tempContours, looseRect, step1Logs, fullMat, screenRatio, debugListener)
+            if (resultPoints != null) return resultPoints
+
             thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
             tempOpen.release(); tempClose.release(); tempContours.forEach { it.release() }; tempHierarchy.release()
             return null
@@ -388,6 +446,12 @@ object PlateDetectionEngine {
         }
 
         if (failReason.isNotEmpty()) {
+            // ==========================================================
+            // 💡 [독립적 Fallback 경로 - 구역 2] 군집화 단계 실패 시 가로채기
+            // ==========================================================
+            resultPoints = executeFallbackRoute(tempContours, looseRect, step2Logs, fullMat, screenRatio, debugListener)
+            if (resultPoints != null) return resultPoints
+
             thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
             tempOpen.release(); tempClose.release(); tempContours.forEach { it.release() }; tempHierarchy.release()
             return null
@@ -476,13 +540,21 @@ object PlateDetectionEngine {
             debugMat3.release(); debugBmp3.recycle()
         }
 
-        tempContours.forEach { it.release() }; tempHierarchy.release(); tempOpen.release(); tempClose.release()
-
         if (failReason.isNotEmpty() || validChars.size < 2) {
+            // ==========================================================
+            // 💡 [독립적 Fallback 경로 - 구역 3] 직선 검증 단계 실패 시 가로채기
+            // ==========================================================
+            resultPoints = executeFallbackRoute(tempContours, looseRect, step3Logs, fullMat, screenRatio, debugListener)
+            if (resultPoints != null) return resultPoints
+
             thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
+            tempOpen.release(); tempClose.release(); tempContours.forEach { it.release() }; tempHierarchy.release()
             return null
         }
 
+        // ==========================================================
+        // [정상 OCR 루틴] 모서리선 생성 및 최종 스케일링
+        // ==========================================================
         val pointsMat = MatOfPoint2f(*validChars.map { it.center }.toTypedArray())
         val line = Mat()
         Imgproc.fitLine(pointsMat, line, Imgproc.DIST_L2, 0.0, 0.01, 0.01)
@@ -547,8 +619,6 @@ object PlateDetectionEngine {
         topLineMat.release(); bottomLineMat.release()
         leftPts.release(); rightPts.release(); leftLine.release(); rightLine.release()
 
-        var resultPoints: List<ImmutablePoint>? = null
-
         try {
             val midX = (initTL.x + initTR.x + initBR.x + initBL.x) / 4.0
             val midY = (initTL.y + initTR.y + initBR.y + initBL.y) / 4.0
@@ -561,13 +631,10 @@ object PlateDetectionEngine {
             val finalPts = listOf(initTL, initTR, initBR, initBL).map { pt ->
                 val dx = pt.x - midX
                 val dy = pt.y - midY
-                
                 val localX = dx * vx + dy * vy
                 val localY = dx * nX + dy * nY
-                
                 val scaledX = localX * scaleX
                 val scaledY = localY * scaleY
-                
                 Point(
                     midX + scaledX * vx + scaledY * nX + looseRect.x,
                     midY + scaledX * vy + scaledY * nY + looseRect.y
@@ -585,8 +652,6 @@ object PlateDetectionEngine {
                     Imgproc.circle(debugMat, finalPts[i], 15, colors[i], -1)
                     Imgproc.putText(debugMat, labels[i], Point(finalPts[i].x - 20, finalPts[i].y - 20), Imgproc.FONT_HERSHEY_SIMPLEX, 1.8, colors[i], 4)
                 }
-
-                Imgproc.circle(debugMat, Point(midX + looseRect.x, midY + looseRect.y), 8, Scalar(0.0, 255.0, 255.0, 255.0), -1)
 
                 val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(debugMat, debugBmp)
@@ -606,6 +671,89 @@ object PlateDetectionEngine {
             thresh.release()
             looseMat.release(); looseGray.release()
             fullMat.release(); fullGray.release()
+        }
+
+        return resultPoints
+    }
+
+    // ==========================================================
+    // 💡 [Fallback 전용 엔진] 번호판의 물리적 회전 각도(Slant)를 보존하여 꼭짓점 추출
+    // ==========================================================
+    private fun executeFallbackRoute(
+        tempContours: List<MatOfPoint>,
+        looseRect: Rect,
+        currentLogs: List<String>,
+        fullMat: Mat,
+        screenRatio: Float,
+        debugListener: DetectionDebugListener?
+    ): List<ImmutablePoint>? {
+        
+        val fallbackLogs = mutableListOf<String>()
+        fallbackLogs.addAll(currentLogs)
+        fallbackLogs.add("[Fallback] 구조 모드 발동: 덩어리 외곽 추적 시작")
+        
+        var bestCandidate: MatOfPoint? = null
+        var bestArea = 0.0
+        
+        val minAreaFallback = looseRect.area() * 0.15 
+        val maxAreaFallback = looseRect.area() * 0.90 
+
+        for (contour in tempContours) {
+            val rect = Imgproc.boundingRect(contour)
+            val area = Imgproc.contourArea(contour)
+            val ratio = rect.width.toDouble() / max(rect.height.toDouble(), 1.0)
+            
+            if (area in minAreaFallback..maxAreaFallback && ratio in 1.8..6.0) {
+                if (area > bestArea) {
+                    bestArea = area
+                    bestCandidate = contour
+                }
+            }
+        }
+
+        if (bestCandidate == null) {
+            fallbackLogs.add("[Fallback] 적합한 번호판 형태의 덩어리가 없음 (구조 실패)")
+            return null
+        }
+
+        fallbackLogs.add("[Fallback] 번호판 윤곽 확인 (Area: ${bestArea.toInt()})")
+        
+        // 💡 핵심 수정: 단순 수평 사각형(boundingRect)이 아닌, 번호판의 실제 '회전 각도'가 반영된 최소 면적 사각형 추출
+        val rotatedRect = Imgproc.minAreaRect(MatOfPoint2f(*bestCandidate.toArray()))
+        val pts = Array(4) { Point() }
+        rotatedRect.points(pts)
+
+        // 4개의 불규칙한 꼭짓점 좌표를 자석 배치 순서(TL -> TR -> BR -> BL)에 맞춰 기하학적 정렬
+        val sortedPts = pts.sortedBy { it.x }
+        val leftTwo = sortedPts.subList(0, 2).sortedBy { it.y }
+        val rightTwo = sortedPts.subList(2, 4).sortedBy { it.y }
+
+        // 로컬 ROI 좌표계에서 전체 원본 이미지 좌표계로 전역 매핑 변환
+        val fbTL = Point(leftTwo[0].x + looseRect.x, leftTwo[0].y + looseRect.y)
+        val fbBL = Point(leftTwo[1].x + looseRect.x, leftTwo[1].y + looseRect.y)
+        val fbTR = Point(rightTwo[0].x + looseRect.x, rightTwo[0].y + looseRect.y)
+        val fbBR = Point(rightTwo[1].x + looseRect.x, rightTwo[1].y + looseRect.y)
+        
+        // 앱의 가림막 이미지 Warp 변환 매트릭스 흐름과 완벽 결합
+        val resultPoints = listOf(fbTL, fbTR, fbBR, fbBL).map { ImmutablePoint(it.x.toFloat(), it.y.toFloat()) }
+        fallbackLogs.add("[Fallback] 번호판 Slant 각도 매핑 완료 -> 가림막 오버레이 준비")
+
+        debugListener?.let {
+            val debugMatFallback = fullMat.clone()
+            val colors = arrayOf(Scalar(255.0, 0.0, 0.0, 255.0), Scalar(0.0, 255.0, 0.0, 255.0), Scalar(0.0, 0.0, 255.0, 255.0), Scalar(255.0, 255.0, 0.0, 255.0))
+            val finalPts = listOf(fbTL, fbTR, fbBR, fbBL)
+            
+            for (i in 0..3) {
+                // 회전된 방향 그대로 가림막 매핑 뼈대선 시각화
+                Imgproc.line(debugMatFallback, finalPts[i], finalPts[(i + 1) % 4], Scalar(0.0, 255.0, 0.0, 255.0), 5) 
+                Imgproc.circle(debugMatFallback, finalPts[i], 15, colors[i], -1)
+            }
+            
+            val debugBmpFallback = Bitmap.createBitmap(debugMatFallback.cols(), debugMatFallback.rows(), Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(debugMatFallback, debugBmpFallback)
+            val hudBmpFallback = addDebugHUD(debugBmpFallback, "Fallback: 회전각 보존 구조 성공", fallbackLogs, screenRatio)
+            it.pauseAndShowStep("Fallback 정밀 꼭짓점 검증", hudBmpFallback)
+            debugMatFallback.release(); debugBmpFallback.recycle()
         }
 
         return resultPoints
