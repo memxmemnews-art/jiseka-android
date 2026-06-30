@@ -407,6 +407,51 @@ object PlateDetectionEngine {
         sortedChars.addAll(rescueCandidates)
         sortedChars = sortedChars.sortedBy { it.center.x }.toMutableList()
 
+        // --- 💡 [새로운 로직: 한글 파편 (상하/좌우 분리) 강제 조립] ---
+        var j = 0
+        while (j < sortedChars.size - 1) {
+            val curr = sortedChars[j]
+            val next = sortedChars[j + 1]
+
+            val currRight = curr.rect.x + curr.rect.width
+            val currBottom = curr.rect.y + curr.rect.height
+            val nextRight = next.rect.x + next.rect.width
+            val nextBottom = next.rect.y + next.rect.height
+
+            val xOverlap = min(currRight, nextRight) - max(curr.rect.x, next.rect.x)
+            val yOverlap = min(currBottom, nextBottom) - max(curr.rect.y, next.rect.y)
+            
+            val xGap = max(0, max(curr.rect.x, next.rect.x) - min(currRight, nextRight))
+            val yGap = max(0, max(curr.rect.y, next.rect.y) - min(currBottom, nextBottom))
+
+            // 1. 상하 분리 ('도', '고' 등): X축이 겹치고 위아래 간격이 좁음
+            val isVerticalSplit = xOverlap > 0 && yGap < 20 && abs(curr.center.x - next.center.x) < 20.0
+            
+            // 2. 좌우 분리 ('가', '나' 등): Y축이 겹치고 좌우 간격이 좁음
+            val isHorizontalSplit = yOverlap > 0 && xGap < 15 && abs(curr.center.y - next.center.y) < 15.0
+
+            if (isVerticalSplit || isHorizontalSplit) {
+                val unionLeft = min(curr.rect.x, next.rect.x)
+                val unionTop = min(curr.rect.y, next.rect.y)
+                val unionRight = max(currRight, nextRight)
+                val unionBottom = max(currBottom, nextBottom)
+                
+                val unionRect = Rect(unionLeft, unionTop, unionRight - unionLeft, unionBottom - unionTop)
+                val unionCenter = Point(unionRect.x + unionRect.width / 2.0, unionRect.y + unionRect.height / 2.0)
+                
+                val mergedChar = CharData(unionCenter, unionRect.width.toDouble(), unionRect.height.toDouble(), unionRect)
+                
+                sortedChars.removeAt(j + 1)
+                sortedChars.removeAt(j)
+                sortedChars.add(j, mergedChar)
+                
+                step1Logs.add(" -> [파편 조립] X:${curr.center.x.toInt()} & ${next.center.x.toInt()} 합병 완료")
+            } else {
+                j++
+            }
+        }
+        // --- 💡 [파편 강제 조립 로직 끝] ---
+
         val gaps = (1 until sortedChars.size).map { sortedChars[it].center.x - sortedChars[it - 1].center.x }
         val medianGap = if (gaps.isNotEmpty()) gaps.sorted()[gaps.size / 2] else 0.0
         val avgWidth = sortedChars.map { it.width }.average()
@@ -417,51 +462,52 @@ object PlateDetectionEngine {
         
         val clusters = mutableListOf<MutableList<CharData>>()
         val allClustersForDebug = mutableListOf<List<CharData>>()
-        var currentCluster = mutableListOf(sortedChars.first())
-        
-        for (i in 1 until sortedChars.size) {
-            val curr = sortedChars[i]
-            val prev = sortedChars[i - 1]
-            val gap = curr.center.x - prev.center.x
-            val yDiff = abs(curr.center.y - prev.center.y)
-            val avgH = (prev.height + curr.height) / 2.0
-
-            val localMaxGap = if (gap > maxGap && gap < avgWidth * 3.5 && yDiff < avgH * 0.45) avgWidth * 3.5 else maxGap
-            val yLimit = avgH * 0.45
+        if (sortedChars.isNotEmpty()) {
+            var currentCluster = mutableListOf(sortedChars.first())
             
-            val gapFail = gap > localMaxGap
-            val yFail = yDiff > yLimit
-            var isSplit = gapFail || yFail
-            var splitReason = if (gapFail && yFail) "Gap+Y" else if (gapFail) "Gap" else "Y축"
+            for (i in 1 until sortedChars.size) {
+                val curr = sortedChars[i]
+                val prev = sortedChars[i - 1]
+                val gap = curr.center.x - prev.center.x
+                val yDiff = abs(curr.center.y - prev.center.y)
+                val avgH = (prev.height + curr.height) / 2.0
 
-            if (isSplit && gap < avgWidth * 1.3 && yDiff <= avgH * 0.85 && currentCluster.size >= 2) {
-                val prev1 = currentCluster.last()
-                val prev2 = currentCluster[currentCluster.size - 2]
-                val slope1 = (prev1.center.y - prev2.center.y) / max(prev1.center.x - prev2.center.x, 1.0)
-                val slope2 = (curr.center.y - prev1.center.y) / max(curr.center.x - prev1.center.x, 1.0)
+                val localMaxGap = if (gap > maxGap && gap < avgWidth * 3.5 && yDiff < avgH * 0.45) avgWidth * 3.5 else maxGap
+                val yLimit = avgH * 0.45
                 
-                if (abs(slope1 - slope2) < 0.2) {
-                    isSplit = false 
-                    splitReason = "예외(사선)"
+                val gapFail = gap > localMaxGap
+                val yFail = yDiff > yLimit
+                var isSplit = gapFail || yFail
+                var splitReason = if (gapFail && yFail) "Gap+Y" else if (gapFail) "Gap" else "Y축"
+
+                if (isSplit && gap < avgWidth * 1.3 && yDiff <= avgH * 0.85 && currentCluster.size >= 2) {
+                    val prev1 = currentCluster.last()
+                    val prev2 = currentCluster[currentCluster.size - 2]
+                    val slope1 = (prev1.center.y - prev2.center.y) / max(prev1.center.x - prev2.center.x, 1.0)
+                    val slope2 = (curr.center.y - prev1.center.y) / max(curr.center.x - prev1.center.x, 1.0)
+                    
+                    if (abs(slope1 - slope2) < 0.2) {
+                        isSplit = false 
+                        splitReason = "예외(사선)"
+                    }
+                }
+
+                val statusMsg = if (isSplit) "FAIL($splitReason)" else "PASS"
+                step2Logs.add(" -> [${i-1}→$i] G:${String.format("%.1f", gap)}(${String.format("%.1f", localMaxGap)}) Y:${String.format("%.1f", yDiff)}(${String.format("%.1f", yLimit)}) => $statusMsg")
+
+                if (isSplit) {
+                    clusters.add(currentCluster) 
+                    allClustersForDebug.add(currentCluster.toList())
+                    currentCluster = mutableListOf(curr) 
+                } else {
+                    currentCluster.add(curr)
                 }
             }
-
-            val statusMsg = if (isSplit) "FAIL($splitReason)" else "PASS"
-            step2Logs.add(" -> [${i-1}→$i] G:${String.format("%.1f", gap)}(${String.format("%.1f", localMaxGap)}) Y:${String.format("%.1f", yDiff)}(${String.format("%.1f", yLimit)}) => $statusMsg")
-
-            if (isSplit) {
-                clusters.add(currentCluster) 
-                allClustersForDebug.add(currentCluster.toList())
-                currentCluster = mutableListOf(curr) 
-            } else {
-                currentCluster.add(curr)
-            }
+            clusters.add(currentCluster)
+            allClustersForDebug.add(currentCluster.toList())
         }
-        clusters.add(currentCluster)
-        allClustersForDebug.add(currentCluster.toList())
 
         // --- 💡 [군집 이중 필터링: 중심점 + 개별 솎아내기(Median 상/중/하) + 최소 7개] ---
-        // 1단계: ROI 중심점 이탈 필터
         val roiCenterX = looseRect.width / 2.0
         val roiCenterY = looseRect.height / 2.0
         val maxDistX = looseRect.width * 0.4
@@ -485,7 +531,6 @@ object PlateDetectionEngine {
             }
         }
 
-        // 2단계: '최소 7개 이상' & '상/중/하 일직선 정렬(개별 솎아내기)' 필터
         var validChars = mutableListOf<CharData>()
 
         if (centerFilteredClusters.isNotEmpty()) {
@@ -496,7 +541,6 @@ object PlateDetectionEngine {
                 
                 if (cluster.isEmpty()) continue
                 
-                // 1. 군집 내의 기준값 계산 (노이즈에 끌려가지 않도록 Average 대신 Median 사용)
                 val sortedY = cluster.map { it.center.y }.sorted()
                 val medianY = sortedY[cluster.size / 2]
                 
@@ -506,7 +550,6 @@ object PlateDetectionEngine {
                 val medianTop = medianY - medianH / 2.0
                 val medianBottom = medianY + medianH / 2.0
 
-                // 2. 일직선 정렬 불량 '개별 후보' 솎아내기 (상/중/하 검증)
                 val alignedCluster = mutableListOf<CharData>()
                 for (charData in cluster) {
                     val charTop = charData.center.y - charData.height / 2.0
@@ -518,7 +561,6 @@ object PlateDetectionEngine {
                     val topDiff = abs(charTop - medianTop)
                     val bottomDiff = abs(charBottom - medianBottom)
                     
-                    // 세 포인트(상, 중, 하) 중 하나라도 기준선에서 크게 벗어나면 컷
                     if (centerDiff <= limit && topDiff <= limit && bottomDiff <= limit) {
                         alignedCluster.add(charData)
                     } else {
@@ -526,7 +568,6 @@ object PlateDetectionEngine {
                     }
                 }
                 
-                // 3. 노이즈를 쳐내고 남은 '진짜 글자'가 7개 이상인지 최종 확인
                 if (alignedCluster.size < 7) {
                     step2Logs.add(" -> [군집 탈락 G$i] 솎아낸 후 개수 미달 (${alignedCluster.size}개 < 7개)")
                     continue
@@ -600,7 +641,6 @@ object PlateDetectionEngine {
         
         step3Logs.add("[진단 3] fitLine ${fitLineRemovedChars.size}개 삭제, 최종 ${validChars.size}개 생존")
 
-        // 💡 fitLine 검증 후에도 최소 7개가 유지되어야 최종 성공으로 간주
         if (validChars.size < 7) {
             failReason = "직선 2차 검증 중 삭제되어 7개 미만 됨"
         } else {
