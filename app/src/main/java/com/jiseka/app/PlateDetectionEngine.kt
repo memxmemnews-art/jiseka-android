@@ -98,7 +98,7 @@ object PlateDetectionEngine {
                 paint.color = Color.parseColor("#55FF55")
             } else if (log.startsWith("[정보]") || log.startsWith("[기준]")) {
                 paint.color = Color.parseColor("#55FFFF") 
-            } else if (log.contains("FAIL") || log.contains("삭제") || log.contains("Yes")) {
+            } else if (log.contains("FAIL") || log.contains("삭제") || log.contains("Yes") || log.contains("탈락")) {
                 paint.color = Color.parseColor("#FF5555") 
             } else if (log.contains("No")) {
                 paint.color = Color.parseColor("#55FF55")
@@ -152,8 +152,7 @@ object PlateDetectionEngine {
         }
         
         if (firstTry.hasMergedBlob || firstTry.points == null) {
-            android.util.Log.d("JISEKA", "1차 실패 (병합 발생) -> 극단적 분리 모드(2차 Fallback) 가동")
-            // 💡 테두리와 글자가 뭉치지 않도록 이진화 강도를 확 높이고 범위를 좁힙니다 (BlockSize 19, C 15.0)
+            android.util.Log.d("JISEKA", "1차 실패 (병합 발생 또는 유효군집 없음) -> 극단적 분리 모드(2차 Fallback) 가동")
             val secondTry = executeDetectionCore(fullBitmap, touchX, touchY, blockSize = 19, C = 15.0, attempt = 2, debugListener)
             return secondTry.points
         }
@@ -219,7 +218,7 @@ object PlateDetectionEngine {
             debugBmp0.recycle()
         }
 
-        // 💡 2차 시도일 때는 테두리와 글자를 붙여버리는 Close(팽창) 연산을 과감히 축소합니다.
+        // 2차 시도일 때는 테두리와 글자를 붙여버리는 Close(팽창) 연산을 과감히 축소
         if (attempt == 1) {
             val tempClose = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
             Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
@@ -461,8 +460,8 @@ object PlateDetectionEngine {
         clusters.add(currentCluster)
         allClustersForDebug.add(currentCluster.toList())
 
-        // --- 💡 [요청하신 새로운 군집 필터링: 중심점 + 최소 7개 + 상중하 일직선] ---
-        // 1단계: ROI 중심점 이탈 필터 (기존 동일)
+        // --- 💡 [군집 이중 필터링: 중심점 + 개별 솎아내기(Median 상/중/하) + 최소 7개] ---
+        // 1단계: ROI 중심점 이탈 필터
         val roiCenterX = looseRect.width / 2.0
         val roiCenterY = looseRect.height / 2.0
         val maxDistX = looseRect.width * 0.4
@@ -486,7 +485,7 @@ object PlateDetectionEngine {
             }
         }
 
-        // 2단계: 요청하신 '최소 7개 이상' & '일직선 정렬' 필터
+        // 2단계: '최소 7개 이상' & '상/중/하 일직선 정렬(개별 솎아내기)' 필터
         var validChars = mutableListOf<CharData>()
 
         if (centerFilteredClusters.isNotEmpty()) {
@@ -495,25 +494,45 @@ object PlateDetectionEngine {
             for (i in 0 until centerFilteredClusters.size) {
                 val cluster = centerFilteredClusters[i]
                 
-                // 조건 A: 7개 이상
-                if (cluster.size < 7) {
-                    step2Logs.add(" -> [군집 탈락 G$i] 개수 미달 (${cluster.size}개 < 7개)")
-                    continue
+                if (cluster.isEmpty()) continue
+                
+                // 1. 군집 내의 기준값 계산 (노이즈에 끌려가지 않도록 Average 대신 Median 사용)
+                val sortedY = cluster.map { it.center.y }.sorted()
+                val medianY = sortedY[cluster.size / 2]
+                
+                val sortedH = cluster.map { it.height }.sorted()
+                val medianH = sortedH[cluster.size / 2]
+                
+                val medianTop = medianY - medianH / 2.0
+                val medianBottom = medianY + medianH / 2.0
+
+                // 2. 일직선 정렬 불량 '개별 후보' 솎아내기 (상/중/하 검증)
+                val alignedCluster = mutableListOf<CharData>()
+                for (charData in cluster) {
+                    val charTop = charData.center.y - charData.height / 2.0
+                    val charBottom = charData.center.y + charData.height / 2.0
+                    
+                    val limit = medianH * 0.35
+                    
+                    val centerDiff = abs(charData.center.y - medianY)
+                    val topDiff = abs(charTop - medianTop)
+                    val bottomDiff = abs(charBottom - medianBottom)
+                    
+                    // 세 포인트(상, 중, 하) 중 하나라도 기준선에서 크게 벗어나면 컷
+                    if (centerDiff <= limit && topDiff <= limit && bottomDiff <= limit) {
+                        alignedCluster.add(charData)
+                    } else {
+                        step2Logs.add(" -> [개별 탈락] X:${charData.center.x.toInt()} 일직선 이탈 (상/중/하 불량)")
+                    }
                 }
                 
-                // 조건 B: 일직선 정렬 (상/중/하)
-                // 판단 기준: 군집 내 글자들의 높이가 비슷하고, 중심 Y좌표가 위아래로 심하게 요동치지 않아야 함
-                val avgY = cluster.map { it.center.y }.average()
-                val avgHeight = cluster.map { it.height }.average()
-                val maxDevY = cluster.maxOf { abs(it.center.y - avgY) }
-                
-                // 글자들의 Y좌표 오차가 평균 높이의 35% 이내로 나란히 위치하는지 검증
-                if (maxDevY > avgHeight * 0.35) {
-                    step2Logs.add(" -> [군집 탈락 G$i] 일직선 정렬 불량 (Y축 편차 초과)")
+                // 3. 노이즈를 쳐내고 남은 '진짜 글자'가 7개 이상인지 최종 확인
+                if (alignedCluster.size < 7) {
+                    step2Logs.add(" -> [군집 탈락 G$i] 솎아낸 후 개수 미달 (${alignedCluster.size}개 < 7개)")
                     continue
                 }
 
-                finalClusters.add(cluster)
+                finalClusters.add(alignedCluster)
             }
 
             validChars = (finalClusters.maxByOrNull { it.size } ?: mutableListOf()).toMutableList()
@@ -631,8 +650,8 @@ object PlateDetectionEngine {
 
         tempContours.forEach { it.release() }; tempHierarchy.release()
 
-        // 💡 최종 반환 전 조건 검사 역시 7개 기준으로 상향
-        if (failReason.isNotEmpty() || validChars.size < 6) { // 파란색 KOR이 지워질 것을 대비해 최종 반환은 6개로 넉넉하게 설정
+        // 💡 파란색 KOR이 지워질 것을 대비해 최종 반환은 6개로 넉넉하게 설정
+        if (failReason.isNotEmpty() || validChars.size < 6) { 
             thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
             return CoreResult(null, hasMergedBlob) 
         }
