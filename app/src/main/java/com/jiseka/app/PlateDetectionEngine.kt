@@ -18,7 +18,6 @@ object PlateDetectionEngine {
         fun pauseAndShowStep(stageName: String, bitmap: Bitmap)
     }
 
-    // 💡 엔진의 실행 결과와 '거대 덩어리 감지 여부'를 함께 반환하는 데이터 클래스 추가
     private data class CoreResult(
         val points: List<ImmutablePoint>?,
         val hasMergedBlob: Boolean
@@ -146,24 +145,22 @@ object PlateDetectionEngine {
         debugListener: DetectionDebugListener? = null
     ): List<ImmutablePoint>? {
         
-        // 1차 시도 (Standard: 일반적인 광범위 커버리지 파라미터)
         val firstTry = executeDetectionCore(fullBitmap, touchX, touchY, blockSize = 31, C = 7.0, attempt = 1, debugListener)
         
         if (firstTry.points != null) {
             return firstTry.points
         }
         
-        // 💡 1차 시도 실패 시 조건부 안전망 발동: 물리적 덩어리(A(Max))가 발견되었거나 정답을 찾지 못했을 때
         if (firstTry.hasMergedBlob || firstTry.points == null) {
-            android.util.Log.d("JISEKA", "1차 판단 보류(실패 또는 덩어리 병합) -> 파라미터 미세조정 2차 Threshold Fallback 시도")
-            val secondTry = executeDetectionCore(fullBitmap, touchX, touchY, blockSize = 25, C = 9.0, attempt = 2, debugListener)
+            android.util.Log.d("JISEKA", "1차 실패 (병합 발생) -> 극단적 분리 모드(2차 Fallback) 가동")
+            // 💡 테두리와 글자가 뭉치지 않도록 이진화 강도를 확 높이고 범위를 좁힙니다 (BlockSize 19, C 15.0)
+            val secondTry = executeDetectionCore(fullBitmap, touchX, touchY, blockSize = 19, C = 15.0, attempt = 2, debugListener)
             return secondTry.points
         }
         
         return null
     }
 
-    // 핵심 검출 파이프라인 코어 엔진 (반환 타입 CoreResult 로 변경)
     private fun executeDetectionCore(
         fullBitmap: Bitmap,
         touchX: Float, touchY: Float,
@@ -172,7 +169,7 @@ object PlateDetectionEngine {
         debugListener: DetectionDebugListener?
     ): CoreResult {
         
-        var hasMergedBlob = false // 💡 물리적 덩어리 병합 여부 추적 플래그
+        var hasMergedBlob = false 
 
         val fullMat = Mat(); val fullGray = Mat()
         Utils.bitmapToMat(fullBitmap, fullMat)
@@ -222,10 +219,20 @@ object PlateDetectionEngine {
             debugBmp0.recycle()
         }
 
-        val tempClose = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
-        Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
+        // 💡 2차 시도일 때는 테두리와 글자를 붙여버리는 Close(팽창) 연산을 과감히 축소합니다.
+        if (attempt == 1) {
+            val tempClose = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
+            Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
+            tempClose.release()
+        } else {
+            val tempClose = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
+            Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
+            tempClose.release()
+        }
+        
         val tempOpen = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_OPEN, tempOpen)
+        tempOpen.release()
         
         val tempContours = ArrayList<MatOfPoint>()
         val tempHierarchy = Mat()
@@ -255,7 +262,7 @@ object PlateDetectionEngine {
                 rReason = "A(Min)"
             } else if (area >= maxAreaBound) {
                 rReason = "A(Max)"
-                hasMergedBlob = true // 💡 거대 덩어리 감지! (2차 정밀 이진화의 트리거)
+                hasMergedBlob = true 
             } else {
                 if (ratio in 0.9..5.5 && rect.height >= 20) {
                     // Pass
@@ -373,8 +380,8 @@ object PlateDetectionEngine {
 
         if (failReason.isNotEmpty()) {
             thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
-            tempOpen.release(); tempClose.release(); tempContours.forEach { it.release() }; tempHierarchy.release()
-            return CoreResult(null, hasMergedBlob) // 💡
+            tempContours.forEach { it.release() }; tempHierarchy.release()
+            return CoreResult(null, hasMergedBlob) 
         }
 
         var sortedChars = charList.sortedBy { it.center.x }.toMutableList()
@@ -454,8 +461,8 @@ object PlateDetectionEngine {
         clusters.add(currentCluster)
         allClustersForDebug.add(currentCluster.toList())
 
-        // --- 💡 [수정된 로직: 군집 이중 필터링 (거리 & 크기)] ---
-        // 1단계: ROI 중심점 이탈 필터
+        // --- 💡 [요청하신 새로운 군집 필터링: 중심점 + 최소 7개 + 상중하 일직선] ---
+        // 1단계: ROI 중심점 이탈 필터 (기존 동일)
         val roiCenterX = looseRect.width / 2.0
         val roiCenterY = looseRect.height / 2.0
         val maxDistX = looseRect.width * 0.4
@@ -479,29 +486,41 @@ object PlateDetectionEngine {
             }
         }
 
-        // 2단계: 군집 원소 개수(크기) 필터
+        // 2단계: 요청하신 '최소 7개 이상' & '일직선 정렬' 필터
         var validChars = mutableListOf<CharData>()
 
         if (centerFilteredClusters.isNotEmpty()) {
-            val maxClusterSize = centerFilteredClusters.maxOf { it.size }
-            val minRequiredSize = max(4, (maxClusterSize * 0.5).toInt())
-
             val finalClusters = mutableListOf<MutableList<CharData>>()
             
             for (i in 0 until centerFilteredClusters.size) {
                 val cluster = centerFilteredClusters[i]
-                if (cluster.size < minRequiredSize) {
-                    step2Logs.add(" -> [군집 탈락] 크기 미달 (${cluster.size} < $minRequiredSize)")
-                } else {
-                    finalClusters.add(cluster)
+                
+                // 조건 A: 7개 이상
+                if (cluster.size < 7) {
+                    step2Logs.add(" -> [군집 탈락 G$i] 개수 미달 (${cluster.size}개 < 7개)")
+                    continue
                 }
+                
+                // 조건 B: 일직선 정렬 (상/중/하)
+                // 판단 기준: 군집 내 글자들의 높이가 비슷하고, 중심 Y좌표가 위아래로 심하게 요동치지 않아야 함
+                val avgY = cluster.map { it.center.y }.average()
+                val avgHeight = cluster.map { it.height }.average()
+                val maxDevY = cluster.maxOf { abs(it.center.y - avgY) }
+                
+                // 글자들의 Y좌표 오차가 평균 높이의 35% 이내로 나란히 위치하는지 검증
+                if (maxDevY > avgHeight * 0.35) {
+                    step2Logs.add(" -> [군집 탈락 G$i] 일직선 정렬 불량 (Y축 편차 초과)")
+                    continue
+                }
+
+                finalClusters.add(cluster)
             }
 
             validChars = (finalClusters.maxByOrNull { it.size } ?: mutableListOf()).toMutableList()
         }
 
-        if (validChars.size < 2) {
-            failReason = "원인 2: 유효 군집 없음 (중심 이탈 또는 크기 미달)"
+        if (validChars.size < 7) {
+            failReason = "원인 2: 유효 군집 없음 (7개 이상 & 일직선 정렬 실패)"
         }
         // --- 💡 수정된 로직 끝 ---
 
@@ -525,8 +544,8 @@ object PlateDetectionEngine {
 
         if (failReason.isNotEmpty()) {
             thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
-            tempOpen.release(); tempClose.release(); tempContours.forEach { it.release() }; tempHierarchy.release()
-            return CoreResult(null, hasMergedBlob) // 💡
+            tempContours.forEach { it.release() }; tempHierarchy.release()
+            return CoreResult(null, hasMergedBlob) 
         }
 
         val step3Logs = mutableListOf<String>()
@@ -562,8 +581,9 @@ object PlateDetectionEngine {
         
         step3Logs.add("[진단 3] fitLine ${fitLineRemovedChars.size}개 삭제, 최종 ${validChars.size}개 생존")
 
-        if (validChars.size < 2) {
-            failReason = "직선 검증 중 삭제되어 2개 미만 됨"
+        // 💡 fitLine 검증 후에도 최소 7개가 유지되어야 최종 성공으로 간주
+        if (validChars.size < 7) {
+            failReason = "직선 2차 검증 중 삭제되어 7개 미만 됨"
         } else {
             val firstChar = validChars.first() 
             val roi = looseMat.submat(firstChar.rect)
@@ -609,11 +629,12 @@ object PlateDetectionEngine {
             debugMat3.release(); debugBmp3.recycle()
         }
 
-        tempContours.forEach { it.release() }; tempHierarchy.release(); tempOpen.release(); tempClose.release()
+        tempContours.forEach { it.release() }; tempHierarchy.release()
 
-        if (failReason.isNotEmpty() || validChars.size < 2) {
+        // 💡 최종 반환 전 조건 검사 역시 7개 기준으로 상향
+        if (failReason.isNotEmpty() || validChars.size < 6) { // 파란색 KOR이 지워질 것을 대비해 최종 반환은 6개로 넉넉하게 설정
             thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
-            return CoreResult(null, hasMergedBlob) // 💡
+            return CoreResult(null, hasMergedBlob) 
         }
 
         val pointsMat = MatOfPoint2f(*validChars.map { it.center }.toTypedArray())
@@ -736,6 +757,6 @@ object PlateDetectionEngine {
             fullMat.release(); fullGray.release()
         }
 
-        return CoreResult(resultPoints, hasMergedBlob) // 💡
+        return CoreResult(resultPoints, hasMergedBlob) 
     }
 }
