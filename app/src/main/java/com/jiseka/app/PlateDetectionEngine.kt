@@ -153,9 +153,9 @@ object PlateDetectionEngine {
             return firstTry.points
         }
         
-        // 💡 1차 시도 실패 시 조건부 안전망 발동: 물리적 덩어리(A(Max))가 발견되었을 때만 2차 정밀 이진화 재시도
-        if (firstTry.hasMergedBlob) {
-            android.util.Log.d("JISEKA", "1차 OCR 실패 및 거대 덩어리 병합 감지 -> 파라미터 미세조정 2차 Threshold Fallback 시도")
+        // 💡 1차 시도 실패 시 조건부 안전망 발동: 물리적 덩어리(A(Max))가 발견되었거나 정답을 찾지 못했을 때
+        if (firstTry.hasMergedBlob || firstTry.points == null) {
+            android.util.Log.d("JISEKA", "1차 판단 보류(실패 또는 덩어리 병합) -> 파라미터 미세조정 2차 Threshold Fallback 시도")
             val secondTry = executeDetectionCore(fullBitmap, touchX, touchY, blockSize = 25, C = 9.0, attempt = 2, debugListener)
             return secondTry.points
         }
@@ -409,7 +409,7 @@ object PlateDetectionEngine {
         val step2Logs = mutableListOf<String>()
         step2Logs.add("[기준] AvgW:${String.format("%.1f", avgWidth)} / MedGap:${String.format("%.1f", medianGap)} / BaseMaxGap:${String.format("%.1f", maxGap)}")
         
-        var clusters = mutableListOf<MutableList<CharData>>()
+        val clusters = mutableListOf<MutableList<CharData>>()
         val allClustersForDebug = mutableListOf<List<CharData>>()
         var currentCluster = mutableListOf(sortedChars.first())
         
@@ -454,8 +454,56 @@ object PlateDetectionEngine {
         clusters.add(currentCluster)
         allClustersForDebug.add(currentCluster.toList())
 
-        var validChars = (clusters.maxByOrNull { it.size } ?: sortedChars).toMutableList()
-        if (validChars.size < 2) failReason = "원인 2: 군집 토막남 (최대 1개)"
+        // --- 💡 [수정된 로직: 군집 이중 필터링 (거리 & 크기)] ---
+        // 1단계: ROI 중심점 이탈 필터
+        val roiCenterX = looseRect.width / 2.0
+        val roiCenterY = looseRect.height / 2.0
+        val maxDistX = looseRect.width * 0.4
+        val maxDistY = looseRect.height * 0.4 
+
+        val centerFilteredClusters = mutableListOf<MutableList<CharData>>()
+
+        for (i in 0 until clusters.size) {
+            val cluster = clusters[i]
+            if (cluster.isEmpty()) continue
+
+            val avgX = cluster.map { it.center.x }.average()
+            val avgY = cluster.map { it.center.y }.average()
+            val distX = abs(avgX - roiCenterX)
+            val distY = abs(avgY - roiCenterY)
+
+            if (distX > maxDistX || distY > maxDistY) {
+                step2Logs.add(" -> [군집 탈락 G$i] 중심 이탈 (dX:${distX.toInt()}, dY:${distY.toInt()})")
+            } else {
+                centerFilteredClusters.add(cluster)
+            }
+        }
+
+        // 2단계: 군집 원소 개수(크기) 필터
+        var validChars = mutableListOf<CharData>()
+
+        if (centerFilteredClusters.isNotEmpty()) {
+            val maxClusterSize = centerFilteredClusters.maxOf { it.size }
+            val minRequiredSize = max(4, (maxClusterSize * 0.5).toInt())
+
+            val finalClusters = mutableListOf<MutableList<CharData>>()
+            
+            for (i in 0 until centerFilteredClusters.size) {
+                val cluster = centerFilteredClusters[i]
+                if (cluster.size < minRequiredSize) {
+                    step2Logs.add(" -> [군집 탈락] 크기 미달 (${cluster.size} < $minRequiredSize)")
+                } else {
+                    finalClusters.add(cluster)
+                }
+            }
+
+            validChars = (finalClusters.maxByOrNull { it.size } ?: mutableListOf()).toMutableList()
+        }
+
+        if (validChars.size < 2) {
+            failReason = "원인 2: 유효 군집 없음 (중심 이탈 또는 크기 미달)"
+        }
+        // --- 💡 수정된 로직 끝 ---
 
         debugListener?.let {
             val debugMat2 = looseMat.clone()
