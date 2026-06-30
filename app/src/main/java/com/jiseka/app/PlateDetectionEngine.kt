@@ -98,9 +98,9 @@ object PlateDetectionEngine {
                 paint.color = Color.parseColor("#55FF55")
             } else if (log.startsWith("[정보]") || log.startsWith("[기준]")) {
                 paint.color = Color.parseColor("#55FFFF") 
-            } else if (log.contains("FAIL") || log.contains("삭제") || log.contains("Yes") || log.contains("탈락")) {
+            } else if (log.contains("FAIL") || log.contains("삭제") || log.contains("Yes") || log.contains("탈락") || log.contains("불량")) {
                 paint.color = Color.parseColor("#FF5555") 
-            } else if (log.contains("No")) {
+            } else if (log.contains("No") || log.contains("조립")) {
                 paint.color = Color.parseColor("#55FF55")
             } else if (log.contains("[Fallback]")) {
                 paint.color = Color.parseColor("#FFA500") 
@@ -218,7 +218,6 @@ object PlateDetectionEngine {
             debugBmp0.recycle()
         }
 
-        // 2차 시도일 때는 테두리와 글자를 붙여버리는 Close(팽창) 연산을 과감히 축소
         if (attempt == 1) {
             val tempClose = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
             Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
@@ -407,7 +406,7 @@ object PlateDetectionEngine {
         sortedChars.addAll(rescueCandidates)
         sortedChars = sortedChars.sortedBy { it.center.x }.toMutableList()
 
-        // --- 💡 [새로운 로직: 한글 파편 (상하/좌우 분리) 강제 조립] ---
+        // --- 💡 [수정된 로직: 위치 무관, '비율'과 '긴 여백' 기반 완벽한 한글 파편 조립] ---
         var j = 0
         while (j < sortedChars.size - 1) {
             val curr = sortedChars[j]
@@ -424,11 +423,25 @@ object PlateDetectionEngine {
             val xGap = max(0, max(curr.rect.x, next.rect.x) - min(currRight, nextRight))
             val yGap = max(0, max(curr.rect.y, next.rect.y) - min(currBottom, nextBottom))
 
-            // 1. 상하 분리 ('도', '고' 등): X축이 겹치고 위아래 간격이 좁음
-            val isVerticalSplit = xOverlap > 0 && yGap < 20 && abs(curr.center.x - next.center.x) < 20.0
+            val currRatio = curr.height / max(curr.width, 1.0)
+            val nextRatio = next.height / max(next.width, 1.0)
+
+            // 💡 [핵심 조건: 뒤에 긴 여백이 있는가?]
+            val gapAfterNext = if (j + 2 < sortedChars.size) {
+                max(0.0, sortedChars[j + 2].rect.x.toDouble() - nextRight)
+            } else {
+                999.0 
+            }
             
-            // 2. 좌우 분리 ('가', '나' 등): Y축이 겹치고 좌우 간격이 좁음
-            val isHorizontalSplit = yOverlap > 0 && xGap < 15 && abs(curr.center.y - next.center.y) < 15.0
+            val hasLongSpaceAfter = gapAfterNext > max(xGap * 2.5, 15.0)
+
+            // 1. 상하 분리 ('도', '고')
+            val isVerticalSplit = xOverlap > 0 && yGap < 20 && abs(curr.center.x - next.center.x) < 20.0 &&
+                                  (currRatio < 1.0 || nextRatio < 1.0)
+            
+            // 2. 좌우 분리 ('가', '나') - 💡 여백 조건 추가로 숫자 '1' 융합 완벽 방어
+            val isHorizontalSplit = yOverlap > 0 && xGap < 15 && abs(curr.center.y - next.center.y) < 15.0 &&
+                                    (currRatio > 3.0 || nextRatio > 3.0) && hasLongSpaceAfter
 
             if (isVerticalSplit || isHorizontalSplit) {
                 val unionLeft = min(curr.rect.x, next.rect.x)
@@ -450,7 +463,7 @@ object PlateDetectionEngine {
                 j++
             }
         }
-        // --- 💡 [파편 강제 조립 로직 끝] ---
+        // --- 💡 [위치 무관 정밀 조립 로직 끝] ---
 
         val gaps = (1 until sortedChars.size).map { sortedChars[it].center.x - sortedChars[it - 1].center.x }
         val medianGap = if (gaps.isNotEmpty()) gaps.sorted()[gaps.size / 2] else 0.0
@@ -690,7 +703,6 @@ object PlateDetectionEngine {
 
         tempContours.forEach { it.release() }; tempHierarchy.release()
 
-        // 💡 파란색 KOR이 지워질 것을 대비해 최종 반환은 6개로 넉넉하게 설정
         if (failReason.isNotEmpty() || validChars.size < 6) { 
             thresh.release(); looseMat.release(); looseGray.release(); fullMat.release(); fullGray.release()
             return CoreResult(null, hasMergedBlob) 
