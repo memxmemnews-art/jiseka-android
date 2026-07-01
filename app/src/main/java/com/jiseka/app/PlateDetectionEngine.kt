@@ -100,7 +100,7 @@ object PlateDetectionEngine {
                 paint.color = Color.parseColor("#55FFFF") 
             } else if (log.contains("FAIL") || log.contains("삭제") || log.contains("Yes") || log.contains("탈락") || log.contains("불량")) {
                 paint.color = Color.parseColor("#FF5555") 
-            } else if (log.contains("No") || log.contains("조립")) {
+            } else if (log.contains("No") || log.contains("조립") || log.contains("부활")) {
                 paint.color = Color.parseColor("#55FF55")
             } else if (log.contains("[Fallback]")) {
                 paint.color = Color.parseColor("#FFA500") 
@@ -406,7 +406,35 @@ object PlateDetectionEngine {
         sortedChars.addAll(rescueCandidates)
         sortedChars = sortedChars.sortedBy { it.center.x }.toMutableList()
 
-        // --- 💡 [수정된 로직: 위치 무관, '비율'과 '긴 여백' 기반 완벽한 한글 파편 조립] ---
+        // --- [추가된 로직: 번호판 내부 '안전 지대(Safe Zone)' 기반 극단적 파편 사전 구출] ---
+        if (sortedChars.size >= 2) {
+            val safeMinX = sortedChars.first().center.x
+            val safeMaxX = sortedChars.last().center.x
+
+            val extremeRescuers = totalRejectedRects.filter { reject ->
+                val isInsideSafeZone = reject.center.x > safeMinX && reject.center.x < safeMaxX
+                
+                if (!isInsideSafeZone) return@filter false
+
+                sortedChars.any { validChar ->
+                    val xOverlap = min(reject.rect.x + reject.rect.width, validChar.rect.x + validChar.rect.width) - max(reject.rect.x, validChar.rect.x)
+                    val xMatch = xOverlap > min(reject.rect.width, validChar.rect.width) * 0.4
+                    
+                    val yGap = max(0, max(reject.rect.y, validChar.rect.y) - min(reject.rect.y + reject.rect.height, validChar.rect.y + validChar.rect.height))
+                    
+                    xMatch && yGap < 20 
+                }
+            }
+
+            if (extremeRescuers.isNotEmpty()) {
+                sortedChars.addAll(extremeRescuers)
+                sortedChars = sortedChars.sortedBy { it.center.x }.toMutableList()
+                step1Logs.add(" -> [사전 구출] 안전 지대 내 극단적 파편 ${extremeRescuers.size}개 부활 성공")
+            }
+        }
+        // -------------------------------------------------------------------------
+
+        // --- [수정된 로직: 위치 무관, '비율'과 '긴 여백' 기반 완벽한 한글 파편 조립] ---
         var j = 0
         while (j < sortedChars.size - 1) {
             val curr = sortedChars[j]
@@ -426,7 +454,6 @@ object PlateDetectionEngine {
             val currRatio = curr.height / max(curr.width, 1.0)
             val nextRatio = next.height / max(next.width, 1.0)
 
-            // 💡 [핵심 조건: 뒤에 긴 여백이 있는가?]
             val gapAfterNext = if (j + 2 < sortedChars.size) {
                 max(0.0, sortedChars[j + 2].rect.x.toDouble() - nextRight)
             } else {
@@ -435,11 +462,9 @@ object PlateDetectionEngine {
             
             val hasLongSpaceAfter = gapAfterNext > max(xGap * 2.5, 15.0)
 
-            // 1. 상하 분리 ('도', '고')
             val isVerticalSplit = xOverlap > 0 && yGap < 20 && abs(curr.center.x - next.center.x) < 20.0 &&
                                   (currRatio < 1.0 || nextRatio < 1.0)
             
-            // 2. 좌우 분리 ('가', '나') - 💡 여백 조건 추가로 숫자 '1' 융합 완벽 방어
             val isHorizontalSplit = yOverlap > 0 && xGap < 15 && abs(curr.center.y - next.center.y) < 15.0 &&
                                     (currRatio > 3.0 || nextRatio > 3.0) && hasLongSpaceAfter
 
@@ -463,7 +488,25 @@ object PlateDetectionEngine {
                 j++
             }
         }
-        // --- 💡 [위치 무관 정밀 조립 로직 끝] ---
+        // -------------------------------------------------------------------------
+
+        // --- [추가된 로직: 양 끝단 볼트/노이즈 제거 (Peeling)] ---
+        if (sortedChars.size > 2) {
+            val sortedH = sortedChars.map { it.height }.sorted()
+            val medianH = sortedH[sortedChars.size / 2]
+            val boltHeightLimit = medianH * 0.55
+            
+            while (sortedChars.isNotEmpty() && sortedChars.first().height < boltHeightLimit) {
+                val removed = sortedChars.removeAt(0)
+                step1Logs.add(" -> [볼트 제거] 좌측 끝 노이즈 삭제 (X:${removed.center.x.toInt()}, H:${removed.height.toInt()})")
+            }
+            
+            while (sortedChars.isNotEmpty() && sortedChars.last().height < boltHeightLimit) {
+                val removed = sortedChars.removeAt(sortedChars.size - 1)
+                step1Logs.add(" -> [볼트 제거] 우측 끝 노이즈 삭제 (X:${removed.center.x.toInt()}, H:${removed.height.toInt()})")
+            }
+        }
+        // -------------------------------------------------------------------------
 
         val gaps = (1 until sortedChars.size).map { sortedChars[it].center.x - sortedChars[it - 1].center.x }
         val medianGap = if (gaps.isNotEmpty()) gaps.sorted()[gaps.size / 2] else 0.0
@@ -520,7 +563,6 @@ object PlateDetectionEngine {
             allClustersForDebug.add(currentCluster.toList())
         }
 
-        // --- 💡 [군집 이중 필터링: 중심점 + 개별 솎아내기(Median 상/중/하) + 최소 7개] ---
         val roiCenterX = looseRect.width / 2.0
         val roiCenterY = looseRect.height / 2.0
         val maxDistX = looseRect.width * 0.4
@@ -595,7 +637,6 @@ object PlateDetectionEngine {
         if (validChars.size < 7) {
             failReason = "원인 2: 유효 군집 없음 (7개 이상 & 일직선 정렬 실패)"
         }
-        // --- 💡 수정된 로직 끝 ---
 
         debugListener?.let {
             val debugMat2 = looseMat.clone()
