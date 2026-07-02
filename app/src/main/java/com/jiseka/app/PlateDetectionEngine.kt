@@ -25,9 +25,27 @@ object PlateDetectionEngine {
 
     class CharData(val center: Point, val width: Double, val height: Double, val rect: Rect, var contrast: Double = 0.0, var density: Double = 0.0)
 
+    // 💡 [추가됨] 캐싱용 통계 데이터 클래스
+    private data class ClusterStats(
+        val medianHeight: Double,
+        val medianWidth: Double,
+        val sortedChars: List<CharData>
+    )
+
     // ==========================================================================================
-    // [공통 유틸리티] 디버그 UI 및 안전한 Rect 생성
+    // [공통 유틸리티]
     // ==========================================================================================
+    private fun calculateClusterStats(cluster: MutableList<CharData>): ClusterStats {
+        cluster.sortBy { it.rect.x }
+        val heights = cluster.map { it.height }.sorted()
+        val widths = cluster.map { it.width }.sorted()
+        return ClusterStats(
+            medianHeight = heights[heights.size / 2],
+            medianWidth = widths[widths.size / 2],
+            sortedChars = cluster.toList()
+        )
+    }
+
     private fun drawTextWithWrap(canvas: Canvas, text: String, x: Float, y: Float, paint: Paint, maxWidth: Float, lineHeight: Float): Float {
         var currentY = y
         val originalTextSize = paint.textSize
@@ -135,6 +153,14 @@ object PlateDetectionEngine {
         return Rect(safeX, safeY, safeW, safeH)
     }
 
+    private fun checkLineIntersection(mat: Mat, startRow: Int, endRow: Int, pixelThreshold: Double): Boolean {
+        val sub = mat.submat(startRow, endRow + 1, 0, mat.cols())
+        val whitePixels = Core.countNonZero(sub)
+        sub.release()
+        val thickness = endRow - startRow + 1
+        return whitePixels > (pixelThreshold * thickness)
+    }
+
     // ==========================================================================================
     // 메인 엔트리: 터치 지점부터 번호판 추적 시작
     // ==========================================================================================
@@ -149,17 +175,14 @@ object PlateDetectionEngine {
         Imgproc.cvtColor(fullMat, fullGray, Imgproc.COLOR_RGBA2GRAY)
         val screenRatio = fullMat.rows().toFloat() / fullMat.cols().toFloat()
 
-        // 1. 스마트 Probe 기반 초기 씨앗(Seed) 추출
-        val seedChars = extractSeedChars(fullMat, fullGray, touchX.toInt(), touchY.toInt(), debugListener)
+        val seedChars = extractSeedChars(fullMat, fullGray, touchX.toInt(), touchY.toInt(), debugListener, screenRatio)
         if (seedChars.isEmpty()) {
             fullMat.release(); fullGray.release()
             return null
         }
 
-        // 2. 진정한 문자 추적(Tracking) 기반 좌우 확장
         val collectedChars = expandAndCollect(seedChars, fullMat, fullGray, debugListener, screenRatio)
         
-        // 3. 글로벌 대청소, 최종 검증 및 와이어프레임 생성
         var resultPoints: List<ImmutablePoint>? = null
         if (collectedChars.size >= 4) { 
             resultPoints = buildWireframe(collectedChars, fullMat, debugListener, screenRatio)
@@ -170,10 +193,11 @@ object PlateDetectionEngine {
     }
 
     // ==========================================================================================
-    // [엔진 1] ExpansionEngine: 초기 씨앗 추출 (실시간 Probe 로직)
+    // [엔진 1] ExpansionEngine: 초기 씨앗 추출 (디버그 1/9, 2/9)
     // ==========================================================================================
     private fun extractSeedChars(
-        fullMat: Mat, fullGray: Mat, cx: Int, cy: Int, debugListener: DetectionDebugListener?
+        fullMat: Mat, fullGray: Mat, cx: Int, cy: Int, 
+        debugListener: DetectionDebugListener?, screenRatio: Float
     ): List<CharData> {
         
         var roiWidth = (fullMat.cols() * 0.05).toInt() 
@@ -185,6 +209,7 @@ object PlateDetectionEngine {
         val pad = (fullMat.cols() * 0.015).toInt() 
 
         var finalRect = getSafeRect(currentX, currentY, roiWidth, roiHeight, fullMat.cols(), fullMat.rows())
+        val initialRect = finalRect.clone()
 
         for (i in 0 until maxExpansions) {
             val roiGray = Mat()
@@ -205,9 +230,7 @@ object PlateDetectionEngine {
                 if (rect.area() < 40) continue 
 
                 val ratio = rect.height.toDouble() / max(rect.width.toDouble(), 1.0)
-                // 그릴/범퍼 실시간 감지 시 손절
-                val isBumperOrGrille = ratio < 0.2 || ratio > 6.0 || rect.width > (fullMat.cols() * 0.3)
-                if (isBumperOrGrille) continue 
+                if (ratio < 0.2 || ratio > 6.0 || rect.width > (fullMat.cols() * 0.3)) continue 
 
                 if (rect.x <= 2) touchesLeft = true
                 if (rect.x + rect.width >= finalRect.width - 2) touchesRight = true
@@ -228,16 +251,42 @@ object PlateDetectionEngine {
             finalRect = getSafeRect(currentX, currentY, roiWidth, roiHeight, fullMat.cols(), fullMat.rows())
         }
 
-        // 스마트 보정된 ROI에서 정식 스캔 (1차 7.0 -> 실패 시 2차 15.0)
-        var seeds = scanRegion(fullMat, fullGray, finalRect, 31, 7.0)
-        if (seeds.isEmpty()) {
-            seeds = scanRegion(fullMat, fullGray, finalRect, 19, 15.0)
+        // 💡 [디버그 1/9] Seed 탐색 ROI 확인
+        debugListener?.let {
+            val debugMat = fullMat.clone()
+            Imgproc.circle(debugMat, Point(cx.toDouble(), cy.toDouble()), 10, Scalar(0.0, 0.0, 255.0, 255.0), -1)
+            Imgproc.rectangle(debugMat, initialRect, Scalar(255.0, 255.0, 0.0, 255.0), 2)
+            Imgproc.rectangle(debugMat, finalRect, Scalar(0.0, 255.0, 0.0, 255.0), 5)
+            
+            val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(debugMat, debugBmp)
+            val hudBmp = addDebugHUD(debugBmp, "[1/9] 터치 인식 및 Seed ROI 확장", listOf("-> (노랑) 최초 설정 ROI", "-> (초록) 윤곽선 팽창 알고리즘 적용 후 최종 ROI", "[진단] 타겟 문자가 초록 박스 안에 온전히 들어왔는지 확인하세요."), screenRatio)
+            it.pauseAndShowStep("디버그 1/9: Seed ROI", hudBmp)
+            debugMat.release(); debugBmp.recycle()
         }
+
+        // 💡 단일 전처리 파이프라인으로 추출 
+        val params = listOf(Pair(31, 7.0), Pair(19, 15.0))
+        val seeds = scanRegion(fullMat, fullGray, finalRect, params)
+
+        // 💡 [디버그 2/9] Seed 추출 결과 확인
+        debugListener?.let {
+            val debugMat = fullMat.clone()
+            Imgproc.rectangle(debugMat, finalRect, Scalar(255.0, 255.0, 255.0, 100.0), 2)
+            seeds.forEach { char -> Imgproc.rectangle(debugMat, char.rect, Scalar(0.0, 255.0, 0.0, 255.0), 3) }
+            
+            val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(debugMat, debugBmp)
+            val hudBmp = addDebugHUD(debugBmp, "[2/9] 초기 Seed 문자 추출 완료", listOf("[진단] ${seeds.size}개의 초기 파편 획득", "-> 파편들이 문자의 형태를 잘 잡았는지 확인하세요."), screenRatio)
+            it.pauseAndShowStep("디버그 2/9: Seed 결과", hudBmp)
+            debugMat.release(); debugBmp.recycle()
+        }
+
         return seeds
     }
 
     // ==========================================================================================
-    // [엔진 2] ExpansionEngine: 진정한 '문자 추적(Tracking)' 기반 좌우 확장
+    // [엔진 2] ExpansionEngine: 방향별 확장 제어기 (디버그 7/9)
     // ==========================================================================================
     private fun expandAndCollect(
         seeds: List<CharData>, fullMat: Mat, fullGray: Mat, 
@@ -246,101 +295,13 @@ object PlateDetectionEngine {
         
         val currentCluster = seeds.toMutableList()
         val stepLogs = mutableListOf<String>()
-        stepLogs.add("[진단] 초기 Seed 확보 완료. 문자 꼬리물기(Tracking) 시작.")
+        stepLogs.add("[진단] 초기 Seed 확보 완료. 방향별 통합 확장 루프 기동.")
 
-        // --- 좌측 추적 ---
-        var expandLeft = true
-        var leftLoops = 0
-        while (expandLeft && leftLoops < 8) {
-            leftLoops++
-            currentCluster.sortBy { it.rect.x }
-            val leftMost = currentCluster.first()
-            
-            val medianH = currentCluster.map { it.height }.sorted()[currentCluster.size / 2]
-            val medianW = currentCluster.map { it.width }.sorted()[currentCluster.size / 2]
-            val medianCenterY = currentCluster.map { it.center.y }.sorted()[currentCluster.size / 2]
-            
-            // 왼쪽 문자에 완벽히 맞물리는 타이트한 탐색 상자 생성
-            val searchW = (medianW * 2.5).toInt() 
-            val searchH = (medianH * 1.3).toInt() 
-            val searchX = leftMost.rect.x - searchW
-            val searchY = (medianCenterY - searchH / 2.0).toInt()
-            val searchRect = getSafeRect(searchX, searchY, searchW, searchH, fullMat.cols(), fullMat.rows())
-            
-            if (searchRect.width < 10) break 
-
-            var newCandidates = scanRegion(fullMat, fullGray, searchRect, 31, 7.0)
-            if (newCandidates.isEmpty()) {
-                stepLogs.add(" -> [좌측 추적] 1차(C=7) 실패, 2차 Rescue(C=15) 가동")
-                newCandidates = scanRegion(fullMat, fullGray, searchRect, 19, 15.0)
-            }
-            
-            val sortedCandidates = newCandidates.sortedByDescending { it.rect.x }
-            var foundValid = false
-
-            for (candidate in sortedCandidates) {
-                if (currentCluster.any { abs(it.center.x - candidate.center.x) < it.width * 0.5 }) continue
-                if (isValidNextChar(candidate, currentCluster, stepLogs, "좌측")) {
-                    currentCluster.add(candidate)
-                    foundValid = true
-                    stepLogs.add(" -> [좌측 연결] X:${candidate.center.x.toInt()} 꼬리물기 성공")
-                } else {
-                    expandLeft = false 
-                    break
-                }
-            }
-            if (!foundValid) expandLeft = false 
-        }
-
-        // --- 우측 추적 ---
-        var expandRight = true
-        var rightLoops = 0
-        while (expandRight && rightLoops < 8) {
-            rightLoops++
-            currentCluster.sortBy { it.rect.x }
-            val rightMost = currentCluster.last()
-            
-            val medianH = currentCluster.map { it.height }.sorted()[currentCluster.size / 2]
-            val medianW = currentCluster.map { it.width }.sorted()[currentCluster.size / 2]
-            val medianCenterY = currentCluster.map { it.center.y }.sorted()[currentCluster.size / 2]
-            
-            // 오른쪽 문자에 완벽히 맞물리는 상자 생성
-            val searchW = (medianW * 2.5).toInt()
-            val searchH = (medianH * 1.3).toInt()
-            val searchX = rightMost.rect.x + rightMost.rect.width
-            val searchY = (medianCenterY - searchH / 2.0).toInt()
-            val searchRect = getSafeRect(searchX, searchY, searchW, searchH, fullMat.cols(), fullMat.rows())
-            
-            if (searchRect.width < 10) break 
-
-            var newCandidates = scanRegion(fullMat, fullGray, searchRect, 31, 7.0)
-            if (newCandidates.isEmpty()) {
-                stepLogs.add(" -> [우측 추적] 1차(C=7) 실패, 2차 Rescue(C=15) 가동")
-                newCandidates = scanRegion(fullMat, fullGray, searchRect, 19, 15.0)
-            }
-            
-            val sortedCandidates = newCandidates.sortedBy { it.rect.x }
-            var foundValid = false
-
-            for (candidate in sortedCandidates) {
-                if (currentCluster.any { abs(it.center.x - candidate.center.x) < it.width * 0.5 }) continue
-                if (isValidNextChar(candidate, currentCluster, stepLogs, "우측")) {
-                    currentCluster.add(candidate)
-                    foundValid = true
-                    stepLogs.add(" -> [우측 연결] X:${candidate.center.x.toInt()} 꼬리물기 성공")
-                } else {
-                    expandRight = false 
-                    break
-                }
-            }
-            if (!foundValid) expandRight = false 
-        }
+        expandOneDirection(currentCluster, fullMat, fullGray, true, stepLogs, debugListener, screenRatio)
+        expandOneDirection(currentCluster, fullMat, fullGray, false, stepLogs, debugListener, screenRatio)
 
         currentCluster.sortBy { it.rect.x }
         
-        // -------------------------------------------------------------------------
-        // 💡 [핵심 복원] 글로벌 대청소 (Top 3 기반 볼트/먼지 완벽 일괄 멸망)
-        // -------------------------------------------------------------------------
         if (currentCluster.size > 2) {
             val heightsDesc = currentCluster.map { it.height }.sortedDescending()
             val trueHeight = if (heightsDesc.size >= 3) heightsDesc[2] else heightsDesc.first()
@@ -355,176 +316,331 @@ object PlateDetectionEngine {
                     purgedCount++
                 }
             }
-            if (purgedCount > 0) stepLogs.add(" -> [글로벌 청소] 기준 미달 볼트/먼지 ${purgedCount}개 일괄 삭제")
+            if (purgedCount > 0) stepLogs.add(" -> [글로벌 청소] 기준 미달 노이즈 ${purgedCount}개 일괄 삭제")
         }
 
-        stepLogs.add("[진단] 최종 수집 완료: 총 ${currentCluster.size}개 문자 확보")
-
+        // 💡 [디버그 7/9] 글로벌 대청소 완료
         debugListener?.let {
             val debugMat = fullMat.clone()
-            for (c in currentCluster) { Imgproc.rectangle(debugMat, c.rect, Scalar(0.0, 255.0, 0.0, 255.0), 3) }
-            for (i in 0 until currentCluster.size - 1) {
-                Imgproc.line(debugMat, currentCluster[i].center, currentCluster[i+1].center, Scalar(0.0, 255.0, 255.0, 255.0), 2)
-            }
+            currentCluster.forEach { char -> Imgproc.rectangle(debugMat, char.rect, Scalar(0.0, 255.0, 255.0, 255.0), 3) }
+            
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
-            val hudBmp = addDebugHUD(debugBmp, "디버그 1/2: 추적(Tracking) 및 글로벌 청소 결과", stepLogs, screenRatio)
-            it.pauseAndShowStep("디버그 1/2: 추적 결과", hudBmp)
+            val hudBmp = addDebugHUD(debugBmp, "[7/9] 글로벌 대청소 (노이즈/볼트 제거)", stepLogs, screenRatio)
+            it.pauseAndShowStep("디버그 7/9: 클러스터 정돈", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
 
         return currentCluster
     }
 
-    // 4대 하드 스톱 방어선
-    private fun isValidNextChar(newChar: CharData, currentCluster: List<CharData>, logs: MutableList<String>, dir: String): Boolean {
+    // ==========================================================================================
+    // [단일 방향 탐색기] 캐싱 최적화 + 디버그 3, 4, 5, 6
+    // ==========================================================================================
+    private fun expandOneDirection(
+        currentCluster: MutableList<CharData>, fullMat: Mat, fullGray: Mat, 
+        isLeft: Boolean, stepLogs: MutableList<String>,
+        debugListener: DetectionDebugListener?, screenRatio: Float
+    ) {
+        var expand = true
+        var loops = 0
+        val dirStr = if (isLeft) "좌측" else "우측"
+        var isFirstRadarCast = true
+
+        // 💡 [최초 1회 캐싱]
+        var stats = calculateClusterStats(currentCluster)
+
+        while (expand && loops < 8) {
+            loops++
+            
+            val cachedCluster = stats.sortedChars
+            val medianH = stats.medianHeight
+            val medianW = stats.medianWidth
+            
+            val outerChar = if (isLeft) cachedCluster.first() else cachedCluster.last()
+            
+            var topSlope = 0.0; var centerSlope = 0.0; var bottomSlope = 0.0
+            if (cachedCluster.size >= 2) {
+                val innerChar = if (isLeft) cachedCluster[1] else cachedCluster[cachedCluster.size - 2]
+                val dx = outerChar.center.x - innerChar.center.x
+                if (abs(dx) > 1.0) {
+                    topSlope = (outerChar.rect.y - innerChar.rect.y) / dx
+                    centerSlope = (outerChar.center.y - innerChar.center.y) / dx
+                    bottomSlope = ((outerChar.rect.y + outerChar.rect.height) - (innerChar.rect.y + innerChar.rect.height)) / dx
+                }
+            }
+            
+            val searchW = (medianW * 2.5).toInt()
+            val searchX = if (isLeft) outerChar.rect.x - searchW else outerChar.rect.x + outerChar.rect.width
+            
+            val probeRect = getSafeRect(searchX, outerChar.rect.y, searchW, outerChar.rect.height, fullMat.cols(), fullMat.rows())
+            if (probeRect.width < 10) break
+
+            // 💡 [디버그 3/9 (좌) or 5/9 (우)] 최초 3선 레이더 투사 
+            if (isFirstRadarCast && probeRect.width >= 10) {
+                isFirstRadarCast = false
+                debugListener?.let {
+                    val debugMat = fullMat.clone()
+                    cachedCluster.forEach { c -> Imgproc.rectangle(debugMat, c.rect, Scalar(150.0, 150.0, 150.0, 255.0), 2) }
+                    Imgproc.rectangle(debugMat, probeRect, Scalar(255.0, 0.0, 255.0, 255.0), 3)
+                    
+                    val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+                    Utils.matToBitmap(debugMat, debugBmp)
+                    
+                    val stepNum = if (isLeft) "3" else "5"
+                    val hudBmp = addDebugHUD(debugBmp, "[$stepNum/9] $dirStr 3단 레이더 투사", listOf("-> (마젠타) 관통 레이더 박스 생성", "[진단] 문자가 있을 것으로 예상되는 곳에 박스가 투사되었는지 확인"), screenRatio)
+                    it.pauseAndShowStep("디버그 $stepNum/9: $dirStr 레이더", hudBmp)
+                    debugMat.release(); debugBmp.recycle()
+                }
+            }
+
+            // 첫 번째 이진화 (레이더용)
+            val probeMat = Mat()
+            fullGray.submat(probeRect).copyTo(probeMat)
+            Imgproc.adaptiveThreshold(probeMat, probeMat, 255.0, Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, Imgproc.THRESH_BINARY_INV, 19, 12.0)
+
+            var finalSearchY = outerChar.rect.y
+            var finalSearchH = outerChar.rect.height
+
+            if (probeMat.rows() >= 5) {
+                val occupancyThreshold = max(medianW * 0.20, 6.0)
+
+                val tRowStart = (probeMat.rows() * 0.10).toInt().coerceIn(0, probeMat.rows() - 1)
+                val tRowEnd = (probeMat.rows() * 0.20).toInt().coerceIn(tRowStart, probeMat.rows() - 1)
+                
+                val mRowStart = (probeMat.rows() * 0.45).toInt().coerceIn(0, probeMat.rows() - 1)
+                val mRowEnd = (probeMat.rows() * 0.55).toInt().coerceIn(mRowStart, probeMat.rows() - 1)
+                
+                val bRowStart = (probeMat.rows() * 0.80).toInt().coerceIn(0, probeMat.rows() - 1)
+                val bRowEnd = (probeMat.rows() * 0.90).toInt().coerceIn(bRowStart, probeMat.rows() - 1)
+
+                val topHit = checkLineIntersection(probeMat, tRowStart, tRowEnd, occupancyThreshold)
+                val midHit = checkLineIntersection(probeMat, mRowStart, mRowEnd, occupancyThreshold)
+                val botHit = checkLineIntersection(probeMat, bRowStart, bRowEnd, occupancyThreshold)
+
+                if (topHit && midHit && !botHit) {
+                    stepLogs.add(" -> [$dirStr 3선 레이더] 상단 O / 중앙 O / 하단 X ➔ 위로 상승 상자 배치")
+                    finalSearchY = outerChar.rect.y - (medianH * 0.5).toInt()
+                    finalSearchH = (medianH * 1.3).toInt()
+                } else if (!topHit && midHit && botHit) {
+                    stepLogs.add(" -> [$dirStr 3선 레이더] 상단 X / 중앙 O / 하단 O ➔ 아래로 하강 상자 배치")
+                    finalSearchY = outerChar.rect.y - (medianH * 0.1).toInt()
+                    finalSearchH = (medianH * 1.4).toInt()
+                } else {
+                    val pad = (medianH * 0.15).toInt()
+                    finalSearchY = outerChar.rect.y - pad
+                    finalSearchH = outerChar.rect.height + pad * 2
+                }
+            }
+            probeMat.release()
+
+            val searchRect = getSafeRect(searchX, finalSearchY, searchW, finalSearchH, fullMat.cols(), fullMat.rows())
+            
+            // 💡 단일 전처리 파이프라인으로 추출 
+            val params = listOf(Pair(31, 7.0), Pair(19, 15.0))
+            val newCandidates = scanRegion(fullMat, fullGray, searchRect, params)
+
+            val sortedCandidates = if (isLeft) newCandidates.sortedByDescending { it.rect.x } else newCandidates.sortedBy { it.rect.x }
+            var foundValid = false
+
+            for (candidate in sortedCandidates) {
+                if (cachedCluster.any { abs(it.center.x - candidate.center.x) < it.width * 0.5 }) continue
+                
+                if (isValidNextChar(candidate, cachedCluster, stepLogs, dirStr, centerSlope, topSlope, bottomSlope)) {
+                    currentCluster.add(candidate)
+                    stats = calculateClusterStats(currentCluster) // 💡 [상태 갱신] 추가 시 캐시 재계산
+                    foundValid = true
+                    stepLogs.add(" -> [$dirStr 연결] X:${candidate.center.x.toInt()} 문자 추가 성공")
+                    break
+                }
+            }
+            if (!foundValid) expand = false
+        }
+
+        // 💡 [디버그 4/9 (좌) or 6/9 (우)] 탐색 완료 결과
+        debugListener?.let {
+            val debugMat = fullMat.clone()
+            currentCluster.forEach { char -> Imgproc.rectangle(debugMat, char.rect, Scalar(255.0, 255.0, 0.0, 255.0), 3) }
+            
+            val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(debugMat, debugBmp)
+            
+            val stepNum = if (isLeft) "4" else "6"
+            val hudBmp = addDebugHUD(debugBmp, "[$stepNum/9] $dirStr 확장 루프 완료", stepLogs.takeLast(3), screenRatio)
+            it.pauseAndShowStep("디버그 $stepNum/9: $dirStr 완료", hudBmp)
+            debugMat.release(); debugBmp.recycle()
+        }
+    }
+
+    // ==========================================================================================
+    // [엔진 2-1] 4대 하드 스톱 방어선
+    // ==========================================================================================
+    private fun isValidNextChar(
+        newChar: CharData, currentCluster: List<CharData>, logs: MutableList<String>, dir: String,
+        centerSlope: Double, topSlope: Double, bottomSlope: Double
+    ): Boolean {
         if (currentCluster.isEmpty()) return true
         
-        val sortedTop = currentCluster.map { it.rect.y.toDouble() }.sorted()
-        val sortedBottom = currentCluster.map { (it.rect.y + it.rect.height).toDouble() }.sorted()
         val sortedArea = currentCluster.map { it.rect.area() }.sorted()
         val sortedHeight = currentCluster.map { it.height }.sorted()
-
-        val medianTop = sortedTop[currentCluster.size / 2]
-        val medianBottom = sortedBottom[currentCluster.size / 2]
         val medianArea = sortedArea[currentCluster.size / 2]
         val medianH = sortedHeight[currentCluster.size / 2]
 
-        val topDiff = abs(newChar.rect.y - medianTop)
-        val bottomDiff = abs((newChar.rect.y + newChar.rect.height) - medianBottom)
-        val isBoundsDeviated = topDiff > (medianH * 0.25) || bottomDiff > (medianH * 0.25)
+        val outerChar = if (dir == "좌측") currentCluster.first() else currentCluster.last()
+        val distToNext = newChar.center.x - outerChar.center.x
+
+        val expectedTopY = outerChar.rect.y + topSlope * distToNext
+        val expectedBottomY = (outerChar.rect.y + outerChar.rect.height) + bottomSlope * distToNext
+        val expectedCenterY = outerChar.center.y + centerSlope * distToNext
+
+        val topDeviation = abs(newChar.rect.y - expectedTopY)
+        val bottomDeviation = abs((newChar.rect.y + newChar.rect.height) - expectedBottomY)
+        val centerDeviation = abs(newChar.center.y - expectedCenterY)
+
+        val isBoundsDeviated = topDeviation > (medianH * 0.35) || bottomDeviation > (medianH * 0.35)
 
         if (newChar.rect.area() < medianArea * 0.35 && isBoundsDeviated) {
-            logs.add(" -> [$dir 중단] 볼트/먼지 차단 (X:${newChar.center.x.toInt()})")
+            logs.add(" -> [$dir 중단] 볼트/먼지 차단 (면적 급감 + 3단 궤도 이탈)")
             return false 
         }
         if (newChar.rect.area() > medianArea * 2.5 && isBoundsDeviated) {
-            logs.add(" -> [$dir 중단] 범퍼/프레임 융합 차단 (X:${newChar.center.x.toInt()})")
+            logs.add(" -> [$dir 중단] 범퍼/프레임 차단 (면적 급증 + 3단 궤도 이탈)")
             return false
         }
-        if (abs(newChar.center.y - (medianTop + medianBottom) / 2.0) > medianH * 0.5) {
-            logs.add(" -> [$dir 중단] Y축 궤도 완전 이탈 (X:${newChar.center.x.toInt()})")
+        if (centerDeviation > medianH * 0.6) {
+            logs.add(" -> [$dir 중단] 중심점 3단 궤도 완전 이탈")
             return false
         }
-        if (newChar.height < medianH * 0.65 || newChar.height > medianH * 1.35) {
-            logs.add(" -> [$dir 중단] 높이 급변 차단 (X:${newChar.center.x.toInt()})")
+        if (newChar.height < medianH * 0.50 || newChar.height > medianH * 1.50) {
+            logs.add(" -> [$dir 중단] 원근 오차를 넘는 높이 급변 차단")
             return false
         }
         return true
     }
 
     // ==========================================================================================
-    // [엔진 3] CharacterScanner: 로컬 파편 조립(Merge) 기능이 내장된 순수 문자 검출기
+    // [엔진 3] CharacterScanner: 단일 전처리 캐싱 구조 
     // ==========================================================================================
-    private fun scanRegion(fullMat: Mat, fullGray: Mat, roi: Rect, blockSize: Int, C: Double): List<CharData> {
+    private fun scanRegion(
+        fullMat: Mat, fullGray: Mat, roi: Rect, 
+        thresholdParams: List<Pair<Int, Double>> 
+    ): List<CharData> {
         val roiGray = Mat()
         fullGray.submat(roi).copyTo(roiGray)
-        val thresh = Mat()
         
+        // 💡 [블러 전처리 1회 수행 및 캐싱]
+        val blurred = Mat()
         Imgproc.medianBlur(roiGray, roiGray, 3)
-        Imgproc.GaussianBlur(roiGray, thresh, Size(5.0, 5.0), 0.0)
-        Imgproc.adaptiveThreshold(thresh, thresh, 255.0, Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, Imgproc.THRESH_BINARY_INV, blockSize, C)
+        Imgproc.GaussianBlur(roiGray, blurred, Size(5.0, 5.0), 0.0)
+        roiGray.release() 
 
-        val tempClose = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
-        Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
-        tempClose.release()
-        
-        val tempOpen = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
-        Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_OPEN, tempOpen)
-        tempOpen.release()
-        
-        val contours = ArrayList<MatOfPoint>()
-        val hierarchy = Mat()
-        Imgproc.findContours(thresh, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
-
-        val rawBlobs = mutableListOf<CharData>()
-        for (contour in contours) {
-            val localRect = Imgproc.boundingRect(contour)
-            if (localRect.area() < 30) continue
-            val ratio = localRect.height.toDouble() / max(localRect.width.toDouble(), 1.0)
-            
-            // 파편(Rescue)까지 모두 담기 위해 0.15~7.0의 광범위한 비율 허용
-            if (ratio in 0.15..7.0) {
-                val globalRect = Rect(localRect.x + roi.x, localRect.y + roi.y, localRect.width, localRect.height)
-                val globalCenter = Point(globalRect.x + globalRect.width / 2.0, globalRect.y + globalRect.height / 2.0)
-                rawBlobs.add(CharData(globalCenter, globalRect.width.toDouble(), globalRect.height.toDouble(), globalRect))
-            }
-        }
-        
-        // -------------------------------------------------------------------------
-        // 💡 [핵심 복원] 로컬 파편 조립 ('로'의 상하/좌우 분리 완벽 복구)
-        // -------------------------------------------------------------------------
-        rawBlobs.sortBy { it.center.x }
-        var j = 0
-        while (j < rawBlobs.size - 1) {
-            val curr = rawBlobs[j]
-            val next = rawBlobs[j + 1]
-
-            val currRight = curr.rect.x + curr.rect.width
-            val currBottom = curr.rect.y + curr.rect.height
-            val nextRight = next.rect.x + next.rect.width
-            val nextBottom = next.rect.y + next.rect.height
-
-            val xOverlap = min(currRight, nextRight) - max(curr.rect.x, next.rect.x)
-            val yOverlap = min(currBottom, nextBottom) - max(curr.rect.y, next.rect.y)
-            val xGap = max(0.0, max(curr.rect.x, next.rect.x) - min(currRight, nextRight).toDouble())
-            val yGap = max(0.0, max(curr.rect.y, next.rect.y) - min(currBottom, nextBottom).toDouble())
-
-            val currRatio = curr.height / max(curr.width, 1.0)
-            val nextRatio = next.height / max(next.width, 1.0)
-
-            // 수직 병합 (비율 기반)
-            val isVerticalSplit = xOverlap > min(curr.width, next.width) * 0.3 && 
-                                  yGap < (curr.height * 0.45) &&
-                                  (currRatio < 1.0 || nextRatio < 1.0 || currRatio > 1.2)
-            
-            // 수평 병합
-            val isHorizontalSplit = yOverlap > 0 && xGap < 15 && abs(curr.center.y - next.center.y) < 15.0 &&
-                                    (currRatio > 3.0 || nextRatio > 3.0)
-
-            if (isVerticalSplit || isHorizontalSplit) {
-                val unionLeft = min(curr.rect.x, next.rect.x)
-                val unionTop = min(curr.rect.y, next.rect.y)
-                val unionRight = max(currRight, nextRight)
-                val unionBottom = max(currBottom, nextBottom)
-                val unionRect = Rect(unionLeft, unionTop, unionRight - unionLeft, unionBottom - unionTop)
-                val unionCenter = Point(unionRect.x + unionRect.width / 2.0, unionRect.y + unionRect.height / 2.0)
-                
-                rawBlobs.removeAt(j + 1)
-                rawBlobs.removeAt(j)
-                rawBlobs.add(j, CharData(unionCenter, unionRect.width.toDouble(), unionRect.height.toDouble(), unionRect))
-            } else {
-                j++
-            }
-        }
-
-        // 조립된 최종 문자들 중 밀도/정상비율을 만족하는 것만 선별
         val finalCandidates = mutableListOf<CharData>()
-        for (blob in rawBlobs) {
-            val ratio = blob.height / max(blob.width, 1.0)
-            if (ratio in 0.25..5.5 && blob.height >= 12) {
-                // 원본 좌표계 기준 Local Rect 생성
-                val localRect = Rect(blob.rect.x - roi.x, blob.rect.y - roi.y, blob.width.toInt(), blob.height.toInt())
-                val roiThresh = thresh.submat(localRect)
-                val whitePixelCount = Core.countNonZero(roiThresh)
-                val density = whitePixelCount.toDouble() / blob.rect.area()
-                roiThresh.release()
+
+        for ((blockSize, cValue) in thresholdParams) {
+            val thresh = Mat()
+            
+            // 캐싱된 blurred 이미지로 이진화만 재시도
+            Imgproc.adaptiveThreshold(blurred, thresh, 255.0, Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, Imgproc.THRESH_BINARY_INV, blockSize, cValue)
+
+            val tempClose = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
+            Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
+            tempClose.release()
+            
+            val tempOpen = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
+            Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_OPEN, tempOpen)
+            tempOpen.release()
+            
+            val contours = ArrayList<MatOfPoint>()
+            val hierarchy = Mat()
+            Imgproc.findContours(thresh, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+
+            val rawBlobs = mutableListOf<CharData>()
+            for (contour in contours) {
+                val localRect = Imgproc.boundingRect(contour)
+                if (localRect.area() < 30) continue
+                val ratio = localRect.height.toDouble() / max(localRect.width.toDouble(), 1.0)
                 
-                if (density in 0.12..0.85) {
-                    blob.density = density
-                    finalCandidates.add(blob)
+                if (ratio in 0.15..7.0) {
+                    val globalRect = Rect(localRect.x + roi.x, localRect.y + roi.y, localRect.width, localRect.height)
+                    val globalCenter = Point(globalRect.x + globalRect.width / 2.0, globalRect.y + globalRect.height / 2.0)
+                    rawBlobs.add(CharData(globalCenter, globalRect.width.toDouble(), globalRect.height.toDouble(), globalRect))
                 }
             }
+            
+            rawBlobs.sortBy { it.center.x }
+            var j = 0
+            while (j < rawBlobs.size - 1) {
+                val curr = rawBlobs[j]
+                val next = rawBlobs[j + 1]
+
+                val currRight = curr.rect.x + curr.rect.width
+                val currBottom = curr.rect.y + curr.rect.height
+                val nextRight = next.rect.x + next.rect.width
+                val nextBottom = next.rect.y + next.rect.height
+
+                val xOverlap = min(currRight, nextRight) - max(curr.rect.x, next.rect.x)
+                val yOverlap = min(currBottom, nextBottom) - max(curr.rect.y, next.rect.y)
+                val xGap = max(0.0, max(curr.rect.x, next.rect.x) - min(currRight, nextRight).toDouble())
+                val yGap = max(0.0, max(curr.rect.y, next.rect.y) - min(currBottom, nextBottom).toDouble())
+
+                val currRatio = curr.height / max(curr.width, 1.0)
+                val nextRatio = next.height / max(next.width, 1.0)
+
+                val isVerticalSplit = xOverlap > min(curr.width, next.width) * 0.3 && 
+                                      yGap < (curr.height * 0.45) &&
+                                      (currRatio < 1.0 || nextRatio < 1.0 || currRatio > 1.2)
+                
+                val isHorizontalSplit = yOverlap > 0 && xGap < 15 && abs(curr.center.y - next.center.y) < 15.0 &&
+                                        (currRatio > 3.0 || nextRatio > 3.0)
+
+                if (isVerticalSplit || isHorizontalSplit) {
+                    val unionLeft = min(curr.rect.x, next.rect.x)
+                    val unionTop = min(curr.rect.y, next.rect.y)
+                    val unionRight = max(currRight, nextRight)
+                    val unionBottom = max(currBottom, nextBottom)
+                    val unionRect = Rect(unionLeft, unionTop, unionRight - unionLeft, unionBottom - unionTop)
+                    val unionCenter = Point(unionRect.x + unionRect.width / 2.0, unionRect.y + unionRect.height / 2.0)
+                    
+                    rawBlobs.removeAt(j + 1)
+                    rawBlobs.removeAt(j)
+                    rawBlobs.add(j, CharData(unionCenter, unionRect.width.toDouble(), unionRect.height.toDouble(), unionRect))
+                } else {
+                    j++
+                }
+            }
+
+            for (blob in rawBlobs) {
+                val ratio = blob.height / max(blob.width, 1.0)
+                if (ratio in 0.25..5.5 && blob.height >= 12) {
+                    val localRect = Rect(blob.rect.x - roi.x, blob.rect.y - roi.y, blob.width.toInt(), blob.height.toInt())
+                    val roiThresh = thresh.submat(localRect)
+                    val whitePixelCount = Core.countNonZero(roiThresh)
+                    val density = whitePixelCount.toDouble() / blob.rect.area()
+                    roiThresh.release()
+                    
+                    if (density in 0.12..0.85) {
+                        blob.density = density
+                        finalCandidates.add(blob)
+                    }
+                }
+            }
+            
+            hierarchy.release()
+            contours.forEach { it.release() }
+            thresh.release()
+            
+            // 💡 후보를 찾았다면 루프 즉시 탈출 (불필요한 2차 시도 방지)
+            if (finalCandidates.isNotEmpty()) {
+                break
+            }
         }
         
-        roiGray.release(); thresh.release(); hierarchy.release()
-        contours.forEach { it.release() }
-        
+        blurred.release()
         return finalCandidates
     }
 
     // ==========================================================================================
-    // [엔진 4] GeometryBuilder: 최종 검증 및 와이어프레임 계산
+    // [엔진 4] GeometryBuilder: 최종 검증 및 와이어프레임 계산 (디버그 8/9, 9/9)
     // ==========================================================================================
     private fun buildWireframe(
         collectedChars: List<CharData>, fullMat: Mat, 
@@ -536,9 +652,6 @@ object PlateDetectionEngine {
 
         var validChars = collectedChars.toMutableList()
 
-        // -------------------------------------------------------------------------
-        // 🚨 [복원] KOR (파란색 태극 마크) 인식 및 제거
-        // -------------------------------------------------------------------------
         if (validChars.isNotEmpty()) {
             val firstChar = validChars.first() 
             val roiMat = fullMat.submat(firstChar.rect)
@@ -553,9 +666,6 @@ object PlateDetectionEngine {
             }
         }
 
-        // -------------------------------------------------------------------------
-        // 🚨 [복원] fitLine 기반 Y축/기울기 궤도 정밀 아웃라이어 제거
-        // -------------------------------------------------------------------------
         if (validChars.size >= 4) {
             val pointsMatTemp = MatOfPoint2f(*validChars.map { it.center }.toTypedArray())
             val lineTemp = Mat()
@@ -582,6 +692,24 @@ object PlateDetectionEngine {
                     removedCount++
                 }
             }
+        }
+
+        // 💡 [디버그 8/9] 선형 궤도 및 KOR 마크 검증 완료
+        debugListener?.let {
+            val debugMat = fullMat.clone()
+            validChars.forEach { char -> 
+                Imgproc.rectangle(debugMat, char.rect, Scalar(255.0, 100.0, 100.0, 255.0), 3) 
+                Imgproc.circle(debugMat, char.center, 5, Scalar(0.0, 255.0, 0.0, 255.0), -1)
+            }
+            if (validChars.size >= 2) {
+                Imgproc.line(debugMat, validChars.first().center, validChars.last().center, Scalar(0.0, 255.0, 255.0, 255.0), 2)
+            }
+            
+            val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(debugMat, debugBmp)
+            val hudBmp = addDebugHUD(debugBmp, "[8/9] 선형 궤도 검증 & KOR 마크 삭제", stepLogs, screenRatio)
+            it.pauseAndShowStep("디버그 8/9: 최종 궤도 검증", hudBmp)
+            debugMat.release(); debugBmp.recycle()
         }
 
         if (validChars.size < 4) {
@@ -680,6 +808,7 @@ object PlateDetectionEngine {
 
         stepLogs.add("[성공] 대칭 팽창(Scale: 1.35) 적용 완료")
 
+        // 💡 [디버그 9/9] 최종 와이어프레임 적용
         debugListener?.let {
             val debugMat = fullMat.clone()
             val colors = arrayOf(Scalar(255.0, 0.0, 0.0, 255.0), Scalar(0.0, 255.0, 0.0, 255.0), 
@@ -695,8 +824,8 @@ object PlateDetectionEngine {
 
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
-            val hudBmp = addDebugHUD(debugBmp, "디버그 2/2: 최종 와이어프레임 확정", stepLogs, screenRatio)
-            it.pauseAndShowStep("디버그 2/2: 최종 와이어프레임", hudBmp)
+            val hudBmp = addDebugHUD(debugBmp, "[9/9] 디버깅 완료: 최종 와이어프레임 기하학 도출", listOf("-> (초록 테두리) 1.35배 대칭 팽창된 최종 번호판 영역", "[진단] 이 영역이 PerspectiveTransform 을 통해 최종 크롭될 영역입니다."), screenRatio)
+            it.pauseAndShowStep("디버그 9/9: 최종 렌더링", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
 
