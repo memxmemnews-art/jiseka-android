@@ -35,6 +35,9 @@ import androidx.camera.view.PreviewView
 import androidx.camera.view.TransformExperimental
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
 import org.opencv.core.Core
@@ -68,7 +71,6 @@ class MainActivity : AppCompatActivity() {
     private var progressBar: ProgressBar? = null
     private var guideText: TextView? = null
 
-    // 🛠️ [디버그 전용] 스레드 제어 및 임시 UI 버튼
     private var debugLatch: CountDownLatch? = null
     private var btnDebugNext: Button? = null
 
@@ -131,7 +133,7 @@ class MainActivity : AppCompatActivity() {
         precomputeExecutor = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(1), ThreadPoolExecutor.DiscardOldestPolicy())
         maskExecutor = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(1), ThreadPoolExecutor.AbortPolicy())
 
-        setupDebugUI() // 🛠️ 디버그 버튼 초기화
+        setupDebugUI() 
         setupUIListeners()
         setupOrientationListener()
         resetToLiveMode()
@@ -140,7 +142,6 @@ class MainActivity : AppCompatActivity() {
         else ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
     }
 
-    // 🛠️ [디버그 전용] 동적으로 하단에 임시 버튼 추가
     private fun setupDebugUI() {
         btnDebugNext = Button(this).apply {
             text = "다음 단계 확인 ⏭️"
@@ -172,7 +173,6 @@ class MainActivity : AppCompatActivity() {
             }
             rawBitmap.recycle()
         } else {
-            Toast.makeText(this, "경고: 텍스처를 찾을 수 없어 기본 색상으로 대체됩니다.", Toast.LENGTH_LONG).show()
             cachedTextureMat = Mat(100, 300, CvType.CV_8UC3, Scalar(70.0, 70.0, 70.0))
         }
     }
@@ -185,6 +185,7 @@ class MainActivity : AppCompatActivity() {
             ?: Toast.makeText(this, "저장할 이미지가 없습니다.", Toast.LENGTH_SHORT).show()
         }
 
+        // 💡 [핵심] 터치 기반 -> ROI Crop -> ML Kit -> OpenCV 단일 파이프라인
         nativeGuideView?.onTouchPointListener = touchDrop@{ uiPoint ->
             if (!isMatrixReady) return@touchDrop
 
@@ -202,44 +203,72 @@ class MainActivity : AppCompatActivity() {
                     val touchCoords = FloatArray(2).apply { this[0] = uiPoint.x; this[1] = uiPoint.y }
                     inverseMatrix.mapPoints(touchCoords)
 
-                    val debugInterceptor = object : PlateDetectionEngine.DetectionDebugListener {
-                        override fun pauseAndShowStep(stageName: String, bitmap: Bitmap) {
-                            debugLatch = CountDownLatch(1)
-                            
-                            runOnUiThread {
-                                if (isFinishing || isDestroyed) return@runOnUiThread
-                                Toast.makeText(this@MainActivity, stageName, Toast.LENGTH_SHORT).show()
-                                nativeBackgroundView?.setImageBitmap(bitmap)
-                                btnDebugNext?.visibility = View.VISIBLE 
-                                progressBar?.visibility = View.GONE 
-                            }
-                            
-                            debugLatch?.await() 
-                            
-                            runOnUiThread { 
-                                btnDebugNext?.visibility = View.GONE 
-                                progressBar?.visibility = View.VISIBLE 
-                            }
-                        }
-                    }
+                    val debugInterceptor = createDebugInterceptor()
 
-                    val targetPolygon = PlateDetectionEngine.rescuePlateFromPoint(
-                        safeBitmap, 
-                        touchCoords[0], touchCoords[1], 
-                        debugListener = debugInterceptor
+                    // Step 1: 터치 영역 주변의 좁은 ROI 영역만 Crop
+                    val seedCropResult = PlateDetectionEngine.prepareSeedCrop(
+                        safeBitmap, touchCoords[0], touchCoords[1], debugInterceptor
                     )
-                    safeBitmap.recycle()
 
-                    runOnUiThread {
-                        if (isFinishing || isDestroyed || captureSessionId.get() != currentSession) return@runOnUiThread
-                        
-                        if (targetPolygon != null && targetPolygon.isNotEmpty()) {
-                            triggerInstantMasking(targetPolygon)
-                        } else {
-                            progressBar?.visibility = View.GONE
-                            nativeGuideView?.visibility = View.VISIBLE
-                            Toast.makeText(this@MainActivity, "번호판 추적 최종 실패.", Toast.LENGTH_LONG).show()
-                        }
+                    if (seedCropResult != null) {
+                        // Step 2: 잘라낸 이미지만 ML Kit에 전달하여 속도 최적화
+                        val recognizer = TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
+                        val image = InputImage.fromBitmap(seedCropResult.croppedBitmap, 0)
+
+                        recognizer.process(image)
+                            .addOnSuccessListener { visionText ->
+                                val plateRegex = Regex("\\d{2,3}[가-힣]\\s?\\d{4}")
+                                var targetBox: android.graphics.Rect? = null
+
+                                for (block in visionText.textBlocks) {
+                                    if (plateRegex.containsMatchIn(block.text)) {
+                                        targetBox = block.boundingBox
+                                        break
+                                    }
+                                }
+
+                                if (targetBox != null) {
+                                    // Step 3: ML Kit 결과를 바탕으로 다시 OpenCV 엔진에서 최종 조립 (비동기 콜백 안에서 다시 워커스레드 할당)
+                                    precomputeExecutor.execute {
+                                        if (captureSessionId.get() != currentSession) {
+                                            safeBitmap.recycle()
+                                            return@execute
+                                        }
+
+                                        val targetPolygon = PlateDetectionEngine.processWithMLKitResult(
+                                            safeBitmap,
+                                            seedCropResult.offsetX,
+                                            seedCropResult.offsetY,
+                                            targetBox,
+                                            debugInterceptor
+                                        )
+
+                                        runOnUiThread {
+                                            if (isFinishing || isDestroyed || captureSessionId.get() != currentSession) {
+                                                safeBitmap.recycle()
+                                                return@runOnUiThread
+                                            }
+
+                                            if (targetPolygon != null && targetPolygon.isNotEmpty()) {
+                                                triggerInstantMasking(targetPolygon)
+                                            } else {
+                                                fallbackToManualMode(currentSession, "번호판 세부 조립에 실패했습니다.")
+                                            }
+                                            safeBitmap.recycle() // 파이프라인 최종 완료 후 메모리 해제
+                                        }
+                                    }
+                                } else {
+                                    safeBitmap.recycle()
+                                    fallbackToManualMode(currentSession, "해당 영역에서 텍스트를 찾지 못했습니다.")
+                                }
+                            }
+                            .addOnFailureListener {
+                                safeBitmap.recycle()
+                                fallbackToManualMode(currentSession, "ML Kit 인식 오류가 발생했습니다.")
+                            }
+                    } else {
+                        safeBitmap.recycle()
+                        fallbackToManualMode(currentSession, "ROI 영역 추출에 실패했습니다.")
                     }
                 } else {
                     runOnUiThread { progressBar?.visibility = View.GONE }
@@ -362,7 +391,6 @@ class MainActivity : AppCompatActivity() {
             imageCapture?.takePicture(cameraExecutor, object : ImageCapture.OnImageCapturedCallback() {
                 override fun onCaptureSuccess(imageProxy: ImageProxy) {
                     try {
-                        // 🌟 수정됨: 가로로 눕는 현상을 막기 위해 EXIF 회전값을 직접 읽어 비트맵에 적용
                         val rawBitmap = imageProxy.toBitmap()
                         val rotationDegrees = imageProxy.imageInfo.rotationDegrees.toFloat()
                         val matrix = Matrix().apply { postRotate(rotationDegrees) }
@@ -379,6 +407,7 @@ class MainActivity : AppCompatActivity() {
                             nativeBackgroundView?.setImageBitmap(uprightBitmap)
                             nativeBackgroundView?.visibility = View.VISIBLE
   
+                            // 💡 촬영 후 바로 가이드 텍스트와 터치 대기 상태로 전환 (자동 인식 제거)
                             progressBar?.visibility = View.GONE 
                             setupMatrixAndPrecalculate(currentSessionId)
                         }
@@ -404,6 +433,38 @@ class MainActivity : AppCompatActivity() {
             Log.e("CAMERA_DEBUG", "takePicture call threw an exception", e)
             resetToLiveMode()
             Toast.makeText(this, "카메라 모듈 오류로 촬영할 수 없습니다.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun fallbackToManualMode(sessionId: Int, message: String) {
+        runOnUiThread {
+            if (captureSessionId.get() != sessionId) return@runOnUiThread
+            progressBar?.visibility = View.GONE
+            nativeGuideView?.visibility = View.VISIBLE
+            Toast.makeText(this@MainActivity, message, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun createDebugInterceptor(): PlateDetectionEngine.DetectionDebugListener {
+        return object : PlateDetectionEngine.DetectionDebugListener {
+            override fun pauseAndShowStep(stageName: String, debugBitmap: Bitmap) {
+                debugLatch = CountDownLatch(1)
+                
+                runOnUiThread {
+                    if (isFinishing || isDestroyed) return@runOnUiThread
+                    Toast.makeText(this@MainActivity, stageName, Toast.LENGTH_SHORT).show()
+                    nativeBackgroundView?.setImageBitmap(debugBitmap)
+                    btnDebugNext?.visibility = View.VISIBLE 
+                    progressBar?.visibility = View.GONE 
+                }
+                
+                debugLatch?.await() 
+                
+                runOnUiThread { 
+                    btnDebugNext?.visibility = View.GONE 
+                    progressBar?.visibility = View.VISIBLE 
+                }
+            }
         }
     }
 
@@ -490,7 +551,7 @@ class MainActivity : AppCompatActivity() {
                             val oldBitmap = displayedBitmap
                             nativeBackgroundView?.setImageBitmap(resultBitmap)
                             displayedBitmap = resultBitmap
-           
+            
                             oldBitmap?.let { bmp -> 
                                 uiHandler.postDelayed({ 
                                     if (!bmp.isRecycled) bmp.recycle() 
@@ -543,7 +604,6 @@ class MainActivity : AppCompatActivity() {
         try {
             val pts = corners.map { Point(it.x.toDouble(), it.y.toDouble()) }
 
-            // 1. 부드러운 경계를 위한 알파 마스크 (Feathering) 생성
             maskMat = Mat.zeros(mat.size(), CvType.CV_8UC1)
             contour = org.opencv.core.MatOfPoint(*pts.toTypedArray())
             Imgproc.fillPoly(maskMat, listOf(contour), Scalar(255.0))
@@ -554,7 +614,6 @@ class MainActivity : AppCompatActivity() {
             alphaMat = Mat()
             blurredMask.convertTo(alphaMat, CvType.CV_32F, 1.0 / 255.0)
 
-            // 2. 입력 텍스처와 원본 이미지 채널 맞추기
             preparedTexture = Mat()
             if (textureInput.channels() != mat.channels()) {
                 if (mat.channels() == 3 && textureInput.channels() == 4) {
@@ -566,7 +625,6 @@ class MainActivity : AppCompatActivity() {
                 textureInput.copyTo(preparedTexture)
             }
 
-            // 3. 단순 4점 투시 변환 (Perspective Transform)
             warpedTexture = Mat.zeros(mat.size(), mat.type())
             val srcPts = MatOfPoint2f(
                 Point(0.0, 0.0),
@@ -584,7 +642,6 @@ class MainActivity : AppCompatActivity() {
             dstPts.release()
             perspectiveMat.release()
 
-            // 4. 알파 블렌딩 (가림막을 원본 이미지 위에 자연스럽게 합성)
             val matChannels = ArrayList<Mat>()
             val textureChannels = ArrayList<Mat>()
             Core.split(mat, matChannels)
@@ -599,15 +656,15 @@ class MainActivity : AppCompatActivity() {
                     textureChannels[i].convertTo(ccF, CvType.CV_32F)
 
                     blendedF = Mat()
-                    Core.multiply(ccF, alphaMat, ccF) // 텍스처 부분
+                    Core.multiply(ccF, alphaMat, ccF) 
          
                     invAlpha = Mat()
                     scalarMat = Mat(alphaMat.size(), alphaMat.type(), Scalar(1.0))
 
-                    Core.subtract(scalarMat, alphaMat, invAlpha) // 반전된 알파
-                    Core.multiply(mcF, invAlpha, mcF) // 원본 부분
+                    Core.subtract(scalarMat, alphaMat, invAlpha) 
+                    Core.multiply(mcF, invAlpha, mcF) 
 
-                    Core.add(ccF, mcF, blendedF) // 합성
+                    Core.add(ccF, mcF, blendedF) 
                     blendedF.convertTo(matChannels[i], CvType.CV_8U)
                 } finally {
                     mcF?.release(); ccF?.release(); blendedF?.release()
@@ -658,7 +715,7 @@ class MainActivity : AppCompatActivity() {
         orientationEventListener?.disable()
         uiHandler.removeCallbacksAndMessages(null)
         
-        debugLatch?.countDown() // 🛠️ 스레드 해방
+        debugLatch?.countDown() 
 
         synchronized(bitmapLock) { 
              lastCapturedBitmap?.recycle()
