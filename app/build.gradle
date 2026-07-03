@@ -53,10 +53,10 @@ dependencies {
     implementation "androidx.camera:camera-lifecycle:$camerax_version"
     implementation "androidx.camera:camera-view:$camerax_version"
 
-    // 💡 구글 ML Kit (한국어 모델 대신 가볍고 빠른 숫자/영문 기본 모델 적용)
-    implementation 'com.google.mlkit:text-recognition:16.0.0'
+    // 💡 구글 ML Kit (번호판의 한글 문자 '가~힣' 인식을 위해 반드시 Korean 모델 사용)
+    implementation 'com.google.mlkit:text-recognition-korean:16.0.0'
 
-    // 💡 OpenCV (사장님의 기존 외부 라이브러리 참조 방식 복구 완료)
+    // 💡 OpenCV (기존 외부 라이브러리 참조 방식 유지)
     implementation 'com.quickbirdstudios:opencv:4.5.3.0'
     
     // 테스트 라이브러리
