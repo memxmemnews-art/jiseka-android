@@ -94,6 +94,9 @@ class MainActivity : AppCompatActivity() {
     private val viewMatrix = Matrix()
     private val inverseMatrix = Matrix()
     private var isMatrixReady = false
+    
+    // 💡 확대 모드 상태 변수
+    private var isZoomed = false
 
     private val uiHandler = android.os.Handler(Looper.getMainLooper())
     private val hideGuideTextRunnable = Runnable {
@@ -185,10 +188,31 @@ class MainActivity : AppCompatActivity() {
             ?: Toast.makeText(this, "저장할 이미지가 없습니다.", Toast.LENGTH_SHORT).show()
         }
 
-        // 💡 [핵심] 터치 기반 -> ROI Crop -> ML Kit -> OpenCV 단일 파이프라인
         nativeGuideView?.onTouchPointListener = touchDrop@{ uiPoint ->
             if (!isMatrixReady) return@touchDrop
 
+            // 💡 1단계: 줌인 모드
+            if (!isZoomed) {
+                isZoomed = true
+                nativeBackgroundView?.pivotX = uiPoint.x
+                nativeBackgroundView?.pivotY = uiPoint.y
+                nativeBackgroundView?.animate()
+                    ?.scaleX(3f)
+                    ?.scaleY(3f)
+                    ?.setDuration(300)
+                    ?.withEndAction {
+                        // 💡 줌인 후 유도 텍스트
+                        guideText?.text = "번호판 글자를 터치해주세요"
+                        guideText?.alpha = 1f
+                        guideText?.visibility = View.VISIBLE
+                        uiHandler.removeCallbacks(hideGuideTextRunnable)
+                        uiHandler.postDelayed(hideGuideTextRunnable, 3500)
+                    }
+                    ?.start()
+                return@touchDrop 
+            }
+
+            // 💡 2단계: 텍스트 인식 모드 
             val currentSession = captureSessionId.get()
             progressBar?.visibility = View.VISIBLE
             nativeGuideView?.visibility = View.GONE
@@ -200,82 +224,157 @@ class MainActivity : AppCompatActivity() {
                 val safeBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) }
        
                 if (safeBitmap != null) {
-                    val touchCoords = FloatArray(2).apply { this[0] = uiPoint.x; this[1] = uiPoint.y }
-                    inverseMatrix.mapPoints(touchCoords)
+                    val pX = nativeBackgroundView?.pivotX ?: 0f
+                    val pY = nativeBackgroundView?.pivotY ?: 0f
+                    val currentScale = nativeBackgroundView?.scaleX ?: 1f
+                    
+                    val unscaledX = pX + (uiPoint.x - pX) / currentScale
+                    val unscaledY = pY + (uiPoint.y - pY) / currentScale
 
+                    val touchCoords = FloatArray(2).apply { 
+                        this[0] = unscaledX
+                        this[1] = unscaledY 
+                    }
+                    inverseMatrix.mapPoints(touchCoords)
                     val debugInterceptor = createDebugInterceptor()
 
-                    // Step 1: 터치 영역 주변의 좁은 ROI 영역만 Crop
-                    val seedCropResult = PlateDetectionEngine.prepareSeedCrop(
-                        safeBitmap, touchCoords[0], touchCoords[1], debugInterceptor
-                    )
+                    runMLKitPipeline(safeBitmap, touchCoords[0], touchCoords[1], currentSession, debugInterceptor)
 
-                    if (seedCropResult != null) {
-                        // Step 2: 잘라낸 이미지만 ML Kit에 전달하여 속도 최적화
-                        val recognizer = TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
-                        val image = InputImage.fromBitmap(seedCropResult.croppedBitmap, 0)
-
-                        recognizer.process(image)
-                            .addOnSuccessListener { visionText ->
-                                val plateRegex = Regex("\\d{2,3}[가-힣]\\s?\\d{4}")
-                                var targetBox: android.graphics.Rect? = null
-
-                                for (block in visionText.textBlocks) {
-                                    if (plateRegex.containsMatchIn(block.text)) {
-                                        targetBox = block.boundingBox
-                                        break
-                                    }
-                                }
-
-                                if (targetBox != null) {
-                                    // Step 3: ML Kit 결과를 바탕으로 다시 OpenCV 엔진에서 최종 조립 (비동기 콜백 안에서 다시 워커스레드 할당)
-                                    precomputeExecutor.execute {
-                                        if (captureSessionId.get() != currentSession) {
-                                            safeBitmap.recycle()
-                                            return@execute
-                                        }
-
-                                        val targetPolygon = PlateDetectionEngine.processWithMLKitResult(
-                                            safeBitmap,
-                                            seedCropResult.offsetX,
-                                            seedCropResult.offsetY,
-                                            targetBox,
-                                            debugInterceptor
-                                        )
-
-                                        runOnUiThread {
-                                            if (isFinishing || isDestroyed || captureSessionId.get() != currentSession) {
-                                                safeBitmap.recycle()
-                                                return@runOnUiThread
-                                            }
-
-                                            if (targetPolygon != null && targetPolygon.isNotEmpty()) {
-                                                triggerInstantMasking(targetPolygon)
-                                            } else {
-                                                fallbackToManualMode(currentSession, "번호판 세부 조립에 실패했습니다.")
-                                            }
-                                            safeBitmap.recycle() // 파이프라인 최종 완료 후 메모리 해제
-                                        }
-                                    }
-                                } else {
-                                    safeBitmap.recycle()
-                                    fallbackToManualMode(currentSession, "해당 영역에서 텍스트를 찾지 못했습니다.")
-                                }
-                            }
-                            .addOnFailureListener {
-                                safeBitmap.recycle()
-                                fallbackToManualMode(currentSession, "ML Kit 인식 오류가 발생했습니다.")
-                            }
-                    } else {
-                        safeBitmap.recycle()
-                        fallbackToManualMode(currentSession, "ROI 영역 추출에 실패했습니다.")
-                    }
                 } else {
                     runOnUiThread { progressBar?.visibility = View.GONE }
                 }
             }
         }
     }
+
+    // ==========================================================================================
+    // 💡 [핵심] ML Kit 단일 파이프라인 (사용자가 조준한 단일 글자 추출)
+    // ==========================================================================================
+    private fun runMLKitPipeline(
+        safeBitmap: Bitmap, touchX: Float, touchY: Float,
+        currentSession: Int, debugInterceptor: PlateDetectionEngine.DetectionDebugListener
+    ) {
+        val recognizer = TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
+
+        // [1차 시도] 스마트 크롭
+        val smartCrop = PlateDetectionEngine.prepareSeedCrop(safeBitmap, touchX, touchY, debugInterceptor)
+        
+        if (smartCrop != null) {
+            val image1 = InputImage.fromBitmap(smartCrop.croppedBitmap, 0)
+            recognizer.process(image1)
+                .addOnSuccessListener { visionText1 ->
+                    
+                    val localTouchX = touchX - smartCrop.offsetX
+                    val localTouchY = touchY - smartCrop.offsetY
+                    var closestSymbolBox1 = findClosestSymbolBox(visionText1, localTouchX, localTouchY)
+
+                    if (closestSymbolBox1 != null) {
+                        buildFinalWireframe(safeBitmap, smartCrop.offsetX, smartCrop.offsetY, closestSymbolBox1, currentSession, debugInterceptor)
+                    } else {
+                        // 1차 OCR 실패 -> 강제 고정 영역으로 2차 시도
+                        runFallbackDumbCrop(recognizer, safeBitmap, touchX, touchY, currentSession, debugInterceptor)
+                    }
+                }
+                .addOnFailureListener {
+                    runFallbackDumbCrop(recognizer, safeBitmap, touchX, touchY, currentSession, debugInterceptor)
+                }
+        } else {
+            runFallbackDumbCrop(recognizer, safeBitmap, touchX, touchY, currentSession, debugInterceptor)
+        }
+    }
+
+    private fun runFallbackDumbCrop(
+        recognizer: com.google.mlkit.vision.text.TextRecognizer,
+        safeBitmap: Bitmap, touchX: Float, touchY: Float,
+        currentSession: Int, debugInterceptor: PlateDetectionEngine.DetectionDebugListener
+    ) {
+        // [2차 시도] 넉넉한 고정 사이즈(Dumb) Crop
+        val dumbCrop = PlateDetectionEngine.prepareDumbCrop(safeBitmap, touchX, touchY, debugInterceptor)
+        val image2 = InputImage.fromBitmap(dumbCrop.croppedBitmap, 0)
+
+        recognizer.process(image2)
+            .addOnSuccessListener { visionText2 ->
+                val localTouchX = touchX - dumbCrop.offsetX
+                val localTouchY = touchY - dumbCrop.offsetY
+                val closestSymbolBox2 = findClosestSymbolBox(visionText2, localTouchX, localTouchY)
+                
+                if (closestSymbolBox2 != null) {
+                    buildFinalWireframe(safeBitmap, dumbCrop.offsetX, dumbCrop.offsetY, closestSymbolBox2, currentSession, debugInterceptor)
+                } else {
+                    safeBitmap.recycle()
+                    fallbackToManualMode(currentSession, "해당 영역에서 번호판 글자를 찾지 못했습니다. 다시 시도해주세요.")
+                }
+            }
+            .addOnFailureListener {
+                safeBitmap.recycle()
+                fallbackToManualMode(currentSession, "텍스트 인식 엔진에 문제가 발생했습니다.")
+            }
+    }
+
+    private fun findClosestSymbolBox(visionText: com.google.mlkit.vision.text.Text, localTouchX: Float, localTouchY: Float): android.graphics.Rect? {
+        var closestSymbolBox: android.graphics.Rect? = null
+        var minDistance = Float.MAX_VALUE
+
+        for (block in visionText.textBlocks) {
+            for (line in block.lines) {
+                for (element in line.elements) {
+                    for (symbol in element.symbols) {
+                        val box = symbol.boundingBox
+                        if (box != null) {
+                            if (box.contains(localTouchX.toInt(), localTouchY.toInt())) {
+                                closestSymbolBox = box
+                                minDistance = 0f
+                                break
+                            }
+                            val cx = box.exactCenterX()
+                            val cy = box.exactCenterY()
+                            val dist = Math.hypot((cx - localTouchX).toDouble(), (cy - localTouchY).toDouble()).toFloat()
+                            if (dist < minDistance) {
+                                minDistance = dist
+                                closestSymbolBox = box
+                            }
+                        }
+                    }
+                    if (minDistance == 0f) break
+                }
+                if (minDistance == 0f) break
+            }
+            if (minDistance == 0f) break
+        }
+        return closestSymbolBox
+    }
+
+    private fun buildFinalWireframe(
+        safeBitmap: Bitmap, offsetX: Int, offsetY: Int, mlKitBox: android.graphics.Rect,
+        currentSession: Int, debugInterceptor: PlateDetectionEngine.DetectionDebugListener
+    ) {
+        precomputeExecutor.execute {
+            if (captureSessionId.get() != currentSession) {
+                safeBitmap.recycle()
+                return@execute
+            }
+
+            val targetPolygon = PlateDetectionEngine.processWithMLKitResult(
+                safeBitmap, offsetX, offsetY, mlKitBox, debugInterceptor
+            )
+
+            runOnUiThread {
+                if (isFinishing || isDestroyed || captureSessionId.get() != currentSession) {
+                    safeBitmap.recycle()
+                    return@runOnUiThread
+                }
+
+                if (targetPolygon != null && targetPolygon.isNotEmpty()) {
+                    triggerInstantMasking(targetPolygon)
+                } else {
+                    fallbackToManualMode(currentSession, "번호판 세부 조립에 실패했습니다.")
+                }
+                safeBitmap.recycle() 
+            }
+        }
+    }
+
+    // ==========================================================================================
 
     private fun setupOrientationListener() {
         orientationEventListener = object : OrientationEventListener(this) {
@@ -327,6 +426,13 @@ class MainActivity : AppCompatActivity() {
             lastCapturedBitmap?.recycle()
             lastCapturedBitmap = null 
         }
+        
+        // 💡 줌 모드 초기화
+        isZoomed = false
+        nativeBackgroundView?.scaleX = 1f
+        nativeBackgroundView?.scaleY = 1f
+        nativeBackgroundView?.translationX = 0f
+        nativeBackgroundView?.translationY = 0f
         
         isMatrixReady = false
         nativeGuideView?.resetState()
@@ -407,7 +513,6 @@ class MainActivity : AppCompatActivity() {
                             nativeBackgroundView?.setImageBitmap(uprightBitmap)
                             nativeBackgroundView?.visibility = View.VISIBLE
   
-                            // 💡 촬영 후 바로 가이드 텍스트와 터치 대기 상태로 전환 (자동 인식 제거)
                             progressBar?.visibility = View.GONE 
                             setupMatrixAndPrecalculate(currentSessionId)
                         }
@@ -439,6 +544,11 @@ class MainActivity : AppCompatActivity() {
     private fun fallbackToManualMode(sessionId: Int, message: String) {
         runOnUiThread {
             if (captureSessionId.get() != sessionId) return@runOnUiThread
+            
+            // 에러 발생 시 원래 비율로 복귀 후 다시 터치 대기
+            nativeBackgroundView?.animate()?.scaleX(1f)?.scaleY(1f)?.setDuration(300)?.start()
+            isZoomed = false
+            
             progressBar?.visibility = View.GONE
             nativeGuideView?.visibility = View.VISIBLE
             Toast.makeText(this@MainActivity, message, Toast.LENGTH_SHORT).show()
@@ -492,7 +602,8 @@ class MainActivity : AppCompatActivity() {
             
                 nativeGuideView?.visibility = View.VISIBLE
                 
-                guideText?.text = "번호판 중앙을 터치해주세요"
+                // 💡 [수정됨] 직관적인 1차 터치 유도 메시지
+                guideText?.text = "번호판을 터치해주세요"
                 guideText?.paint?.isFakeBoldText = true 
                 guideText?.textSize = 20f 
                 guideText?.alpha = 1f
@@ -558,6 +669,10 @@ class MainActivity : AppCompatActivity() {
                                 }, 500)
                             }
                             
+                            // 💡 처리가 끝나면 원본 비율로 줌 아웃
+                            nativeBackgroundView?.animate()?.scaleX(1f)?.scaleY(1f)?.setDuration(300)?.start()
+                            isZoomed = false
+
                             progressBar?.visibility = View.GONE
                             resultActionLayout?.visibility = View.VISIBLE
                         }
