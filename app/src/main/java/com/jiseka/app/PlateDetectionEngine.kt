@@ -194,6 +194,7 @@ object PlateDetectionEngine {
         val cropW = (fullBitmap.width * 0.25f).toInt()
         val cropH = (fullBitmap.height * 0.15f).toInt()
 
+        // safeRect는 OpenCV의 org.opencv.core.Rect 입니다.
         val safeRect = getSafeRect(
             (touchX - cropW / 2).toInt(),
             (touchY - cropH / 2).toInt(),
@@ -208,7 +209,9 @@ object PlateDetectionEngine {
             val debugMat = Mat(); Utils.bitmapToMat(fullBitmap, debugMat)
             val screenRatio = debugMat.rows().toFloat() / debugMat.cols().toFloat()
             Imgproc.circle(debugMat, Point(touchX.toDouble(), touchY.toDouble()), 10, Scalar(0.0, 0.0, 255.0, 255.0), -1)
-            Imgproc.rectangle(debugMat, org.opencv.core.Rect(safeRect.left, safeRect.top, safeRect.width(), safeRect.height()), Scalar(255.0, 100.0, 0.0, 255.0), 5)
+            
+            // 💡 [오류 수정됨] safeRect를 직접 전달
+            Imgproc.rectangle(debugMat, safeRect, Scalar(255.0, 100.0, 0.0, 255.0), 5)
             
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
@@ -217,7 +220,8 @@ object PlateDetectionEngine {
             debugMat.release(); debugBmp.recycle()
         }
 
-        return SeedCropResult(safeRect.x, safeRect.y, croppedBitmap, Rect(safeRect.left, safeRect.top, safeRect.width(), safeRect.height()))
+        // 💡 [오류 수정됨] safeRect를 그대로 반환
+        return SeedCropResult(safeRect.x, safeRect.y, croppedBitmap, safeRect)
     }
 
     // ==========================================================================================
@@ -241,7 +245,6 @@ object PlateDetectionEngine {
             offsetY + localMlKitBox.bottom
         )
 
-        // 💡 단일 BoundingBox 하나를 엔진의 최초 기준점(Seed)으로 직접 사용
         val globalCenter = Point(globalMlKitBox.exactCenterX().toDouble(), globalMlKitBox.exactCenterY().toDouble())
         val seedChar = CharData(
             globalCenter,
@@ -275,13 +278,12 @@ object PlateDetectionEngine {
     }
 
     // ==========================================================================================
-    // 💡 [내부 엔진] 1-1. 단순 고정 크기 ROI 생성 (6% 사이즈로 최적화)
+    // [내부 엔진] 1-1. 단순 고정 크기 ROI 생성 
     // ==========================================================================================
     private fun createSeedROI(
         fullMat: Mat, fullGray: Mat, cx: Int, cy: Int, 
         debugListener: DetectionDebugListener?, screenRatio: Float
     ): Rect {
-        // 💡 글자 1~2개만 타이트하게 들어가도록 화면 원본 폭의 6%로 설정
         val cropSize = (fullMat.cols() * 0.06).toInt() 
         val currentX = cx - cropSize / 2
         val currentY = cy - cropSize / 2
@@ -531,7 +533,7 @@ object PlateDetectionEngine {
     }
 
     // ==========================================================================================
-    // [엔진 3] CharacterScanner (스캐너 기능 유지)
+    // [엔진 3] CharacterScanner 
     // ==========================================================================================
     private fun scanRegion(
         fullMat: Mat, fullGray: Mat, roi: Rect, 
