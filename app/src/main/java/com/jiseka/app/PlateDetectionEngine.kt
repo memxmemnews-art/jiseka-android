@@ -163,7 +163,7 @@ object PlateDetectionEngine {
     }
 
     // ==========================================================================================
-    // 💡 [단일 파이프라인 - Step 1] 터치 위치에서 부분 Crop (ML Kit 최적화용)
+    // 💡 [단일 파이프라인 - Step 1] 터치 위치에서 고정 크기 Crop (ML Kit 전용)
     // ==========================================================================================
     fun prepareSeedCrop(
         fullBitmap: Bitmap, 
@@ -184,7 +184,44 @@ object PlateDetectionEngine {
     }
 
     // ==========================================================================================
-    // 💡 [단일 파이프라인 - Step 2] ML Kit 결과를 받아 최종 와이어프레임 생성
+    // 💡 [단일 파이프라인 - Fallback] 1차 스마트 탐색 실패 시 넉넉한 영역으로 2차 시도
+    // ==========================================================================================
+    fun prepareDumbCrop(
+        fullBitmap: Bitmap, 
+        touchX: Float, touchY: Float, 
+        debugListener: DetectionDebugListener? = null
+    ): SeedCropResult {
+        val cropW = (fullBitmap.width * 0.25f).toInt()
+        val cropH = (fullBitmap.height * 0.15f).toInt()
+
+        val safeRect = getSafeRect(
+            (touchX - cropW / 2).toInt(),
+            (touchY - cropH / 2).toInt(),
+            cropW,
+            cropH,
+            fullBitmap.width, fullBitmap.height
+        )
+
+        val croppedBitmap = Bitmap.createBitmap(fullBitmap, safeRect.x, safeRect.y, safeRect.width, safeRect.height)
+
+        debugListener?.let {
+            val debugMat = Mat(); Utils.bitmapToMat(fullBitmap, debugMat)
+            val screenRatio = debugMat.rows().toFloat() / debugMat.cols().toFloat()
+            Imgproc.circle(debugMat, Point(touchX.toDouble(), touchY.toDouble()), 10, Scalar(0.0, 0.0, 255.0, 255.0), -1)
+            Imgproc.rectangle(debugMat, org.opencv.core.Rect(safeRect.left, safeRect.top, safeRect.width(), safeRect.height()), Scalar(255.0, 100.0, 0.0, 255.0), 5)
+            
+            val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(debugMat, debugBmp)
+            val hudBmp = addDebugHUD(debugBmp, "[Fallback] 2차 강제 크롭 발동", listOf("[경고] 1차 스마트 탐색 실패", "-> (주황) 터치 주변 강제 고정 영역으로 ML Kit 2차 시도"), screenRatio)
+            it.pauseAndShowStep("디버그 Fallback: 강제 크롭", hudBmp)
+            debugMat.release(); debugBmp.recycle()
+        }
+
+        return SeedCropResult(safeRect.x, safeRect.y, croppedBitmap, Rect(safeRect.left, safeRect.top, safeRect.width(), safeRect.height()))
+    }
+
+    // ==========================================================================================
+    // 💡 [단일 파이프라인 - Step 2] ML Kit 단일 문자 결과를 받아 최종 와이어프레임 생성
     // ==========================================================================================
     fun processWithMLKitResult(
         fullBitmap: Bitmap, 
@@ -204,10 +241,26 @@ object PlateDetectionEngine {
             offsetY + localMlKitBox.bottom
         )
 
-        val seedChars = extractSeedCharsFromMLKit(fullMat, fullGray, globalMlKitBox, debugListener, screenRatio)
-        if (seedChars.isEmpty()) {
-            fullMat.release(); fullGray.release()
-            return null
+        // 💡 단일 BoundingBox 하나를 엔진의 최초 기준점(Seed)으로 직접 사용
+        val globalCenter = Point(globalMlKitBox.exactCenterX().toDouble(), globalMlKitBox.exactCenterY().toDouble())
+        val seedChar = CharData(
+            globalCenter,
+            globalMlKitBox.width().toDouble(),
+            globalMlKitBox.height().toDouble(),
+            Rect(globalMlKitBox.left, globalMlKitBox.top, globalMlKitBox.width(), globalMlKitBox.height())
+        )
+        
+        val seedChars = listOf(seedChar)
+
+        debugListener?.let {
+            val debugMat = fullMat.clone()
+            Imgproc.rectangle(debugMat, seedChar.rect, Scalar(0.0, 255.0, 0.0, 255.0), 3)
+            
+            val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(debugMat, debugBmp)
+            val hudBmp = addDebugHUD(debugBmp, "[2/9] ML Kit 단일 Seed 문자 등록 완료", listOf("-> (초록) 사용자가 터치한 위치의 단일 문자 Bounding Box", "[진단] 이 문자를 기준으로 좌/우 탐색 레이더가 발사됩니다."), screenRatio)
+            it.pauseAndShowStep("디버그 2/9: ML Kit Seed", hudBmp)
+            debugMat.release(); debugBmp.recycle()
         }
 
         val collectedChars = expandAndCollect(seedChars, fullMat, fullGray, debugListener, screenRatio)
@@ -222,75 +275,28 @@ object PlateDetectionEngine {
     }
 
     // ==========================================================================================
-    // [내부 엔진] 1-1. Seed ROI 생성기 (디버그 1/9)
+    // 💡 [내부 엔진] 1-1. 단순 고정 크기 ROI 생성 (6% 사이즈로 최적화)
     // ==========================================================================================
     private fun createSeedROI(
         fullMat: Mat, fullGray: Mat, cx: Int, cy: Int, 
         debugListener: DetectionDebugListener?, screenRatio: Float
     ): Rect {
-        var roiWidth = (fullMat.cols() * 0.04).toInt() 
-        var roiHeight = (roiWidth * 0.8).toInt()       
-        var currentX = cx - roiWidth / 2
-        var currentY = cy - roiHeight / 2
+        // 💡 글자 1~2개만 타이트하게 들어가도록 화면 원본 폭의 6%로 설정
+        val cropSize = (fullMat.cols() * 0.06).toInt() 
+        val currentX = cx - cropSize / 2
+        val currentY = cy - cropSize / 2
 
-        val maxExpansions = 3 
-        val pad = (fullMat.cols() * 0.008).toInt() 
-
-        var finalRect = getSafeRect(currentX, currentY, roiWidth, roiHeight, fullMat.cols(), fullMat.rows())
-        val initialRect = finalRect.clone()
-
-        for (i in 0 until maxExpansions) {
-            val roiGray = Mat()
-            fullGray.submat(finalRect).copyTo(roiGray)
-            val thresh = Mat()
-            Imgproc.medianBlur(roiGray, roiGray, 3)
-            Imgproc.adaptiveThreshold(roiGray, thresh, 255.0, Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, Imgproc.THRESH_BINARY_INV, 19, 12.0)
-
-            val contours = ArrayList<MatOfPoint>()
-            val hierarchy = Mat()
-            Imgproc.findContours(thresh, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
-
-            var touchesLeft = false; var touchesRight = false
-            var touchesTop = false; var touchesBottom = false
-
-            for (contour in contours) {
-                val rect = Imgproc.boundingRect(contour)
-                if (rect.area() < 40) continue 
-
-                val ratio = rect.height.toDouble() / max(rect.width.toDouble(), 1.0)
-                if (ratio < 0.2 || ratio > 6.0 || rect.width > (fullMat.cols() * 0.3)) continue 
-                
-                if (rect.height > finalRect.height * 0.85 || rect.width > finalRect.width * 0.85) continue
-
-                if (rect.x <= 2) touchesLeft = true
-                if (rect.x + rect.width >= finalRect.width - 2) touchesRight = true
-                if (rect.y <= 2) touchesTop = true
-                if (rect.y + rect.height >= finalRect.height - 2) touchesBottom = true
-            }
-
-            roiGray.release(); thresh.release(); hierarchy.release()
-            contours.forEach { it.release() }
-
-            if (!touchesLeft && !touchesRight && !touchesTop && !touchesBottom) break
-
-            if (touchesLeft) { currentX -= pad; roiWidth += pad }
-            if (touchesRight) { roiWidth += pad }
-            if (touchesTop) { currentY -= pad; roiHeight += pad }
-            if (touchesBottom) { roiHeight += pad }
-
-            finalRect = getSafeRect(currentX, currentY, roiWidth, roiHeight, fullMat.cols(), fullMat.rows())
-        }
+        val finalRect = getSafeRect(currentX, currentY, cropSize, cropSize, fullMat.cols(), fullMat.rows())
 
         debugListener?.let {
             val debugMat = fullMat.clone()
             Imgproc.circle(debugMat, Point(cx.toDouble(), cy.toDouble()), 10, Scalar(0.0, 0.0, 255.0, 255.0), -1)
-            Imgproc.rectangle(debugMat, initialRect, Scalar(255.0, 255.0, 0.0, 255.0), 2)
             Imgproc.rectangle(debugMat, finalRect, Scalar(0.0, 255.0, 0.0, 255.0), 5)
             
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
-            val hudBmp = addDebugHUD(debugBmp, "[1/9] 터치 기반 Seed ROI 생성", listOf("-> (노랑) 최초 설정 ROI", "-> (초록) 윤곽선 팽창 알고리즘 적용 후 최종 ROI", "[진단] 이 초록 박스 이미지가 크롭되어 ML Kit로 전달됩니다."), screenRatio)
-            it.pauseAndShowStep("디버그 1/9: Seed ROI", hudBmp)
+            val hudBmp = addDebugHUD(debugBmp, "[1/9] 고정 크기 Seed ROI 생성 (스마트 확장 제거)", listOf("-> (초록) 사용자의 2차 터치(조준) 지점 기준 6% 고정 크롭 영역", "[진단] OpenCV 개입 없이 이 영역 내에서 ML Kit가 단일 문자를 직접 찾습니다."), screenRatio)
+            it.pauseAndShowStep("디버그 1/9: 고정 ROI", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
 
@@ -298,43 +304,7 @@ object PlateDetectionEngine {
     }
 
     // ==========================================================================================
-    // [내부 엔진] 1-2. ML Kit Box를 기반으로 Seed 문자 추출 (디버그 2/9)
-    // ==========================================================================================
-    private fun extractSeedCharsFromMLKit(
-        fullMat: Mat, fullGray: Mat, globalMlKitBox: android.graphics.Rect, 
-        debugListener: DetectionDebugListener?, screenRatio: Float
-    ): List<CharData> {
-        
-        val pad = (fullMat.cols() * 0.015).toInt()
-        val finalRect = getSafeRect(
-            globalMlKitBox.left - pad, 
-            globalMlKitBox.top - pad, 
-            globalMlKitBox.width() + pad * 2, 
-            globalMlKitBox.height() + pad * 2, 
-            fullMat.cols(), fullMat.rows()
-        )
-
-        val params = listOf(Pair(31, 7.0), Pair(19, 15.0))
-        val seeds = scanRegion(fullMat, fullGray, finalRect, params)
-
-        debugListener?.let {
-            val debugMat = fullMat.clone()
-            Imgproc.rectangle(debugMat, Rect(globalMlKitBox.left, globalMlKitBox.top, globalMlKitBox.width(), globalMlKitBox.height()), Scalar(255.0, 255.0, 0.0, 255.0), 2)
-            Imgproc.rectangle(debugMat, finalRect, Scalar(0.0, 255.0, 0.0, 255.0), 2)
-            seeds.forEach { char -> Imgproc.rectangle(debugMat, char.rect, Scalar(0.0, 255.0, 0.0, 255.0), 3) }
-            
-            val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
-            Utils.matToBitmap(debugMat, debugBmp)
-            val hudBmp = addDebugHUD(debugBmp, "[2/9] ML Kit 연동 및 Seed 추출", listOf("-> (노랑) ML Kit 반환 영역 (Global 좌표계 완벽 복원)", "-> (초록) 패딩 영역 내에서 확보된 ${seeds.size}개의 Seed 파편"), screenRatio)
-            it.pauseAndShowStep("디버그 2/9: ML Kit & Seed", hudBmp)
-            debugMat.release(); debugBmp.recycle()
-        }
-
-        return seeds
-    }
-
-    // ==========================================================================================
-    // [엔진 2] ExpansionEngine: 방향별 확장 제어기 (디버그 7/9)
+    // [엔진 2] ExpansionEngine: 방향별 확장 제어기
     // ==========================================================================================
     private fun expandAndCollect(
         seeds: List<CharData>, fullMat: Mat, fullGray: Mat, 
@@ -382,7 +352,7 @@ object PlateDetectionEngine {
     }
 
     // ==========================================================================================
-    // [단일 방향 탐색기] 캐싱 최적화 + 디버그 3, 4, 5, 6
+    // [단일 방향 탐색기] 캐싱 최적화
     // ==========================================================================================
     private fun expandOneDirection(
         currentCluster: MutableList<CharData>, fullMat: Mat, fullGray: Mat, 
@@ -561,7 +531,7 @@ object PlateDetectionEngine {
     }
 
     // ==========================================================================================
-    // [엔진 3] CharacterScanner: 단일 전처리 캐싱 구조 
+    // [엔진 3] CharacterScanner (스캐너 기능 유지)
     // ==========================================================================================
     private fun scanRegion(
         fullMat: Mat, fullGray: Mat, roi: Rect, 
@@ -679,7 +649,7 @@ object PlateDetectionEngine {
     }
 
     // ==========================================================================================
-    // [엔진 4] GeometryBuilder: 최종 검증 및 와이어프레임 계산 (디버그 8/9, 9/9)
+    // [엔진 4] GeometryBuilder: 최종 검증 및 와이어프레임 계산
     // ==========================================================================================
     private fun buildWireframe(
         collectedChars: List<CharData>, fullMat: Mat, 
