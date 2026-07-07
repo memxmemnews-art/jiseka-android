@@ -80,70 +80,88 @@ object PlateDetectionEngine {
         return currentY
     }
 
-    private fun addDebugHUD(original: Bitmap, title: String, logs: List<String>, screenRatio: Float): Bitmap {
-        val canvasWidth = 1080
-        val canvasHeight = (canvasWidth * screenRatio).toInt()
-        val combinedBmp = Bitmap.createBitmap(canvasWidth, canvasHeight, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(combinedBmp)
-        
-        val bgPaint = Paint().apply { color = Color.parseColor("#E6000000") }
-        canvas.drawRect(0f, 0f, canvasWidth.toFloat(), canvasHeight.toFloat(), bgPaint)
+    private fun addDebugHUD(original: Bitmap, title: String, logs: List<String>, screenRatio: Float, focusY: Float? = null): Bitmap {
+        // 원본 화질 유지를 위해 리사이징 없이 그대로 복사하여 캔버스 생성
+        val resultBmp = original.copy(Bitmap.Config.ARGB_8888, true)
+        val canvas = Canvas(resultBmp)
+
+        val imgW = canvas.width.toFloat()
+        val imgH = canvas.height.toFloat()
+
+        // 텍스트 크기를 이미지 원본 해상도(가로폭)에 비례하도록 동적 설정 (확대해도 깨지지 않음)
+        val baseTextSize = max(24f, imgW * 0.035f)
+        val titleTextSize = baseTextSize * 1.15f
+        val padding = imgW * 0.03f
+        val lineHeight = baseTextSize * 1.3f
+        val maxTextWidth = imgW - (padding * 2)
 
         val paint = Paint().apply {
             color = Color.WHITE
-            textSize = 35f
+            textSize = baseTextSize
             isAntiAlias = true
-            setShadowLayer(5f, 0f, 0f, Color.BLACK)
+            setShadowLayer(4f, 0f, 0f, Color.BLACK)
         }
 
-        val paddingX = 40f
-        val lineHeight = 35f 
-        val maxTextWidth = canvasWidth - (paddingX * 2)
-        var currentY = 60f 
-        
+        // 1. 텍스트 블록이 차지할 총 높이 사전 계산
+        var totalTextHeight = padding + lineHeight + (padding * 0.5f)
+        for (log in logs) {
+            var currentLine = ""
+            for (word in log.split(" ")) {
+                val testLine = if (currentLine.isEmpty()) word else "$currentLine $word"
+                if (paint.measureText(testLine) > maxTextWidth && currentLine.isNotEmpty()) {
+                    totalTextHeight += lineHeight
+                    currentLine = word
+                } else {
+                    currentLine = testLine
+                }
+            }
+            if (currentLine.isNotEmpty()) totalTextHeight += lineHeight
+        }
+        totalTextHeight += padding
+
+        // 2. focusY(현재 인식 중인 번호판 Y좌표)를 기준으로 HUD 동적 배치
+        var startY = padding
+        if (focusY != null) {
+            val spaceAbove = focusY - (imgH * 0.1f)
+            if (spaceAbove > totalTextHeight) {
+                // 번호판 위에 공간이 충분하면 위에 배치
+                startY = spaceAbove - totalTextHeight
+            } else {
+                // 공간이 부족하면 번호판 아래에 배치
+                startY = focusY + (imgH * 0.1f)
+            }
+        }
+
+        // 화면 위/아래 밖으로 잘리지 않도록 안전 영역 보정
+        startY = startY.coerceIn(padding, max(padding, imgH - totalTextHeight - padding))
+
+        // 3. 가독성을 위한 반투명 블랙 배경 박스
+        val bgPaint = Paint().apply { color = Color.parseColor("#CC000000") } // 80% Black
+        canvas.drawRect(0f, startY, imgW, startY + totalTextHeight, bgPaint)
+
+        // 4. 텍스트 렌더링
+        var currentY = startY + padding + (titleTextSize * 0.8f)
+
         paint.color = Color.YELLOW
         paint.isFakeBoldText = true
-        paint.textSize = 38f
-        currentY = drawTextWithWrap(canvas, title, paddingX, currentY, paint, maxTextWidth, lineHeight)
-        currentY += 10f 
+        paint.textSize = titleTextSize
+        currentY = drawTextWithWrap(canvas, title, padding, currentY, paint, maxTextWidth, lineHeight)
+        currentY += (padding * 0.5f)
 
-        paint.color = Color.WHITE
         paint.isFakeBoldText = false
-        paint.textSize = 26f 
+        paint.textSize = baseTextSize
         for (log in logs) {
-            if (log.startsWith("->") || log.startsWith("[경고]")) paint.color = Color.parseColor("#FF8888") 
+            if (log.startsWith("->") || log.startsWith("[경고]")) paint.color = Color.parseColor("#FF8888")
             else if (log.startsWith("[진단")) paint.color = Color.parseColor("#55FF55")
-            else if (log.startsWith("[정보]") || log.startsWith("[기준]")) paint.color = Color.parseColor("#55FFFF") 
-            else if (log.contains("FAIL") || log.contains("중단") || log.contains("삭제") || log.contains("손절")) paint.color = Color.parseColor("#FF5555") 
+            else if (log.startsWith("[정보]") || log.startsWith("[기준]")) paint.color = Color.parseColor("#55FFFF")
+            else if (log.contains("FAIL") || log.contains("중단") || log.contains("삭제") || log.contains("손절")) paint.color = Color.parseColor("#FF5555")
             else if (log.contains("통과") || log.contains("성공") || log.contains("조립")) paint.color = Color.parseColor("#55FF55")
             else paint.color = Color.WHITE
-            
-            currentY = drawTextWithWrap(canvas, log, paddingX, currentY, paint, maxTextWidth, lineHeight)
+
+            currentY = drawTextWithWrap(canvas, log, padding, currentY, paint, maxTextWidth, lineHeight)
         }
 
-        val textBottom = currentY + 15f 
-        val margin = 20f
-        val maxImgWidth = canvasWidth - (margin * 2)
-        val maxImgHeight = canvasHeight - textBottom - margin 
-
-        if (maxImgHeight > 0) {
-            val scaleX = maxImgWidth / original.width.toFloat()
-            val scaleY = maxImgHeight / original.height.toFloat()
-            val safeScaleFactor = min(scaleX, scaleY)
-
-            val scaledWidth = (original.width * safeScaleFactor).toInt()
-            val scaledHeight = (original.height * safeScaleFactor).toInt()
-            val scaledImg = Bitmap.createScaledBitmap(original, max(1, scaledWidth), max(1, scaledHeight), true)
-            
-            val imgX = (canvasWidth - scaledWidth) / 2f
-            val imgY = textBottom + (maxImgHeight - scaledHeight) / 2f
-
-            val borderPaint = Paint().apply { color = Color.CYAN; style = Paint.Style.STROKE; strokeWidth = 6f }
-            canvas.drawRect(imgX - 3f, imgY - 3f, imgX + scaledWidth + 3f, imgY + scaledHeight + 3f, borderPaint)
-            canvas.drawBitmap(scaledImg, imgX, imgY, null)
-            scaledImg.recycle()
-        }
-        return combinedBmp
+        return resultBmp
     }
 
     private fun getSafeRect(x: Int, y: Int, w: Int, h: Int, maxW: Int, maxH: Int): Rect {
@@ -194,7 +212,6 @@ object PlateDetectionEngine {
         val cropW = (fullBitmap.width * 0.25f).toInt()
         val cropH = (fullBitmap.height * 0.15f).toInt()
 
-        // safeRect는 OpenCV의 org.opencv.core.Rect 입니다.
         val safeRect = getSafeRect(
             (touchX - cropW / 2).toInt(),
             (touchY - cropH / 2).toInt(),
@@ -210,17 +227,15 @@ object PlateDetectionEngine {
             val screenRatio = debugMat.rows().toFloat() / debugMat.cols().toFloat()
             Imgproc.circle(debugMat, Point(touchX.toDouble(), touchY.toDouble()), 10, Scalar(0.0, 0.0, 255.0, 255.0), -1)
             
-            // 💡 [오류 수정됨] safeRect를 직접 전달
             Imgproc.rectangle(debugMat, safeRect, Scalar(255.0, 100.0, 0.0, 255.0), 5)
             
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
-            val hudBmp = addDebugHUD(debugBmp, "[Fallback] 2차 강제 크롭 발동", listOf("[경고] 1차 스마트 탐색 실패", "-> (주황) 터치 주변 강제 고정 영역으로 ML Kit 2차 시도"), screenRatio)
+            val hudBmp = addDebugHUD(debugBmp, "[Fallback] 2차 강제 크롭 발동", listOf("[경고] 1차 스마트 탐색 실패", "-> (주황) 터치 주변 강제 고정 영역으로 ML Kit 2차 시도"), screenRatio, touchY)
             it.pauseAndShowStep("디버그 Fallback: 강제 크롭", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
 
-        // 💡 [오류 수정됨] safeRect를 그대로 반환
         return SeedCropResult(safeRect.x, safeRect.y, croppedBitmap, safeRect)
     }
 
@@ -261,7 +276,7 @@ object PlateDetectionEngine {
             
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
-            val hudBmp = addDebugHUD(debugBmp, "[2/9] ML Kit 단일 Seed 문자 등록 완료", listOf("-> (초록) 사용자가 터치한 위치의 단일 문자 Bounding Box", "[진단] 이 문자를 기준으로 좌/우 탐색 레이더가 발사됩니다."), screenRatio)
+            val hudBmp = addDebugHUD(debugBmp, "[2/9] ML Kit 단일 Seed 문자 등록 완료", listOf("-> (초록) 사용자가 터치한 위치의 단일 문자 Bounding Box", "[진단] 이 문자를 기준으로 좌/우 탐색 레이더가 발사됩니다."), screenRatio, globalCenter.y.toFloat())
             it.pauseAndShowStep("디버그 2/9: ML Kit Seed", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
@@ -297,7 +312,7 @@ object PlateDetectionEngine {
             
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
-            val hudBmp = addDebugHUD(debugBmp, "[1/9] 고정 크기 Seed ROI 생성 (스마트 확장 제거)", listOf("-> (초록) 사용자의 2차 터치(조준) 지점 기준 6% 고정 크롭 영역", "[진단] OpenCV 개입 없이 이 영역 내에서 ML Kit가 단일 문자를 직접 찾습니다."), screenRatio)
+            val hudBmp = addDebugHUD(debugBmp, "[1/9] 고정 크기 Seed ROI 생성 (스마트 확장 제거)", listOf("-> (초록) 사용자의 2차 터치(조준) 지점 기준 6% 고정 크롭 영역", "[진단] OpenCV 개입 없이 이 영역 내에서 ML Kit가 단일 문자를 직접 찾습니다."), screenRatio, cy.toFloat())
             it.pauseAndShowStep("디버그 1/9: 고정 ROI", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
@@ -345,7 +360,8 @@ object PlateDetectionEngine {
             
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
-            val hudBmp = addDebugHUD(debugBmp, "[7/9] 글로벌 대청소 (노이즈/볼트 제거)", stepLogs, screenRatio)
+            val focusY = currentCluster.firstOrNull()?.center?.y?.toFloat()
+            val hudBmp = addDebugHUD(debugBmp, "[7/9] 글로벌 대청소 (노이즈/볼트 제거)", stepLogs, screenRatio, focusY)
             it.pauseAndShowStep("디버그 7/9: 클러스터 정돈", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
@@ -405,7 +421,7 @@ object PlateDetectionEngine {
                     Utils.matToBitmap(debugMat, debugBmp)
                     
                     val stepNum = if (isLeft) "3" else "5"
-                    val hudBmp = addDebugHUD(debugBmp, "[$stepNum/9] $dirStr 3단 레이더 투사", listOf("-> (마젠타) 관통 레이더 박스 생성", "[진단] 문자가 있을 것으로 예상되는 곳에 박스가 투사되었는지 확인"), screenRatio)
+                    val hudBmp = addDebugHUD(debugBmp, "[$stepNum/9] $dirStr 3단 레이더 투사", listOf("-> (마젠타) 관통 레이더 박스 생성", "[진단] 문자가 있을 것으로 예상되는 곳에 박스가 투사되었는지 확인"), screenRatio, probeRect.y.toFloat())
                     it.pauseAndShowStep("디버그 $stepNum/9: $dirStr 레이더", hudBmp)
                     debugMat.release(); debugBmp.recycle()
                 }
@@ -480,7 +496,8 @@ object PlateDetectionEngine {
             Utils.matToBitmap(debugMat, debugBmp)
             
             val stepNum = if (isLeft) "4" else "6"
-            val hudBmp = addDebugHUD(debugBmp, "[$stepNum/9] $dirStr 확장 루프 완료", stepLogs.takeLast(3), screenRatio)
+            val focusY = currentCluster.firstOrNull()?.center?.y?.toFloat()
+            val hudBmp = addDebugHUD(debugBmp, "[$stepNum/9] $dirStr 확장 루프 완료", stepLogs.takeLast(3), screenRatio, focusY)
             it.pauseAndShowStep("디버그 $stepNum/9: $dirStr 완료", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
@@ -717,7 +734,9 @@ object PlateDetectionEngine {
             
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
-            val hudBmp = addDebugHUD(debugBmp, "[8/9] 선형 궤도 검증 & KOR 마크 삭제", stepLogs, screenRatio)
+            
+            val focusY = validChars.firstOrNull()?.center?.y?.toFloat()
+            val hudBmp = addDebugHUD(debugBmp, "[8/9] 선형 궤도 검증 & KOR 마크 삭제", stepLogs, screenRatio, focusY)
             it.pauseAndShowStep("디버그 8/9: 최종 궤도 검증", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
@@ -833,7 +852,8 @@ object PlateDetectionEngine {
 
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
-            val hudBmp = addDebugHUD(debugBmp, "[9/9] 디버깅 완료: 최종 와이어프레임 기하학 도출", listOf("-> (초록 테두리) 1.35배 대칭 팽창된 최종 번호판 영역", "[진단] 이 영역이 PerspectiveTransform 을 통해 최종 크롭될 영역입니다."), screenRatio)
+            
+            val hudBmp = addDebugHUD(debugBmp, "[9/9] 디버깅 완료: 최종 와이어프레임 기하학 도출", listOf("-> (초록 테두리) 1.35배 대칭 팽창된 최종 번호판 영역", "[진단] 이 영역이 PerspectiveTransform 을 통해 최종 크롭될 영역입니다."), screenRatio, midY.toFloat())
             it.pauseAndShowStep("디버그 9/9: 최종 렌더링", hudBmp)
             debugMat.release(); debugBmp.recycle()
         }
