@@ -35,9 +35,12 @@ import androidx.camera.view.PreviewView
 import androidx.camera.view.TransformExperimental
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope // 💡 추가됨: 코루틴 스코프
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
+import kotlinx.coroutines.Dispatchers // 💡 추가됨: 코루틴 디스패처
+import kotlinx.coroutines.launch // 💡 추가됨: 코루틴 실행
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
 import org.opencv.core.Core
@@ -55,6 +58,8 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.coroutines.resume // 💡 추가됨: 코루틴 제어
+import kotlin.coroutines.suspendCoroutine // 💡 추가됨: 비동기 콜백 변환
 import kotlin.math.max
 import kotlin.math.min
 
@@ -95,7 +100,6 @@ class MainActivity : AppCompatActivity() {
     private val inverseMatrix = Matrix()
     private var isMatrixReady = false
     
-    // 💡 확대 모드 상태 변수
     private var isZoomed = false
 
     private val uiHandler = android.os.Handler(Looper.getMainLooper())
@@ -191,7 +195,6 @@ class MainActivity : AppCompatActivity() {
         nativeGuideView?.onTouchPointListener = touchDrop@{ uiPoint ->
             if (!isMatrixReady) return@touchDrop
 
-            // 💡 1단계: 줌인 모드
             if (!isZoomed) {
                 isZoomed = true
                 nativeBackgroundView?.pivotX = uiPoint.x
@@ -201,7 +204,6 @@ class MainActivity : AppCompatActivity() {
                     ?.scaleY(3f)
                     ?.setDuration(300)
                     ?.withEndAction {
-                        // 💡 줌인 후 유도 텍스트
                         guideText?.text = "번호판 글자를 터치해주세요"
                         guideText?.alpha = 1f
                         guideText?.visibility = View.VISIBLE
@@ -212,7 +214,6 @@ class MainActivity : AppCompatActivity() {
                 return@touchDrop 
             }
 
-            // 💡 2단계: 텍스트 인식 모드 
             val currentSession = captureSessionId.get()
             progressBar?.visibility = View.VISIBLE
             nativeGuideView?.visibility = View.GONE
@@ -247,16 +248,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ==========================================================================================
-    // 💡 [핵심] ML Kit 단일 파이프라인 (사용자가 조준한 단일 글자 추출)
-    // ==========================================================================================
     private fun runMLKitPipeline(
         safeBitmap: Bitmap, touchX: Float, touchY: Float,
         currentSession: Int, debugInterceptor: PlateDetectionEngine.DetectionDebugListener
     ) {
         val recognizer = TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
 
-        // [1차 시도] 스마트 크롭
         val smartCrop = PlateDetectionEngine.prepareSeedCrop(safeBitmap, touchX, touchY, debugInterceptor)
         
         if (smartCrop != null) {
@@ -271,7 +268,6 @@ class MainActivity : AppCompatActivity() {
                     if (closestSymbolBox1 != null) {
                         buildFinalWireframe(safeBitmap, smartCrop.offsetX, smartCrop.offsetY, closestSymbolBox1, currentSession, debugInterceptor)
                     } else {
-                        // 1차 OCR 실패 -> 강제 고정 영역으로 2차 시도
                         runFallbackDumbCrop(recognizer, safeBitmap, touchX, touchY, currentSession, debugInterceptor)
                     }
                 }
@@ -288,7 +284,6 @@ class MainActivity : AppCompatActivity() {
         safeBitmap: Bitmap, touchX: Float, touchY: Float,
         currentSession: Int, debugInterceptor: PlateDetectionEngine.DetectionDebugListener
     ) {
-        // [2차 시도] 넉넉한 고정 사이즈(Dumb) Crop
         val dumbCrop = PlateDetectionEngine.prepareDumbCrop(safeBitmap, touchX, touchY, debugInterceptor)
         val image2 = InputImage.fromBitmap(dumbCrop.croppedBitmap, 0)
 
@@ -344,18 +339,54 @@ class MainActivity : AppCompatActivity() {
         return closestSymbolBox
     }
 
+    // 💡 [핵심 수정됨] 코루틴 스코프 적용 및 MLKitScanner 비동기 어댑터 주입
     private fun buildFinalWireframe(
         safeBitmap: Bitmap, offsetX: Int, offsetY: Int, mlKitBox: android.graphics.Rect,
         currentSession: Int, debugInterceptor: PlateDetectionEngine.DetectionDebugListener
     ) {
-        precomputeExecutor.execute {
+        lifecycleScope.launch(Dispatchers.Default) {
             if (captureSessionId.get() != currentSession) {
                 safeBitmap.recycle()
-                return@execute
+                return@launch
+            }
+
+            // 엔진이 넘겨주는 크롭된 비트맵을 ML Kit로 분석하여 콜백 없이 suspend로 반환
+            val mlKitScanner = object : PlateDetectionEngine.MLKitScanner {
+                override suspend fun scanSingleCharacter(bitmap: Bitmap): android.graphics.Rect? = suspendCoroutine { continuation ->
+                    val image = InputImage.fromBitmap(bitmap, 0)
+                    val recognizer = TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
+                    
+                    recognizer.process(image)
+                        .addOnSuccessListener { visionText ->
+                            var bestBox: android.graphics.Rect? = null
+                            var maxArea = -1
+                            
+                            for (block in visionText.textBlocks) {
+                                for (line in block.lines) {
+                                    for (element in line.elements) {
+                                        for (symbol in element.symbols) {
+                                            val box = symbol.boundingBox
+                                            if (box != null) {
+                                                val area = box.width() * box.height()
+                                                if (area > maxArea) {
+                                                    maxArea = area
+                                                    bestBox = box
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            continuation.resume(bestBox)
+                        }
+                        .addOnFailureListener {
+                            continuation.resume(null)
+                        }
+                }
             }
 
             val targetPolygon = PlateDetectionEngine.processWithMLKitResult(
-                safeBitmap, offsetX, offsetY, mlKitBox, debugInterceptor
+                safeBitmap, offsetX, offsetY, mlKitBox, mlKitScanner, debugInterceptor
             )
 
             runOnUiThread {
@@ -373,8 +404,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
-
-    // ==========================================================================================
 
     private fun setupOrientationListener() {
         orientationEventListener = object : OrientationEventListener(this) {
@@ -415,7 +444,7 @@ class MainActivity : AppCompatActivity() {
         
         debugLatch?.countDown() 
         btnDebugNext?.visibility = View.GONE
-      
+       
         btnCapture?.isEnabled = true
         nativeBackgroundView?.setImageDrawable(null)
     
@@ -427,7 +456,6 @@ class MainActivity : AppCompatActivity() {
             lastCapturedBitmap = null 
         }
         
-        // 💡 줌 모드 초기화
         isZoomed = false
         nativeBackgroundView?.scaleX = 1f
         nativeBackgroundView?.scaleY = 1f
@@ -545,7 +573,6 @@ class MainActivity : AppCompatActivity() {
         runOnUiThread {
             if (captureSessionId.get() != sessionId) return@runOnUiThread
             
-            // 에러 발생 시 원래 비율로 복귀 후 다시 터치 대기
             nativeBackgroundView?.animate()?.scaleX(1f)?.scaleY(1f)?.setDuration(300)?.start()
             isZoomed = false
             
@@ -602,7 +629,6 @@ class MainActivity : AppCompatActivity() {
             
                 nativeGuideView?.visibility = View.VISIBLE
                 
-                // 💡 [수정됨] 직관적인 1차 터치 유도 메시지
                 guideText?.text = "번호판을 터치해주세요"
                 guideText?.paint?.isFakeBoldText = true 
                 guideText?.textSize = 20f 
@@ -669,7 +695,6 @@ class MainActivity : AppCompatActivity() {
                                 }, 500)
                             }
                             
-                            // 💡 처리가 끝나면 원본 비율로 줌 아웃
                             nativeBackgroundView?.animate()?.scaleX(1f)?.scaleY(1f)?.setDuration(300)?.start()
                             isZoomed = false
 
