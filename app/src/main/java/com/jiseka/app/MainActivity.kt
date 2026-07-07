@@ -35,12 +35,12 @@ import androidx.camera.view.PreviewView
 import androidx.camera.view.TransformExperimental
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.lifecycleScope // 💡 추가됨: 코루틴 스코프
+import androidx.lifecycle.lifecycleScope 
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
-import kotlinx.coroutines.Dispatchers // 💡 추가됨: 코루틴 디스패처
-import kotlinx.coroutines.launch // 💡 추가됨: 코루틴 실행
+import kotlinx.coroutines.Dispatchers 
+import kotlinx.coroutines.launch 
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
 import org.opencv.core.Core
@@ -58,8 +58,8 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
-import kotlin.coroutines.resume // 💡 추가됨: 코루틴 제어
-import kotlin.coroutines.suspendCoroutine // 💡 추가됨: 비동기 콜백 변환
+import kotlin.coroutines.resume 
+import kotlin.coroutines.suspendCoroutine 
 import kotlin.math.max
 import kotlin.math.min
 
@@ -76,8 +76,12 @@ class MainActivity : AppCompatActivity() {
     private var progressBar: ProgressBar? = null
     private var guideText: TextView? = null
 
+    // 💡 화면 고정용 디버그 HUD UI 요소
     private var debugLatch: CountDownLatch? = null
     private var btnDebugNext: Button? = null
+    private var debugHudContainer: LinearLayout? = null
+    private var debugHudTitle: TextView? = null
+    private var debugHudLogs: TextView? = null
 
     private var orientationEventListener: OrientationEventListener? = null
     private var currentLogicalRotation = 0f
@@ -160,14 +164,48 @@ class MainActivity : AppCompatActivity() {
                 debugLatch?.countDown() 
             }
         }
-        val params = FrameLayout.LayoutParams(
+        val btnParams = FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT,
             FrameLayout.LayoutParams.WRAP_CONTENT
         ).apply {
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            bottomMargin = 300 
+            bottomMargin = 50 
         }
-        addContentView(btnDebugNext, params)
+        addContentView(btnDebugNext, btnParams)
+
+        debugHudContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor("#CC000000")) 
+            setPadding(40, 40, 40, 40)
+            visibility = View.GONE
+        }
+        
+        debugHudTitle = TextView(this).apply {
+            setTextColor(Color.YELLOW)
+            textSize = 22f
+            paint.isFakeBoldText = true
+            setShadowLayer(4f, 0f, 0f, Color.BLACK)
+        }
+        
+        debugHudLogs = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 16f
+            setLineSpacing(0f, 1.2f)
+            setPadding(0, 20, 0, 0)
+            setShadowLayer(4f, 0f, 0f, Color.BLACK)
+        }
+
+        debugHudContainer?.addView(debugHudTitle)
+        debugHudContainer?.addView(debugHudLogs)
+
+        val hudParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = Gravity.CENTER_HORIZONTAL or Gravity.TOP
+            topMargin = 100 
+        }
+        addContentView(debugHudContainer, hudParams)
     }
 
     private fun loadTextureSafely() {
@@ -339,7 +377,6 @@ class MainActivity : AppCompatActivity() {
         return closestSymbolBox
     }
 
-    // 💡 [핵심 수정됨] 코루틴 스코프 적용 및 MLKitScanner 비동기 어댑터 주입
     private fun buildFinalWireframe(
         safeBitmap: Bitmap, offsetX: Int, offsetY: Int, mlKitBox: android.graphics.Rect,
         currentSession: Int, debugInterceptor: PlateDetectionEngine.DetectionDebugListener
@@ -350,37 +387,28 @@ class MainActivity : AppCompatActivity() {
                 return@launch
             }
 
-            // 엔진이 넘겨주는 크롭된 비트맵을 ML Kit로 분석하여 콜백 없이 suspend로 반환
             val mlKitScanner = object : PlateDetectionEngine.MLKitScanner {
-                override suspend fun scanSingleCharacter(bitmap: Bitmap): android.graphics.Rect? = suspendCoroutine { continuation ->
+                override suspend fun scanCharacters(bitmap: Bitmap): List<android.graphics.Rect> = suspendCoroutine { continuation ->
                     val image = InputImage.fromBitmap(bitmap, 0)
                     val recognizer = TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
                     
                     recognizer.process(image)
                         .addOnSuccessListener { visionText ->
-                            var bestBox: android.graphics.Rect? = null
-                            var maxArea = -1
+                            val boxes = mutableListOf<android.graphics.Rect>()
                             
                             for (block in visionText.textBlocks) {
                                 for (line in block.lines) {
                                     for (element in line.elements) {
                                         for (symbol in element.symbols) {
-                                            val box = symbol.boundingBox
-                                            if (box != null) {
-                                                val area = box.width() * box.height()
-                                                if (area > maxArea) {
-                                                    maxArea = area
-                                                    bestBox = box
-                                                }
-                                            }
+                                            symbol.boundingBox?.let { boxes.add(it) }
                                         }
                                     }
                                 }
                             }
-                            continuation.resume(bestBox)
+                            continuation.resume(boxes)
                         }
                         .addOnFailureListener {
-                            continuation.resume(null)
+                            continuation.resume(emptyList())
                         }
                 }
             }
@@ -444,6 +472,7 @@ class MainActivity : AppCompatActivity() {
         
         debugLatch?.countDown() 
         btnDebugNext?.visibility = View.GONE
+        debugHudContainer?.visibility = View.GONE
        
         btnCapture?.isEnabled = true
         nativeBackgroundView?.setImageDrawable(null)
@@ -584,13 +613,22 @@ class MainActivity : AppCompatActivity() {
 
     private fun createDebugInterceptor(): PlateDetectionEngine.DetectionDebugListener {
         return object : PlateDetectionEngine.DetectionDebugListener {
-            override fun pauseAndShowStep(stageName: String, debugBitmap: Bitmap) {
+            override fun pauseAndShowStep(stageName: String, debugBitmap: Bitmap, title: String, logs: List<String>) {
                 debugLatch = CountDownLatch(1)
                 
                 runOnUiThread {
                     if (isFinishing || isDestroyed) return@runOnUiThread
-                    Toast.makeText(this@MainActivity, stageName, Toast.LENGTH_SHORT).show()
+                    
                     nativeBackgroundView?.setImageBitmap(debugBitmap)
+                    
+                    debugHudTitle?.text = title
+                    val logText = StringBuilder()
+                    for (log in logs) {
+                        logText.append(log).append("\n")
+                    }
+                    debugHudLogs?.text = logText.toString()
+                    debugHudContainer?.visibility = View.VISIBLE
+                    
                     btnDebugNext?.visibility = View.VISIBLE 
                     progressBar?.visibility = View.GONE 
                 }
@@ -600,6 +638,7 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread { 
                     btnDebugNext?.visibility = View.GONE 
                     progressBar?.visibility = View.VISIBLE 
+                    debugHudContainer?.visibility = View.GONE
                 }
             }
         }
