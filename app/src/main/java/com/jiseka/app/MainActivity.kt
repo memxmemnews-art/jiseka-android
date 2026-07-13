@@ -76,7 +76,7 @@ class MainActivity : AppCompatActivity() {
     private var progressBar: ProgressBar? = null
     private var guideText: TextView? = null
 
-    // 💡 화면 고정용 디버그 HUD UI 요소
+    // 화면 고정용 디버그 HUD UI 요소
     private var debugLatch: CountDownLatch? = null
     private var btnDebugNext: Button? = null
     private var debugHudContainer: LinearLayout? = null
