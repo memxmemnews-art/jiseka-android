@@ -31,29 +31,6 @@ object PlateDetectionEngine {
         val roiRect: Rect
     )
 
-    private data class ClusterStats(
-        val medianHeight: Double,
-        val medianWidth: Double,
-        val sortedChars: List<CharData>
-    )
-
-    private fun calculateClusterStats(cluster: MutableList<CharData>): ClusterStats {
-        cluster.sortBy { it.rect.x }
-        
-        val size = cluster.size
-        val heights = DoubleArray(size) { cluster[it].height }
-        val widths = DoubleArray(size) { cluster[it].width }
-        
-        heights.sort()
-        widths.sort()
-        
-        return ClusterStats(
-            medianHeight = heights[size / 2],
-            medianWidth = widths[size / 2],
-            sortedChars = cluster.toList()
-        )
-    }
-
     private fun getSafeRect(x: Int, y: Int, w: Int, h: Int, maxW: Int, maxH: Int): Rect {
         val safeX = x.coerceIn(0, maxW - 1)
         val safeY = y.coerceIn(0, maxH - 1)
@@ -179,57 +156,6 @@ object PlateDetectionEngine {
         return SeedCropResult(safeRect.x, safeRect.y, croppedBitmap, safeRect)
     }
 
-    suspend fun processWithMLKitResult(
-        fullBitmap: Bitmap, 
-        offsetX: Int, offsetY: Int, 
-        localMlKitBox: android.graphics.Rect, 
-        mlKitScanner: MLKitScanner, 
-        debugListener: DetectionDebugListener? = null
-    ): List<ImmutablePoint>? {
-        val fullMat = Mat(); val fullGray = Mat()
-        Utils.bitmapToMat(fullBitmap, fullMat)
-        Imgproc.cvtColor(fullMat, fullGray, Imgproc.COLOR_RGBA2GRAY)
-        val screenRatio = fullMat.rows().toFloat() / fullMat.cols().toFloat()
-
-        val globalMlKitBox = Rect(
-            offsetX + localMlKitBox.left,
-            offsetY + localMlKitBox.top,
-            localMlKitBox.width(),
-            localMlKitBox.height()
-        )
-
-        val seedChar = tightenWithOpenCV(fullGray, globalMlKitBox, fullMat.cols(), fullMat.rows())
-        val seedChars = listOf(seedChar)
-
-        debugListener?.let {
-            val debugMat = fullMat.clone()
-            
-            val oldRect = Rect(globalMlKitBox.x, globalMlKitBox.y, globalMlKitBox.width, globalMlKitBox.height)
-            Imgproc.rectangle(debugMat, oldRect, Scalar(255.0, 0.0, 0.0, 255.0), 2) 
-            Imgproc.rectangle(debugMat, seedChar.rect, Scalar(0.0, 255.0, 0.0, 255.0), 4)
-            
-            val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
-            Utils.matToBitmap(debugMat, debugBmp)
-            
-            it.pauseAndShowStep(
-                "디버그 2/9: 타이트 Seed", debugBmp,
-                "[2/9] Seed 문자 타이트 바운딩",
-                listOf("-> (빨강) 기존 ML Kit 원본 박스 (엉성함)", "-> (초록) OpenCV로 재계산된 타이트한 바운드 박스", "[진단] 정확한 중심/상단/하단 좌표 확보 완료.")
-            )
-            debugMat.release(); debugBmp.recycle()
-        }
-
-        val collectedChars = expandAndCollect(seedChars, fullBitmap, fullMat, fullGray, mlKitScanner, debugListener, screenRatio)
-        
-        var resultPoints: List<ImmutablePoint>? = null
-        if (collectedChars.size >= 4) { 
-            resultPoints = buildWireframe(collectedChars, fullMat, debugListener, screenRatio)
-        }
-
-        fullMat.release(); fullGray.release()
-        return resultPoints
-    }
-
     private fun createSeedROI(
         fullMat: Mat, fullGray: Mat, cx: Int, cy: Int, 
         debugListener: DetectionDebugListener?, screenRatio: Float
@@ -259,27 +185,41 @@ object PlateDetectionEngine {
         return finalRect
     }
 
-    private suspend fun expandAndCollect(
-        seeds: List<CharData>, fullBitmap: Bitmap, fullMat: Mat, fullGray: Mat, 
-        mlKitScanner: MLKitScanner,
-        debugListener: DetectionDebugListener?, screenRatio: Float
-    ): List<CharData> {
-        
-        val currentCluster = seeds.toMutableList()
-        val stepLogs = mutableListOf<String>()
-        stepLogs.add("[진단] 초기 Seed 확보 완료. 방향별 통합 확장 루프 기동.")
+    suspend fun processWithMLKitResult(
+        fullBitmap: Bitmap, 
+        offsetX: Int, offsetY: Int, 
+        localMlKitBox: android.graphics.Rect, 
+        mlKitScanner: MLKitScanner, 
+        debugListener: DetectionDebugListener? = null
+    ): List<ImmutablePoint>? {
+        val fullMat = Mat(); val fullGray = Mat()
+        Utils.bitmapToMat(fullBitmap, fullMat)
+        Imgproc.cvtColor(fullMat, fullGray, Imgproc.COLOR_RGBA2GRAY)
+        val screenRatio = fullMat.rows().toFloat() / fullMat.cols().toFloat()
 
-        expandOneDirection(currentCluster, fullBitmap, fullMat, fullGray, true, mlKitScanner, stepLogs, debugListener, screenRatio)
-        expandOneDirection(currentCluster, fullBitmap, fullMat, fullGray, false, mlKitScanner, stepLogs, debugListener, screenRatio)
+        val seedGlobalBox = android.graphics.Rect(
+            offsetX + localMlKitBox.left,
+            offsetY + localMlKitBox.top,
+            offsetX + localMlKitBox.right,
+            offsetY + localMlKitBox.bottom
+        )
 
-        currentCluster.sortBy { it.rect.x }
-        
-        if (currentCluster.size > 2) {
-            val heightsDesc = currentCluster.map { it.height }.sortedDescending()
+        val allMlKitBoxes = collectMLKitCharacters(seedGlobalBox, fullBitmap, mlKitScanner, debugListener, fullMat.cols(), fullMat.rows())
+
+        val collectedChars = mutableListOf<CharData>()
+        for (box in allMlKitBoxes) {
+            val cvRect = org.opencv.core.Rect(box.left, box.top, box.width(), box.height())
+            val tightChar = tightenWithOpenCV(fullGray, cvRect, fullMat.cols(), fullMat.rows())
+            collectedChars.add(tightChar)
+        }
+
+        if (collectedChars.size > 2) {
+            collectedChars.sortBy { it.rect.x }
+            val heightsDesc = collectedChars.map { it.height }.sortedDescending()
             val trueHeight = if (heightsDesc.size >= 3) heightsDesc[2] else heightsDesc.first()
             val purgeHeightLimit = trueHeight * 0.50
             
-            val purgeIterator = currentCluster.iterator()
+            val purgeIterator = collectedChars.iterator()
             var purgedCount = 0
             while (purgeIterator.hasNext()) {
                 val c = purgeIterator.next()
@@ -288,189 +228,215 @@ object PlateDetectionEngine {
                     purgedCount++
                 }
             }
-            if (purgedCount > 0) stepLogs.add(" -> [글로벌 청소] 기준 미달 노이즈 ${purgedCount}개 일괄 삭제")
         }
 
         debugListener?.let {
             val debugMat = fullMat.clone()
-            currentCluster.forEach { char -> Imgproc.rectangle(debugMat, char.rect, Scalar(0.0, 255.0, 255.0, 255.0), 3) }
+            collectedChars.forEach { char -> Imgproc.rectangle(debugMat, char.rect, Scalar(0.0, 255.0, 255.0, 255.0), 3) }
             
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
             
             it.pauseAndShowStep(
-                "디버그 7/9: 클러스터 정돈", debugBmp,
-                "[7/9] 글로벌 대청소 (노이즈/볼트 제거)",
-                stepLogs
+                "디버그 7/9: 타이트 바운딩 일괄 적용", debugBmp,
+                "[7/9] ML Kit 탐색 완료 후 일괄 OpenCV 적용",
+                listOf("-> (노랑) ${collectedChars.size}개 문자에 대해 일괄 타이트 바운딩 완료")
             )
             debugMat.release(); debugBmp.recycle()
         }
 
-        return currentCluster
+        var resultPoints: List<ImmutablePoint>? = null
+        if (collectedChars.size >= 4) { 
+            resultPoints = buildWireframe(collectedChars, fullMat, debugListener, screenRatio)
+        }
+
+        fullMat.release(); fullGray.release()
+        return resultPoints
     }
 
-    private suspend fun expandOneDirection(
-        currentCluster: MutableList<CharData>, fullBitmap: Bitmap, fullMat: Mat, fullGray: Mat, 
-        isLeft: Boolean, mlKitScanner: MLKitScanner, stepLogs: MutableList<String>,
-        debugListener: DetectionDebugListener?, screenRatio: Float
-    ) {
+    private suspend fun collectMLKitCharacters(
+        seedGlobalBox: android.graphics.Rect,
+        fullBitmap: Bitmap,
+        mlKitScanner: MLKitScanner,
+        debugListener: DetectionDebugListener?,
+        fullW: Int, fullH: Int
+    ): List<android.graphics.Rect> {
+        val stepLogs = mutableListOf<String>()
+        stepLogs.add("[진단] ML Kit 전용 방향별 탐색 루프 기동.")
+
+        val visited = mutableListOf<android.graphics.Rect>()
+        visited.add(seedGlobalBox)
+
+        val leftBoxes = expandOneDirectionMLKit(seedGlobalBox, fullBitmap, true, mlKitScanner, visited, stepLogs, debugListener, fullW, fullH)
+        val rightBoxes = expandOneDirectionMLKit(seedGlobalBox, fullBitmap, false, mlKitScanner, visited, stepLogs, debugListener, fullW, fullH)
+
+        val allBoxes = mutableListOf<android.graphics.Rect>()
+        allBoxes.addAll(leftBoxes.reversed())
+        allBoxes.add(seedGlobalBox)
+        allBoxes.addAll(rightBoxes)
+
+        return allBoxes
+    }
+
+    private suspend fun expandOneDirectionMLKit(
+        seedBox: android.graphics.Rect, fullBitmap: Bitmap, 
+        isLeft: Boolean, mlKitScanner: MLKitScanner, visited: MutableList<android.graphics.Rect>, stepLogs: MutableList<String>,
+        debugListener: DetectionDebugListener?, fullW: Int, fullH: Int
+    ): List<android.graphics.Rect> {
+        val result = mutableListOf<android.graphics.Rect>()
+        val recentBoxes = mutableListOf<android.graphics.Rect>(seedBox) 
+        
+        var currentBox = seedBox
         var expand = true
         var loops = 0
         val dirStr = if (isLeft) "좌측" else "우측"
 
-        var stats = calculateClusterStats(currentCluster)
-
         while (expand && loops < 8) {
             loops++
-            
-            val cachedCluster = stats.sortedChars
-            val medianH = stats.medianHeight
-            val medianW = stats.medianWidth
-            
-            val outerChar = if (isLeft) cachedCluster.first() else cachedCluster.last()
-            
-            val searchW = (medianW * 1.5).toInt()
-            val searchX = if (isLeft) outerChar.rect.x - searchW else outerChar.rect.x + outerChar.rect.width
-            
-            var topSlope = 0.0; var centerSlope = 0.0; var bottomSlope = 0.0
-            
-            if (cachedCluster.size >= 2) {
-                val innerChar = if (isLeft) cachedCluster.last() else cachedCluster.first()
-                val dx = outerChar.center.x - innerChar.center.x
-                
-                if (abs(dx) > 1.0) {
-                    topSlope = (outerChar.topCenter.y - innerChar.topCenter.y) / dx
-                    centerSlope = (outerChar.center.y - innerChar.center.y) / dx
-                    bottomSlope = (outerChar.bottomCenter.y - innerChar.bottomCenter.y) / dx
-                }
-            }
-
-            val expectedDistX = if (isLeft) -medianW else medianW
-            val predictedTopY = outerChar.topCenter.y + topSlope * expectedDistX
-            val predictedBottomY = outerChar.bottomCenter.y + bottomSlope * expectedDistX
-
-            val padY = (medianH * 0.15).toInt()
-            val finalSearchY = predictedTopY.toInt() - padY
-            val finalSearchH = max(10, (predictedBottomY - predictedTopY).toInt() + (padY * 2))
-
-            val searchRect = getSafeRect(searchX, finalSearchY, searchW, finalSearchH, fullMat.cols(), fullMat.rows())
+            val searchRect = buildSearchROI(currentBox, recentBoxes, isLeft, fullW, fullH)
             if (searchRect.width < 10) break
 
-            debugListener?.let {
-                val debugMat = fullMat.clone()
-                cachedCluster.forEach { c -> Imgproc.rectangle(debugMat, c.rect, Scalar(150.0, 150.0, 150.0, 255.0), 2) }
-                Imgproc.rectangle(debugMat, searchRect, Scalar(255.0, 0.0, 255.0, 255.0), 3)
-                
-                Imgproc.line(debugMat, Point(outerChar.center.x, predictedTopY), Point(outerChar.center.x + expectedDistX, predictedTopY), Scalar(0.0, 255.0, 0.0, 255.0), 2)
-                Imgproc.line(debugMat, Point(outerChar.center.x, predictedBottomY), Point(outerChar.center.x + expectedDistX, predictedBottomY), Scalar(0.0, 255.0, 0.0, 255.0), 2)
-                
-                val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
-                Utils.matToBitmap(debugMat, debugBmp)
-                
-                val stepNum = if (isLeft) "3" else "5"
-                it.pauseAndShowStep(
-                    "디버그 $stepNum/9: $dirStr 궤도", debugBmp,
-                    "[$stepNum/9] $dirStr 3점 기울기 궤도 투사",
-                    listOf("-> (마젠타) 1글자 너비 제한 탐색 박스", "-> (초록선) 이전 문자와 시드 문자를 이은 예측 기울기")
-                )
-                debugMat.release(); debugBmp.recycle()
-            }
-
             val probeBmp = Bitmap.createBitmap(fullBitmap, searchRect.x, searchRect.y, searchRect.width, searchRect.height)
-            val localMlKitBoxes = mlKitScanner.scanCharacters(probeBmp)
+            val localBoxes = mlKitScanner.scanCharacters(probeBmp)
             probeBmp.recycle()
 
-            var foundValid = false
+            if (localBoxes.isNotEmpty()) {
+                val currentCenter = Point(currentBox.exactCenterX().toDouble(), currentBox.exactCenterY().toDouble())
+                val bestCandidate = chooseNearestCandidate(currentCenter, localBoxes, searchRect, isLeft, visited)
 
-            if (localMlKitBoxes.isNotEmpty()) {
-                val targetLocalBox = if (isLeft) {
-                    localMlKitBoxes.maxByOrNull { it.right }
+                if (bestCandidate != null) {
+                    result.add(bestCandidate)
+                    visited.add(bestCandidate)
+                    recentBoxes.add(bestCandidate) 
+                    currentBox = bestCandidate
+                    stepLogs.add(" -> [$dirStr 확장] ML Kit 후보 선택 완료")
                 } else {
-                    localMlKitBoxes.minByOrNull { it.left }
-                }
-
-                if (targetLocalBox != null) {
-                    val globalMlKitRect = Rect(
-                        searchRect.x + targetLocalBox.left,
-                        searchRect.y + targetLocalBox.top,
-                        targetLocalBox.width(),
-                        targetLocalBox.height()
-                    )
-
-                    val tightChar = tightenWithOpenCV(fullGray, globalMlKitRect, fullMat.cols(), fullMat.rows())
-                    
-                    if (isValidNextChar(tightChar, cachedCluster, stepLogs, dirStr, centerSlope, topSlope, bottomSlope)) {
-                        currentCluster.add(tightChar)
-                        stats = calculateClusterStats(currentCluster) 
-                        foundValid = true
-                        stepLogs.add(" -> [$dirStr 연결] ML Kit 탐색 성공 -> OpenCV 타이트 바운딩 완료")
-                    }
+                    stepLogs.add(" -> [$dirStr 중단] 모든 후보가 이미 방문(visited) 됨")
+                    expand = false
                 }
             } else {
-                stepLogs.add(" -> [$dirStr 중단] ML Kit가 해당 영역에서 문자를 찾지 못함")
+                stepLogs.add(" -> [$dirStr 중단] 탐색 ROI 내 ML Kit 결과 없음")
+                expand = false
             }
-
-            if (!foundValid) expand = false
         }
-
-        debugListener?.let {
-            val debugMat = fullMat.clone()
-            currentCluster.forEach { char -> Imgproc.rectangle(debugMat, char.rect, Scalar(255.0, 255.0, 0.0, 255.0), 3) }
-            
-            val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
-            Utils.matToBitmap(debugMat, debugBmp)
-            
-            val stepNum = if (isLeft) "4" else "6"
-            it.pauseAndShowStep(
-                "디버그 $stepNum/9: $dirStr 완료", debugBmp,
-                "[$stepNum/9] $dirStr 확장 루프 완료",
-                stepLogs.takeLast(3)
-            )
-            debugMat.release(); debugBmp.recycle()
-        }
+        return result
     }
 
-    private fun isValidNextChar(
-        newChar: CharData, currentCluster: List<CharData>, logs: MutableList<String>, dir: String,
-        centerSlope: Double, topSlope: Double, bottomSlope: Double
-    ): Boolean {
-        if (currentCluster.isEmpty()) return true
+    private fun buildSearchROI(
+        currentBox: android.graphics.Rect, 
+        recentBoxes: List<android.graphics.Rect>, 
+        isLeft: Boolean, 
+        fullW: Int, fullH: Int
+    ): org.opencv.core.Rect {
         
-        val sortedArea = currentCluster.map { it.rect.area() }.sorted()
-        val sortedHeight = currentCluster.map { it.height }.sorted()
-        val medianArea = sortedArea[currentCluster.size / 2]
-        val medianH = sortedHeight[currentCluster.size / 2]
+        val historyToUse = recentBoxes.takeLast(3)
+        val avgWidth = historyToUse.map { it.width() }.average()
+        val avgHeight = historyToUse.map { it.height() }.average()
 
-        val outerChar = if (dir == "좌측") currentCluster.first() else currentCluster.last()
-        val distToNext = newChar.center.x - outerChar.center.x
+        var avgDistance = avgWidth * 0.8
+        var expectedDy = 0.0
 
-        val expectedTopY = outerChar.topCenter.y + topSlope * distToNext
-        val expectedBottomY = outerChar.bottomCenter.y + bottomSlope * distToNext
-        val expectedCenterY = outerChar.center.y + centerSlope * distToNext
+        if (historyToUse.size >= 2) {
+            val dists = mutableListOf<Double>()
+            for (i in 1 until historyToUse.size) {
+                val dx = abs(historyToUse[i].exactCenterX() - historyToUse[i - 1].exactCenterX())
+                dists.add(dx.toDouble())
+            }
+            val latestAvgDist = dists.average()
+            avgDistance = min(latestAvgDist, avgWidth * 3.0) 
 
-        val topDeviation = abs(newChar.topCenter.y - expectedTopY)
-        val bottomDeviation = abs(newChar.bottomCenter.y - expectedBottomY)
-        val centerDeviation = abs(newChar.center.y - expectedCenterY)
-
-        val isBoundsDeviated = topDeviation > (medianH * 0.35) || bottomDeviation > (medianH * 0.35)
-
-        if (newChar.rect.area() < medianArea * 0.35 && isBoundsDeviated) {
-            logs.add(" -> [$dir 중단] 볼트/먼지 차단 (면적 급감 + 3단 궤도 이탈)")
-            return false 
+            val firstBox = historyToUse.first()
+            val lastBox = historyToUse.last()
+            
+            val dxTotal = lastBox.exactCenterX() - firstBox.exactCenterX()
+            val dyTotal = lastBox.exactCenterY() - firstBox.exactCenterY()
+            
+            if (abs(dxTotal) > 1.0) {
+                val slope = dyTotal.toDouble() / dxTotal.toDouble()
+                val stepDx = if (isLeft) -avgDistance else avgDistance
+                expectedDy = stepDx * slope
+            }
         }
-        if (newChar.rect.area() > medianArea * 2.5 && isBoundsDeviated) {
-            logs.add(" -> [$dir 중단] 범퍼/프레임 차단 (면적 급증 + 3단 궤도 이탈)")
-            return false
+
+        val searchWidth = (avgDistance + avgWidth * 1.2).toInt()
+        val searchHeight = (avgHeight * 1.5).toInt()
+        val overlapX = (avgWidth * 0.2).toInt()
+        
+        val expectedCenterY = currentBox.exactCenterY() + expectedDy
+        
+        val searchX = if (isLeft) {
+            currentBox.left - searchWidth + overlapX
+        } else {
+            currentBox.right - overlapX
         }
-        if (centerDeviation > medianH * 0.6) {
-            logs.add(" -> [$dir 중단] 중심점 3단 궤도 완전 이탈")
-            return false
+        
+        val searchY = (expectedCenterY - searchHeight / 2.0).toInt()
+        
+        return getSafeRect(searchX, searchY, searchWidth, searchHeight, fullW, fullH)
+    }
+
+    private fun chooseNearestCandidate(
+        currentCenter: Point,
+        candidates: List<android.graphics.Rect>,
+        searchRect: org.opencv.core.Rect,
+        isLeft: Boolean,
+        visited: List<android.graphics.Rect>
+    ): android.graphics.Rect? {
+        var bestCandidate: android.graphics.Rect? = null
+        var minDiff = Double.MAX_VALUE
+
+        for (localBox in candidates) {
+            val globalBox = android.graphics.Rect(
+                searchRect.x + localBox.left,
+                searchRect.y + localBox.top,
+                searchRect.x + localBox.right,
+                searchRect.y + localBox.bottom
+            )
+            
+            if (isVisited(globalBox, visited)) continue
+
+            val candidateCenterX = globalBox.exactCenterX().toDouble()
+            val candidateCenterY = globalBox.exactCenterY().toDouble()
+            
+            // X축 방향 조건 검증 (좌/우측으로 진행하고 있는지)
+            val isValidDirection = if (isLeft) {
+                candidateCenterX < currentCenter.x
+            } else {
+                candidateCenterX > currentCenter.x
+            }
+
+            if (isValidDirection) {
+                // 수정 반영: 1D 거리 계산 방식 -> 2D 유클리드 빗변 거리 계산으로 변경
+                val dx = candidateCenterX - currentCenter.x
+                val dy = candidateCenterY - currentCenter.y
+                val dist = hypot(dx, dy)
+                
+                if (dist < minDiff) {
+                    minDiff = dist
+                    bestCandidate = globalBox
+                }
+            }
         }
-        if (newChar.height < medianH * 0.50 || newChar.height > medianH * 1.50) {
-            logs.add(" -> [$dir 중단] 원근 오차를 넘는 높이 급변 차단")
-            return false
+        return bestCandidate
+    }
+
+    private fun isVisited(candidate: android.graphics.Rect, visited: List<android.graphics.Rect>): Boolean {
+        val cx1 = candidate.exactCenterX()
+        val cy1 = candidate.exactCenterY()
+        
+        // 수정 반영: 폭(Width) 대신 넓은 방향(Max)을 기준으로 삼아 좁은 숫자('1')도 안정적으로 필터링
+        val maxDimension = max(candidate.width(), candidate.height())
+        
+        for (v in visited) {
+            val cx2 = v.exactCenterX()
+            val cy2 = v.exactCenterY()
+            val dist = hypot((cx1 - cx2).toDouble(), (cy1 - cy2).toDouble())
+            
+            if (dist < maxDimension * 0.4) {
+                return true
+            }
         }
-        return true
+        return false
     }
 
     private fun buildWireframe(
