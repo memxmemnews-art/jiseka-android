@@ -615,7 +615,7 @@ object PlateDetectionEngine {
             val dx = x2 - x1; val dy = y2 - y1
             val det = vx2 * vy1 - vy2 * vx1
             if (abs(det) < 1e-6) return Point(x1, y1)
-            val u = (dy * vx1 - dx * 구vy1) / det
+            val u = (dy * vx1 - dx * vy1) / det
             return Point(x2 + u * vx2, y2 + u * vy2)
         }
 
