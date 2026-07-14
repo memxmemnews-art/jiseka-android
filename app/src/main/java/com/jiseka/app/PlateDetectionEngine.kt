@@ -39,7 +39,8 @@ object PlateDetectionEngine {
         return Rect(safeX, safeY, safeW, safeH)
     }
 
-    private fun tightenWithOpenCV(fullGray: Mat, mlKitGlobalRect: Rect, fullCols: Int, fullRows: Int): CharData {
+    // [필터 2차 방어] OpenCV 픽셀 밀도(Stroke Density) 검사 추가 -> 노이즈면 null 반환
+    private fun tightenWithOpenCV(fullGray: Mat, mlKitGlobalRect: Rect, fullCols: Int, fullRows: Int): CharData? {
         val padY = (mlKitGlobalRect.height * 0.10).toInt()
         val padX = (mlKitGlobalRect.width * 0.02).toInt()
         
@@ -59,6 +60,16 @@ object PlateDetectionEngine {
 
         val thresh = Mat()
         Imgproc.adaptiveThreshold(blurred, thresh, 255.0, Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, Imgproc.THRESH_BINARY_INV, 19, 12.0)
+
+        // ⭐️ 픽셀 밀도(Stroke Density) 검사: 속이 꽉 찬 범퍼나 텅 빈 먼지 제거
+        val nonZeroPixels = Core.countNonZero(thresh)
+        val totalPixels = thresh.rows() * thresh.cols()
+        val density = nonZeroPixels.toDouble() / max(1, totalPixels).toDouble()
+
+        if (density < 0.08 || density > 0.75) {
+            roiGray.release(); blurred.release(); thresh.release()
+            return null // 밀도가 글씨의 범위를 벗어나면 즉시 폐기
+        }
 
         val tempClose = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
@@ -209,8 +220,11 @@ object PlateDetectionEngine {
         val collectedChars = mutableListOf<CharData>()
         for (box in allMlKitBoxes) {
             val cvRect = org.opencv.core.Rect(box.left, box.top, box.width(), box.height())
+            // OpenCV 필터를 통과한 진짜 문자만 수집
             val tightChar = tightenWithOpenCV(fullGray, cvRect, fullMat.cols(), fullMat.rows())
-            collectedChars.add(tightChar)
+            if (tightChar != null) {
+                collectedChars.add(tightChar)
+            }
         }
 
         if (collectedChars.size > 2) {
@@ -239,7 +253,7 @@ object PlateDetectionEngine {
             
             it.pauseAndShowStep(
                 "디버그 7/9: 타이트 바운딩 일괄 적용", debugBmp,
-                "[7/9] ML Kit 탐색 완료 후 일괄 OpenCV 적용",
+                "[7/9] 픽셀 밀도 필터링 통과 및 일괄 OpenCV 적용",
                 listOf("-> (노랑) ${collectedChars.size}개 문자에 대해 일괄 타이트 바운딩 완료")
             )
             debugMat.release(); debugBmp.recycle()
@@ -262,7 +276,7 @@ object PlateDetectionEngine {
         fullW: Int, fullH: Int
     ): List<android.graphics.Rect> {
         val stepLogs = mutableListOf<String>()
-        stepLogs.add("[진단] ML Kit 전용 방향별 탐색 루프 기동.")
+        stepLogs.add("[진단] ML Kit 전용 방향별 탐색 및 기하학적 노이즈 필터 가동.")
 
         val visited = mutableListOf<android.graphics.Rect>()
         visited.add(seedGlobalBox)
@@ -276,6 +290,33 @@ object PlateDetectionEngine {
         allBoxes.addAll(rightBoxes)
 
         return allBoxes
+    }
+
+    // ⭐️ [필터 1차 방어] 물리적 기하학 필터 (그릴, 볼트, 범퍼 차단)
+    private fun filterNoiseBoxes(
+        rawBoxes: List<android.graphics.Rect>,
+        seedBox: android.graphics.Rect
+    ): List<android.graphics.Rect> {
+        return rawBoxes.filter { box ->
+            val w = box.width().toFloat()
+            val h = box.height().toFloat()
+            if (w <= 0 || h <= 0) return@filter false
+            
+            val ratio = w / h
+            val seedW = seedBox.width().toFloat()
+            val seedH = seedBox.height().toFloat()
+
+            // 1. 그릴/범퍼 라인: 너무 납작(>1.3)하거나 너무 얇은 선(<0.15)
+            if (ratio < 0.15 || ratio > 1.3) return@filter false
+
+            // 2. 볼트: 정사각형 비율(0.7~1.3)이면서 크기가 기준 문자(시드)의 40% 미만일 때
+            if (ratio in 0.7..1.3 && w < seedW * 0.4 && h < seedH * 0.4) return@filter false
+
+            // 3. 거대 그림자: 높이가 기준 문자의 2.2배 이상이거나 절반 이하일 때
+            if (h > seedH * 2.2 || h < seedH * 0.45) return@filter false
+
+            true // 모든 함정을 통과한 진짜 문자 후보
+        }
     }
 
     private suspend fun expandOneDirectionMLKit(
@@ -297,8 +338,11 @@ object PlateDetectionEngine {
             if (searchRect.width < 10) break
 
             val probeBmp = Bitmap.createBitmap(fullBitmap, searchRect.x, searchRect.y, searchRect.width, searchRect.height)
-            val localBoxes = mlKitScanner.scanCharacters(probeBmp)
+            val rawLocalBoxes = mlKitScanner.scanCharacters(probeBmp)
             probeBmp.recycle()
+
+            // 1차 방어선: 기하학적 노이즈 제거
+            val localBoxes = filterNoiseBoxes(rawLocalBoxes, seedBox)
 
             if (localBoxes.isNotEmpty()) {
                 val currentCenter = Point(currentBox.exactCenterX().toDouble(), currentBox.exactCenterY().toDouble())
@@ -309,13 +353,13 @@ object PlateDetectionEngine {
                     visited.add(bestCandidate)
                     recentBoxes.add(bestCandidate) 
                     currentBox = bestCandidate
-                    stepLogs.add(" -> [$dirStr 확장] ML Kit 후보 선택 완료")
+                    stepLogs.add(" -> [$dirStr 확장] 필터를 통과한 최고 후보 선택 완료")
                 } else {
-                    stepLogs.add(" -> [$dirStr 중단] 모든 후보가 이미 방문(visited) 됨")
+                    stepLogs.add(" -> [$dirStr 중단] 모든 유효 후보가 이미 방문(visited) 됨")
                     expand = false
                 }
             } else {
-                stepLogs.add(" -> [$dirStr 중단] 탐색 ROI 내 ML Kit 결과 없음")
+                stepLogs.add(" -> [$dirStr 중단] 탐색 ROI 내 유효 결과 없음 (노이즈 필터링 됨)")
                 expand = false
             }
         }
@@ -398,7 +442,6 @@ object PlateDetectionEngine {
             val candidateCenterX = globalBox.exactCenterX().toDouble()
             val candidateCenterY = globalBox.exactCenterY().toDouble()
             
-            // X축 방향 조건 검증 (좌/우측으로 진행하고 있는지)
             val isValidDirection = if (isLeft) {
                 candidateCenterX < currentCenter.x
             } else {
@@ -406,7 +449,6 @@ object PlateDetectionEngine {
             }
 
             if (isValidDirection) {
-                // 수정 반영: 1D 거리 계산 방식 -> 2D 유클리드 빗변 거리 계산으로 변경
                 val dx = candidateCenterX - currentCenter.x
                 val dy = candidateCenterY - currentCenter.y
                 val dist = hypot(dx, dy)
@@ -423,8 +465,6 @@ object PlateDetectionEngine {
     private fun isVisited(candidate: android.graphics.Rect, visited: List<android.graphics.Rect>): Boolean {
         val cx1 = candidate.exactCenterX()
         val cy1 = candidate.exactCenterY()
-        
-        // 수정 반영: 폭(Width) 대신 넓은 방향(Max)을 기준으로 삼아 좁은 숫자('1')도 안정적으로 필터링
         val maxDimension = max(candidate.width(), candidate.height())
         
         for (v in visited) {
@@ -449,6 +489,7 @@ object PlateDetectionEngine {
 
         var validChars = collectedChars.toMutableList()
 
+        // ⭐️ [필터 3차 방어] KOR 마크 타격 (색상 검증)
         if (validChars.isNotEmpty()) {
             val firstChar = validChars.first() 
             val roiMat = fullMat.submat(firstChar.rect)
@@ -457,9 +498,10 @@ object PlateDetectionEngine {
             
             val r = meanColor.`val`[0].toInt(); val g = meanColor.`val`[1].toInt(); val b = meanColor.`val`[2].toInt()
             
+            // 파란색이 붉은색과 초록색 대비 압도적으로 높다면 KOR 마크로 간주하여 절단
             if (b > r + 25 && b > g + 15) {
                 validChars.removeAt(0) 
-                stepLogs.add(" -> [검증] 좌측 KOR 파랑 마크 식별 및 제거 완료")
+                stepLogs.add(" -> [검증] 좌측 KOR 파랑 마크 식별 및 완전 제거 완료")
             }
         }
 
@@ -573,7 +615,7 @@ object PlateDetectionEngine {
             val dx = x2 - x1; val dy = y2 - y1
             val det = vx2 * vy1 - vy2 * vx1
             if (abs(det) < 1e-6) return Point(x1, y1)
-            val u = (dy * vx1 - dx * vy1) / det
+            val u = (dy * vx1 - dx * 구vy1) / det
             return Point(x2 + u * vx2, y2 + u * vy2)
         }
 
