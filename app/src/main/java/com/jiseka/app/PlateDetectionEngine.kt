@@ -39,14 +39,14 @@ object PlateDetectionEngine {
         return Rect(safeX, safeY, safeW, safeH)
     }
 
-    // ⭐️ 완전히 개편된 문자 분할 및 타이트 바운딩 함수 (수직 투영 프로파일 적용)
+    // ⭐️ 수직 투영 프로파일(Vertical Projection)을 활용한 뭉친 글자 분할 및 타이트 바운딩
     private fun splitAndTightenWithOpenCV(
         fullGray: Mat, mlKitGlobalRect: Rect, fullCols: Int, fullRows: Int, seedWidth: Double?
     ): List<CharData> {
         val resultChars = mutableListOf<CharData>()
 
         val padY = (mlKitGlobalRect.height * 0.10).toInt()
-        val padX = (mlKitGlobalRect.width * 0.05).toInt() // 양옆 여백을 약간 더 줍니다.
+        val padX = (mlKitGlobalRect.width * 0.05).toInt() 
         
         val searchRect = getSafeRect(
             mlKitGlobalRect.x - padX,
@@ -65,7 +65,7 @@ object PlateDetectionEngine {
         val thresh = Mat()
         Imgproc.adaptiveThreshold(blurred, thresh, 255.0, Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, Imgproc.THRESH_BINARY_INV, 19, 12.0)
 
-        // 1. 픽셀 밀도 검사 (노이즈 필터링 유지)
+        // 1. 픽셀 밀도 검사 (노이즈 필터링)
         val nonZeroPixels = Core.countNonZero(thresh)
         val totalPixels = thresh.rows() * thresh.cols()
         val density = nonZeroPixels.toDouble() / max(1, totalPixels).toDouble()
@@ -75,7 +75,12 @@ object PlateDetectionEngine {
             return emptyList()
         }
 
-        // --- 🔪 2. Vertical Projection Profile (수직 투영 기반 골짜기 찾기) ---
+        // 2. Morphology Close 연산 선제 적용 (끊어진 획 복구 및 덩어리화)
+        val tempClose = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
+        Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
+        tempClose.release()
+
+        // 3. 수직 투영 프로파일(Vertical Projection Profile) 생성 및 골짜기 탐색
         val projection = IntArray(thresh.cols())
         for (col in 0 until thresh.cols()) {
             var colSum = 0
@@ -87,12 +92,10 @@ object PlateDetectionEngine {
             projection[col] = colSum
         }
 
-        // 획의 평균 높이를 대략적으로 추산 (노이즈 판단용 임계값)
         val maxProj = projection.maxOrNull() ?: 1
-        val noiseThreshold = maxProj * 0.10 // 최대 획 높이의 10% 미만은 픽셀이 끊긴 빈 공간(Valley)으로 간주
+        val noiseThreshold = maxProj * 0.10 
 
-        // 글자가 있는 구간(Segment) 분리하기
-        val segments = mutableListOf<Pair<Int, Int>>() // <StartX, EndX>
+        val segments = mutableListOf<Pair<Int, Int>>() 
         var isText = false
         var startX = 0
 
@@ -103,34 +106,27 @@ object PlateDetectionEngine {
             } else if (isText && projection[col] <= noiseThreshold) {
                 isText = false
                 val segmentWidth = col - startX
-                // 아주 얇은 세로줄(노이즈) 무시. '1'과 같은 숫자도 일정 폭 이상은 됨.
                 if (segmentWidth > (seedWidth ?: 10.0) * 0.15) { 
                     segments.add(Pair(startX, col))
                 }
             }
         }
-        // 마지막 글자가 끝까지 꽉 차서 0으로 안 떨어지고 끝난 경우 처리
+        
         if (isText) {
              if ((projection.size - startX) > (seedWidth ?: 10.0) * 0.15) {
                  segments.add(Pair(startX, projection.size - 1))
              }
         }
 
-        // --- 3. 분리된 각 구간(Segment)별로 다시 윤곽선(Contour)을 따서 Y축까지 완벽하게 타이트 바운딩 ---
+        // 4. 분리된 구간별로 각각 독립된 타이트 바운딩 박스 생성
         for (segment in segments) {
             val segX = segment.first
             val segEndX = segment.second
             val segWidth = segEndX - segX
             
-            // X축은 잘랐지만, Y축 여백을 없애기 위해 해당 구역만 따로 이진화 데이터 복사
             val segRect = Rect(segX, 0, segWidth, thresh.rows())
             val segMat = Mat()
             thresh.submat(segRect).copyTo(segMat)
-
-            // 작은 먼지를 없애기 위한 살짝의 Morphology
-            val tempClose = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
-            Imgproc.morphologyEx(segMat, segMat, Imgproc.MORPH_CLOSE, tempClose)
-            tempClose.release()
 
             val contours = ArrayList<MatOfPoint>()
             val hierarchy = Mat()
@@ -140,7 +136,6 @@ object PlateDetectionEngine {
                 var minX = Int.MAX_VALUE; var minY = Int.MAX_VALUE
                 var maxX = Int.MIN_VALUE; var maxY = Int.MIN_VALUE
 
-                // 해당 글자 구역(Segment) 안의 유효한 윤곽선들 병합 (이제 글자 1개 단위이므로 병합해도 안전함)
                 for (contour in contours) {
                     val rect = Imgproc.boundingRect(contour)
                     if (rect.area() > 10) { 
@@ -152,7 +147,6 @@ object PlateDetectionEngine {
                 }
 
                 if (maxX > minX && maxY > minY) {
-                    // 최종 분리 및 타이트 된 글자 박스
                     val finalTightRect = Rect(
                         searchRect.x + segX + minX, 
                         searchRect.y + minY, 
@@ -160,7 +154,6 @@ object PlateDetectionEngine {
                         maxY - minY
                     )
                     
-                    // 기하학 노이즈 2차 검증 (자른 조각이 너무 작거나 납작하면 버림)
                     if (finalTightRect.height > searchRect.height * 0.3) {
                         val globalCenter = Point(finalTightRect.x + finalTightRect.width / 2.0, finalTightRect.y + finalTightRect.height / 2.0)
                         resultChars.add(CharData(globalCenter, finalTightRect.width.toDouble(), finalTightRect.height.toDouble(), finalTightRect))
@@ -300,14 +293,14 @@ object PlateDetectionEngine {
         val collectedChars = mutableListOf<CharData>()
         val seedWidthEstimate = seedGlobalBox.width().toDouble()
 
-        // ⭐️ [변경됨] 수집된 모든 ML Kit 박스를 프로젝션 분할기로 넘겨 여러 개의 글자로 쪼개서 받음
+        // 확보된 모든 ML Kit 박스를 프로젝션 분할기로 넘겨 여러 개의 1글자로 쪼개서 수집
         for (box in allMlKitBoxes) {
             val cvRect = org.opencv.core.Rect(box.left, box.top, box.width(), box.height())
             val splitChars = splitAndTightenWithOpenCV(fullGray, cvRect, fullMat.cols(), fullMat.rows(), seedWidthEstimate)
             collectedChars.addAll(splitChars)
         }
 
-        // --- X 좌표 기준으로 재정렬 및 중복된 글자 제거 (같은 글자를 쪼개다 보면 겹칠 수 있음) ---
+        // X 좌표 기준으로 정렬 및 너무 심하게 겹친(과분할 또는 중복 탐색) 글자 제거
         collectedChars.sortBy { it.rect.x }
         val uniqueChars = mutableListOf<CharData>()
         for (char in collectedChars) {
@@ -316,13 +309,13 @@ object PlateDetectionEngine {
             } else {
                 val lastChar = uniqueChars.last()
                 val dist = abs(char.center.x - lastChar.center.x)
-                // 두 글자의 중심 거리가 평균 너비의 40% 미만이면 완전히 겹친 중복 글자로 간주
                 if (dist > (char.width + lastChar.width) / 2.0 * 0.4) {
                     uniqueChars.add(char)
                 }
             }
         }
 
+        // 높이 기준 글로벌 청소 (노이즈 방어)
         if (uniqueChars.size > 2) {
             val heightsDesc = uniqueChars.map { it.height }.sortedDescending()
             val trueHeight = if (heightsDesc.size >= 3) heightsDesc[2] else heightsDesc.first()
@@ -400,7 +393,7 @@ object PlateDetectionEngine {
             val seedW = seedBox.width().toFloat()
             val seedH = seedBox.height().toFloat()
 
-            // 뭉친 문자("16", "270")를 허용하기 위해 가로로 긴 형태(ratio 최대 4.0까지)를 살려둡니다.
+            // 프로젝션 분할을 믿고 상한선을 4.0까지 넓게 잡아 단어 뭉치를 허용
             if (ratio < 0.15 || ratio > 4.0) return@filter false
             if (ratio in 0.7..1.3 && w < seedW * 0.4 && h < seedH * 0.4) return@filter false
             if (h > seedH * 2.2 || h < seedH * 0.45) return@filter false
@@ -646,14 +639,19 @@ object PlateDetectionEngine {
             }
         }
 
+        // ⭐️ 디버그 화면 업데이트: 상/중/하단 3개 궤도를 모두 시각화하여 확인 가능
         debugListener?.let {
             val debugMat = fullMat.clone()
             validChars.forEach { char -> 
                 Imgproc.rectangle(debugMat, char.rect, Scalar(255.0, 100.0, 100.0, 255.0), 3) 
-                Imgproc.circle(debugMat, char.center, 5, Scalar(0.0, 255.0, 0.0, 255.0), -1)
+                Imgproc.circle(debugMat, char.topCenter, 5, Scalar(255.0, 255.0, 0.0, 255.0), -1) 
+                Imgproc.circle(debugMat, char.center, 5, Scalar(0.0, 255.0, 0.0, 255.0), -1) 
+                Imgproc.circle(debugMat, char.bottomCenter, 5, Scalar(255.0, 0.0, 255.0, 255.0), -1) 
             }
             if (validChars.size >= 2) {
+                Imgproc.line(debugMat, validChars.first().topCenter, validChars.last().topCenter, Scalar(255.0, 255.0, 0.0, 255.0), 2)
                 Imgproc.line(debugMat, validChars.first().center, validChars.last().center, Scalar(0.0, 255.0, 255.0, 255.0), 2)
+                Imgproc.line(debugMat, validChars.first().bottomCenter, validChars.last().bottomCenter, Scalar(255.0, 0.0, 255.0, 255.0), 2)
             }
             
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
@@ -661,7 +659,7 @@ object PlateDetectionEngine {
             
             it.pauseAndShowStep(
                 "디버그 8/9: 최종 궤도 검증", debugBmp,
-                "[8/9] 선형 궤도 검증 & KOR 마크 삭제",
+                "[8/9] 상/중/하 3단 선형 궤도 검증 & KOR 삭제",
                 stepLogs
             )
             debugMat.release(); debugBmp.recycle()
