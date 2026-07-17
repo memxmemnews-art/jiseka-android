@@ -58,10 +58,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
-import kotlin.coroutines.resume 
-import kotlin.coroutines.suspendCoroutine 
 import kotlin.math.max
-import kotlin.math.min
 
 @OptIn(TransformExperimental::class)
 class MainActivity : AppCompatActivity() {
@@ -76,7 +73,6 @@ class MainActivity : AppCompatActivity() {
     private var progressBar: ProgressBar? = null
     private var guideText: TextView? = null
 
-    // 화면 고정용 디버그 HUD UI 요소
     private var debugLatch: CountDownLatch? = null
     private var btnDebugNext: Button? = null
     private var debugHudContainer: LinearLayout? = null
@@ -103,8 +99,6 @@ class MainActivity : AppCompatActivity() {
     private val viewMatrix = Matrix()
     private val inverseMatrix = Matrix()
     private var isMatrixReady = false
-    
-    private var isZoomed = false
 
     private val uiHandler = android.os.Handler(Looper.getMainLooper())
     private val hideGuideTextRunnable = Runnable {
@@ -233,25 +227,6 @@ class MainActivity : AppCompatActivity() {
         nativeGuideView?.onTouchPointListener = touchDrop@{ uiPoint ->
             if (!isMatrixReady) return@touchDrop
 
-            if (!isZoomed) {
-                isZoomed = true
-                nativeBackgroundView?.pivotX = uiPoint.x
-                nativeBackgroundView?.pivotY = uiPoint.y
-                nativeBackgroundView?.animate()
-                    ?.scaleX(3f)
-                    ?.scaleY(3f)
-                    ?.setDuration(300)
-                    ?.withEndAction {
-                        guideText?.text = "번호판 글자를 터치해주세요"
-                        guideText?.alpha = 1f
-                        guideText?.visibility = View.VISIBLE
-                        uiHandler.removeCallbacks(hideGuideTextRunnable)
-                        uiHandler.postDelayed(hideGuideTextRunnable, 3500)
-                    }
-                    ?.start()
-                return@touchDrop 
-            }
-
             val currentSession = captureSessionId.get()
             progressBar?.visibility = View.VISIBLE
             nativeGuideView?.visibility = View.GONE
@@ -263,22 +238,14 @@ class MainActivity : AppCompatActivity() {
                 val safeBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) }
        
                 if (safeBitmap != null) {
-                    val pX = nativeBackgroundView?.pivotX ?: 0f
-                    val pY = nativeBackgroundView?.pivotY ?: 0f
-                    val currentScale = nativeBackgroundView?.scaleX ?: 1f
-                    
-                    val unscaledX = pX + (uiPoint.x - pX) / currentScale
-                    val unscaledY = pY + (uiPoint.y - pY) / currentScale
-
                     val touchCoords = FloatArray(2).apply { 
-                        this[0] = unscaledX
-                        this[1] = unscaledY 
+                        this[0] = uiPoint.x
+                        this[1] = uiPoint.y 
                     }
                     inverseMatrix.mapPoints(touchCoords)
                     val debugInterceptor = createDebugInterceptor()
 
                     runMLKitPipeline(safeBitmap, touchCoords[0], touchCoords[1], currentSession, debugInterceptor)
-
                 } else {
                     runOnUiThread { progressBar?.visibility = View.GONE }
                 }
@@ -292,93 +259,66 @@ class MainActivity : AppCompatActivity() {
     ) {
         val recognizer = TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
 
-        val smartCrop = PlateDetectionEngine.prepareSeedCrop(safeBitmap, touchX, touchY, debugInterceptor)
-        
-        if (smartCrop != null) {
-            val image1 = InputImage.fromBitmap(smartCrop.croppedBitmap, 0)
-            recognizer.process(image1)
-                .addOnSuccessListener { visionText1 ->
+        val localCrop = PlateDetectionEngine.prepareWideCrop(safeBitmap, touchX, touchY)
+        val image = InputImage.fromBitmap(localCrop.croppedBitmap, 0)
+
+        recognizer.process(image)
+            .addOnSuccessListener { visionText ->
+                val localTouchX = touchX - localCrop.offsetX
+                val localTouchY = touchY - localCrop.offsetY
+
+                val localLineBox = findClosestLineBox(visionText, localTouchX, localTouchY)
+
+                if (localLineBox != null) {
+                    val globalLineBox = android.graphics.Rect(
+                        localCrop.offsetX + localLineBox.left,
+                        localCrop.offsetY + localLineBox.top,
+                        localCrop.offsetX + localLineBox.right,
+                        localCrop.offsetY + localLineBox.bottom
+                    )
                     
-                    val localTouchX = touchX - smartCrop.offsetX
-                    val localTouchY = touchY - smartCrop.offsetY
-                    var closestSymbolBox1 = findClosestSymbolBox(visionText1, localTouchX, localTouchY)
-
-                    if (closestSymbolBox1 != null) {
-                        buildFinalWireframe(safeBitmap, smartCrop.offsetX, smartCrop.offsetY, closestSymbolBox1, currentSession, debugInterceptor)
-                    } else {
-                        runFallbackDumbCrop(recognizer, safeBitmap, touchX, touchY, currentSession, debugInterceptor)
-                    }
-                }
-                .addOnFailureListener {
-                    runFallbackDumbCrop(recognizer, safeBitmap, touchX, touchY, currentSession, debugInterceptor)
-                }
-        } else {
-            runFallbackDumbCrop(recognizer, safeBitmap, touchX, touchY, currentSession, debugInterceptor)
-        }
-    }
-
-    private fun runFallbackDumbCrop(
-        recognizer: com.google.mlkit.vision.text.TextRecognizer,
-        safeBitmap: Bitmap, touchX: Float, touchY: Float,
-        currentSession: Int, debugInterceptor: PlateDetectionEngine.DetectionDebugListener
-    ) {
-        val dumbCrop = PlateDetectionEngine.prepareDumbCrop(safeBitmap, touchX, touchY, debugInterceptor)
-        val image2 = InputImage.fromBitmap(dumbCrop.croppedBitmap, 0)
-
-        recognizer.process(image2)
-            .addOnSuccessListener { visionText2 ->
-                val localTouchX = touchX - dumbCrop.offsetX
-                val localTouchY = touchY - dumbCrop.offsetY
-                val closestSymbolBox2 = findClosestSymbolBox(visionText2, localTouchX, localTouchY)
-                
-                if (closestSymbolBox2 != null) {
-                    buildFinalWireframe(safeBitmap, dumbCrop.offsetX, dumbCrop.offsetY, closestSymbolBox2, currentSession, debugInterceptor)
+                    localCrop.croppedBitmap.recycle()
+                    
+                    buildFinalWireframe(safeBitmap, globalLineBox, currentSession, debugInterceptor)
                 } else {
+                    localCrop.croppedBitmap.recycle()
                     safeBitmap.recycle()
-                    fallbackToManualMode(currentSession, "해당 영역에서 번호판 글자를 찾지 못했습니다. 다시 시도해주세요.")
+                    fallbackToManualMode(currentSession, "해당 위치 주변에서 텍스트를 찾지 못했습니다.")
                 }
             }
             .addOnFailureListener {
+                localCrop.croppedBitmap.recycle()
                 safeBitmap.recycle()
-                fallbackToManualMode(currentSession, "텍스트 인식 엔진에 문제가 발생했습니다.")
+                fallbackToManualMode(currentSession, "텍스트 인식에 실패했습니다.")
             }
     }
 
-    private fun findClosestSymbolBox(visionText: com.google.mlkit.vision.text.Text, localTouchX: Float, localTouchY: Float): android.graphics.Rect? {
-        var closestSymbolBox: android.graphics.Rect? = null
+    private fun findClosestLineBox(visionText: com.google.mlkit.vision.text.Text, touchX: Float, touchY: Float): android.graphics.Rect? {
+        var closestLineBox: android.graphics.Rect? = null
         var minDistance = Float.MAX_VALUE
 
         for (block in visionText.textBlocks) {
             for (line in block.lines) {
-                for (element in line.elements) {
-                    for (symbol in element.symbols) {
-                        val box = symbol.boundingBox
-                        if (box != null) {
-                            if (box.contains(localTouchX.toInt(), localTouchY.toInt())) {
-                                closestSymbolBox = box
-                                minDistance = 0f
-                                break
-                            }
-                            val cx = box.exactCenterX()
-                            val cy = box.exactCenterY()
-                            val dist = Math.hypot((cx - localTouchX).toDouble(), (cy - localTouchY).toDouble()).toFloat()
-                            if (dist < minDistance) {
-                                minDistance = dist
-                                closestSymbolBox = box
-                            }
-                        }
+                val box = line.boundingBox
+                if (box != null) {
+                    if (box.contains(touchX.toInt(), touchY.toInt())) {
+                        return box
                     }
-                    if (minDistance == 0f) break
+                    val cx = box.exactCenterX()
+                    val cy = box.exactCenterY()
+                    val dist = Math.hypot((cx - touchX).toDouble(), (cy - touchY).toDouble()).toFloat()
+                    if (dist < minDistance) {
+                        minDistance = dist
+                        closestLineBox = box
+                    }
                 }
-                if (minDistance == 0f) break
             }
-            if (minDistance == 0f) break
         }
-        return closestSymbolBox
+        return closestLineBox
     }
 
     private fun buildFinalWireframe(
-        safeBitmap: Bitmap, offsetX: Int, offsetY: Int, mlKitBox: android.graphics.Rect,
+        safeBitmap: Bitmap, mlKitBox: android.graphics.Rect,
         currentSession: Int, debugInterceptor: PlateDetectionEngine.DetectionDebugListener
     ) {
         lifecycleScope.launch(Dispatchers.Default) {
@@ -387,34 +327,8 @@ class MainActivity : AppCompatActivity() {
                 return@launch
             }
 
-            val mlKitScanner = object : PlateDetectionEngine.MLKitScanner {
-                override suspend fun scanCharacters(bitmap: Bitmap): List<android.graphics.Rect> = suspendCoroutine { continuation ->
-                    val image = InputImage.fromBitmap(bitmap, 0)
-                    val recognizer = TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
-                    
-                    recognizer.process(image)
-                        .addOnSuccessListener { visionText ->
-                            val boxes = mutableListOf<android.graphics.Rect>()
-                            
-                            for (block in visionText.textBlocks) {
-                                for (line in block.lines) {
-                                    for (element in line.elements) {
-                                        for (symbol in element.symbols) {
-                                            symbol.boundingBox?.let { boxes.add(it) }
-                                        }
-                                    }
-                                }
-                            }
-                            continuation.resume(boxes)
-                        }
-                        .addOnFailureListener {
-                            continuation.resume(emptyList())
-                        }
-                }
-            }
-
             val targetPolygon = PlateDetectionEngine.processWithMLKitResult(
-                safeBitmap, offsetX, offsetY, mlKitBox, mlKitScanner, debugInterceptor
+                safeBitmap, mlKitBox, debugInterceptor
             )
 
             runOnUiThread {
@@ -426,7 +340,7 @@ class MainActivity : AppCompatActivity() {
                 if (targetPolygon != null && targetPolygon.isNotEmpty()) {
                     triggerInstantMasking(targetPolygon)
                 } else {
-                    fallbackToManualMode(currentSession, "번호판 세부 조립에 실패했습니다.")
+                    fallbackToManualMode(currentSession, "번호판 세부 분할 및 조립에 실패했습니다.")
                 }
                 safeBitmap.recycle() 
             }
@@ -484,12 +398,6 @@ class MainActivity : AppCompatActivity() {
             lastCapturedBitmap?.recycle()
             lastCapturedBitmap = null 
         }
-        
-        isZoomed = false
-        nativeBackgroundView?.scaleX = 1f
-        nativeBackgroundView?.scaleY = 1f
-        nativeBackgroundView?.translationX = 0f
-        nativeBackgroundView?.translationY = 0f
         
         isMatrixReady = false
         nativeGuideView?.resetState()
@@ -601,9 +509,6 @@ class MainActivity : AppCompatActivity() {
     private fun fallbackToManualMode(sessionId: Int, message: String) {
         runOnUiThread {
             if (captureSessionId.get() != sessionId) return@runOnUiThread
-            
-            nativeBackgroundView?.animate()?.scaleX(1f)?.scaleY(1f)?.setDuration(300)?.start()
-            isZoomed = false
             
             progressBar?.visibility = View.GONE
             nativeGuideView?.visibility = View.VISIBLE
@@ -734,9 +639,6 @@ class MainActivity : AppCompatActivity() {
                                 }, 500)
                             }
                             
-                            nativeBackgroundView?.animate()?.scaleX(1f)?.scaleY(1f)?.setDuration(300)?.start()
-                            isZoomed = false
-
                             progressBar?.visibility = View.GONE
                             resultActionLayout?.visibility = View.VISIBLE
                         }
