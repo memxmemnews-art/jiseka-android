@@ -62,8 +62,9 @@ object PlateDetectionEngine {
         return SeedCropResult(safeRect.x, safeRect.y, croppedBitmap, safeRect)
     }
 
+    // ⭐️ 수정: 디버그 리스너 추가하여 실패 원인 시각화
     private fun splitAndTightenWithOpenCV(
-        fullGray: Mat, mlKitGlobalRect: Rect, fullCols: Int, fullRows: Int, seedWidth: Double?
+        fullGray: Mat, mlKitGlobalRect: Rect, fullCols: Int, fullRows: Int, seedWidth: Double?, debugListener: DetectionDebugListener?
     ): List<CharData> {
         val resultChars = mutableListOf<CharData>()
 
@@ -91,7 +92,18 @@ object PlateDetectionEngine {
         val totalPixels = thresh.rows() * thresh.cols()
         val density = nonZeroPixels.toDouble() / max(1, totalPixels).toDouble()
 
+        // 🚨 실패 관문 1: 픽셀 밀도 검사 (노이즈, 그릴, 아스팔트 등)
         if (density < 0.08 || density > 0.75) {
+            debugListener?.let {
+                val debugBmp = Bitmap.createBitmap(thresh.cols(), thresh.rows(), Bitmap.Config.ARGB_8888)
+                Utils.matToBitmap(thresh, debugBmp)
+                it.pauseAndShowStep(
+                    "디버그 3단계: [FAIL] 밀도 검사 실패", debugBmp,
+                    "[FAIL] 텍스트 밀도 미달 또는 초과",
+                    listOf("-> 기준 밀도: 0.08 ~ 0.75", "-> 현재 밀도: ${String.format("%.3f", density)}", "-> 원인: 노이즈가 너무 많거나 글자가 아닙니다.")
+                )
+                debugBmp.recycle()
+            }
             roiGray.release(); blurred.release(); thresh.release()
             return emptyList()
         }
@@ -198,9 +210,23 @@ object PlateDetectionEngine {
         val screenRatio = fullMat.rows().toFloat() / fullMat.cols().toFloat()
 
         val seedWidthEstimate = lineGlobalBox.width().toDouble() / 7.0
-
         val cvRect = org.opencv.core.Rect(lineGlobalBox.left, lineGlobalBox.top, lineGlobalBox.width(), lineGlobalBox.height())
-        val uniqueChars = splitAndTightenWithOpenCV(fullGray, cvRect, fullMat.cols(), fullMat.rows(), seedWidthEstimate).toMutableList()
+        
+        debugListener?.let {
+            val debugMat = fullMat.clone()
+            Imgproc.rectangle(debugMat, cvRect, Scalar(0.0, 255.0, 0.0, 255.0), 4)
+            val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(debugMat, debugBmp)
+            it.pauseAndShowStep("디버그 2단계: 텍스트 글로벌 ROI", debugBmp, "[진단] 크롭 영역 기준 글로벌 좌표 복원", listOf("-> (초록) 이 영역을 투영 분할기에 넘깁니다."))
+            debugMat.release(); debugBmp.recycle()
+        }
+
+        val uniqueChars = splitAndTightenWithOpenCV(fullGray, cvRect, fullMat.cols(), fullMat.rows(), seedWidthEstimate, debugListener).toMutableList()
+
+        if (uniqueChars.isEmpty()) {
+            fullMat.release(); fullGray.release()
+            return null // 밀도 검사에서 이미 실패 화면을 띄웠음
+        }
 
         uniqueChars.sortBy { it.rect.x }
 
@@ -217,6 +243,24 @@ object PlateDetectionEngine {
             }
         }
 
+        // 🚨 실패 관문 2: 노이즈 청소 후 글자가 2개 미만일 때 (기울기 선을 그을 수 없음)
+        if (uniqueChars.size < 2) {
+            debugListener?.let {
+                val debugMat = fullMat.clone()
+                uniqueChars.forEach { char -> Imgproc.rectangle(debugMat, char.rect, Scalar(0.0, 0.0, 255.0, 255.0), 4) }
+                val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+                Utils.matToBitmap(debugMat, debugBmp)
+                it.pauseAndShowStep(
+                    "디버그 4단계: [FAIL] 유효 문자 부족", debugBmp,
+                    "[FAIL] 노이즈 청소 후 문자가 다 지워짐",
+                    listOf("-> 남은 문자: ${uniqueChars.size}개", "-> 원인: 크기가 들쭉날쭉한 쓰레기 엣지였을 확률이 높습니다.")
+                )
+                debugMat.release(); debugBmp.recycle()
+            }
+            fullMat.release(); fullGray.release()
+            return null
+        }
+
         var resultPoints: List<ImmutablePoint>? = null
         if (uniqueChars.isNotEmpty()) { 
             resultPoints = buildWireframe(uniqueChars, fullMat, fullGray, debugListener, screenRatio)
@@ -226,7 +270,6 @@ object PlateDetectionEngine {
         return resultPoints
     }
 
-    // 내부 후보군 점수 클래스 정의
     private class CandidateScore(val pts: List<Point>, val score: Double, val log: String)
 
     private fun buildWireframe(
@@ -235,7 +278,6 @@ object PlateDetectionEngine {
     ): List<ImmutablePoint>? {
         
         val stepLogs = mutableListOf<String>()
-        stepLogs.add("[진단] 와이어프레임 기하학 조립 전 최종 검증 시작")
 
         var validChars = collectedChars.toMutableList()
 
@@ -246,10 +288,8 @@ object PlateDetectionEngine {
             roiMat.release() 
             
             val r = meanColor.`val`[0].toInt(); val g = meanColor.`val`[1].toInt(); val b = meanColor.`val`[2].toInt()
-            
             if (b > r + 25 && b > g + 15) {
                 validChars.removeAt(0) 
-                stepLogs.add(" -> [검증] 좌측 KOR 파랑 마크 식별 및 완전 제거 완료")
             }
         }
 
@@ -272,7 +312,7 @@ object PlateDetectionEngine {
             val stepX = normVx * avgW * 1.15 
             val stepY = normVy * avgW * 1.15
 
-            stepLogs.add("[추가 탐색] 산출된 궤도(${String.format("%.2f", normVy/normVx)})를 따라 좌우 레이더 가동")
+            stepLogs.add("[탐색] 산출된 기울기를 따라 좌우 숨겨진 문자 적출 진행")
 
             var currentPtL = validChars.first().center
             for(i in 0..2) {
@@ -282,7 +322,7 @@ object PlateDetectionEngine {
                 
                 if (checkDensity(fullGray, roi) in 0.08..0.60) {
                     validChars.add(0, CharData(currentPtL, avgW, avgH, roi))
-                    stepLogs.add(" -> [성공] 좌측 연장선에서 숨겨진 문자 1개 추가 적출")
+                    stepLogs.add(" -> 좌측 숨겨진 문자 1개 추가 적출")
                 } else break 
             }
 
@@ -294,7 +334,7 @@ object PlateDetectionEngine {
                 
                 if (checkDensity(fullGray, roi) in 0.08..0.60) {
                     validChars.add(CharData(currentPtR, avgW, avgH, roi))
-                    stepLogs.add(" -> [성공] 우측 연장선에서 숨겨진 문자 1개 추가 적출")
+                    stepLogs.add(" -> 우측 숨겨진 문자 1개 추가 적출")
                 } else break
             }
 
@@ -308,18 +348,39 @@ object PlateDetectionEngine {
                 val dist = abs(A * charData.center.x + B * charData.center.y + C) / denominator
                 
                 if (dist > fitLineLimit) {
-                    stepLogs.add(" -> [검증] 선형 궤도 이탈 노이즈 삭제")
                     iterator.remove()
                 }
             }
         }
 
-        if (validChars.size < 4) {
-            stepLogs.add(" -> [FAIL] 추가 탐색 후에도 유효 문자가 4개 미만입니다.")
-            return null
+        // 🚨 실패 관문 3: 레이더 탐색 후에도 4개가 안될 때 
+        val isFailed = validChars.size < 4
+        if (isFailed) {
+            stepLogs.add(" -> [FAIL] 유효 문자가 ${validChars.size}개뿐이므로 기하학 조립을 포기합니다.")
+        } else {
+            stepLogs.add("[진단] 최종 ${validChars.size}개 문자로 와이어프레임 렌더링을 진행합니다.")
         }
 
-        stepLogs.add("[진단] 최종 ${validChars.size}개 문자로 와이어프레임 렌더링")
+        // ⭐️ 실패하든 성공하든 무조건 화면을 띄워서 결과를 보여줌
+        debugListener?.let {
+            val debugMat = fullMat.clone()
+            validChars.forEach { char -> 
+                Imgproc.rectangle(debugMat, char.rect, Scalar(255.0, 100.0, 100.0, 255.0), 3) 
+                Imgproc.circle(debugMat, char.center, 5, Scalar(0.0, 255.0, 0.0, 255.0), -1) 
+            }
+            if (validChars.size >= 2) {
+                Imgproc.line(debugMat, validChars.first().center, validChars.last().center, Scalar(0.0, 255.0, 255.0, 255.0), 2)
+            }
+            
+            val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(debugMat, debugBmp)
+            
+            val title = if (isFailed) "[FAIL] 번호판 문자 개수 미달" else "[진행] 기울기 탐색 및 궤도 검증"
+            it.pauseAndShowStep("디버그 5단계: 궤도 검증", debugBmp, title, stepLogs)
+            debugMat.release(); debugBmp.recycle()
+        }
+
+        if (isFailed) return null
 
         val pointsMat = MatOfPoint2f(*validChars.map { it.center }.toTypedArray())
         val line = Mat()
@@ -408,13 +469,8 @@ object PlateDetectionEngine {
             )
         }
 
-        stepLogs.add("[성공] 대칭 팽창(Scale: 1.35) 가상 테두리 생성 완료")
-
-        // --------------------------------------------------------------------------------------
-        // ⭐️ 새로운 로직: 점수(가중치) 기반 후보군 비교 알고리즘
-        // --------------------------------------------------------------------------------------
+        val scoreLogs = mutableListOf<String>()
         
-        // 1. 기준점(Baseline) 특징 추출
         val baseTl = finalPts[0]; val baseTr = finalPts[1]
         val baseBr = finalPts[2]; val baseBl = finalPts[3]
         
@@ -425,7 +481,6 @@ object PlateDetectionEngine {
         val baseCy = midY
         val baseAngle = Math.toDegrees(Math.atan2(baseTr.y - baseTl.y, baseTr.x - baseTl.x))
 
-        // 2. ROI 엣지 탐색
         val roiMinX = finalPts.minOf { it.x }.toInt()
         val roiMinY = finalPts.minOf { it.y }.toInt()
         val roiMaxX = finalPts.maxOf { it.x }.toInt()
@@ -448,7 +503,6 @@ object PlateDetectionEngine {
         val plateContours = ArrayList<MatOfPoint>()
         val hierarchy2 = Mat()
         
-        // RETR_LIST 모드로 안쪽/바깥쪽 가리지 않고 모든 엣지를 긁어모읍니다.
         Imgproc.findContours(edges, plateContours, hierarchy2, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE)
 
         val candidates = mutableListOf<CandidateScore>()
@@ -458,12 +512,10 @@ object PlateDetectionEngine {
             val approx = MatOfPoint2f()
             Imgproc.approxPolyDP(MatOfPoint2f(*contour.toArray()), approx, 0.03 * peri, true)
 
-            // 노이즈(조각) 제거를 위해 최소한 ROI 면적의 10% 이상인 볼록 사각형만 취급
             if (approx.toArray().size == 4 && Imgproc.isContourConvex(MatOfPoint(*approx.toArray()))) {
                 val area = Imgproc.contourArea(approx)
                 if (area < roiArea * 0.10) { approx.release(); continue }
                 
-                // 글로벌 좌표로 복원 및 정렬 (TL, TR, BR, BL)
                 val pts = approx.toArray().map { Point(it.x + plateRoiRect.x, it.y + plateRoiRect.y) }
                 val sortedBySum = pts.sortedBy { it.x + it.y }
                 val tl = sortedBySum.first()
@@ -474,7 +526,6 @@ object PlateDetectionEngine {
                 
                 val candPts = listOf(tl, tr, br, bl)
 
-                // 🚨 절대 방어막 (Hard Filter): 문자 포함률 검사
                 val contourMat = MatOfPoint2f(*candPts.toTypedArray())
                 var includedChars = 0
                 for (char in validChars) {
@@ -485,9 +536,8 @@ object PlateDetectionEngine {
                 contourMat.release()
                 
                 val inclusionRate = includedChars.toDouble() / validChars.size
-                if (inclusionRate < 0.5) { approx.release(); continue } // 문자를 50% 이상 못 품으면 즉시 버림
+                if (inclusionRate < 0.5) { approx.release(); continue }
 
-                // 3. 후보군 특징 산출 및 채점 (Scoring)
                 val candW = (hypot(tr.x - tl.x, tr.y - tl.y) + hypot(br.x - bl.x, br.y - bl.y)) / 2.0
                 val candH = (hypot(bl.x - tl.x, bl.y - tl.y) + hypot(br.x - tr.x, br.y - tr.y)) / 2.0
                 val candAR = candW / candH
@@ -495,23 +545,19 @@ object PlateDetectionEngine {
                 val candCy = (tl.y + tr.y + br.y + bl.y) / 4.0
                 val candAngle = Math.toDegrees(Math.atan2(tr.y - tl.y, tr.x - tl.x))
 
-                // 가중치 1: 꼭짓점 일치도 (IoU 대체, 45%)
                 val avgCornerDist = (hypot(tl.x - baseTl.x, tl.y - baseTl.y) + 
                                      hypot(tr.x - baseTr.x, tr.y - baseTr.y) + 
                                      hypot(br.x - baseBr.x, br.y - baseBr.y) + 
                                      hypot(bl.x - baseBl.x, bl.y - baseBl.y)) / 4.0
                 val cornerScore = max(0.0, 1.0 - (avgCornerDist / baseH)) * 100.0
 
-                // 가중치 2: 중심점 일치도 (25%)
                 val centerDist = hypot(candCx - baseCx, candCy - baseCy)
                 val centerScore = max(0.0, 1.0 - (centerDist / baseH)) * 100.0
 
-                // 가중치 3: 회전각 일치도 (15%)
                 var angleDiff = abs(candAngle - baseAngle)
                 if (angleDiff > 180) angleDiff = 360.0 - angleDiff
-                val angleScore = max(0.0, 1.0 - (angleDiff / 15.0)) * 100.0 // 15도 이상 차이나면 0점
+                val angleScore = max(0.0, 1.0 - (angleDiff / 15.0)) * 100.0 
 
-                // 가중치 4: 가로세로 비율(AR) 일치도 (15%)
                 val arDiff = abs(candAR - baseAR)
                 val arScore = max(0.0, 1.0 - (arDiff / baseAR)) * 100.0
 
@@ -524,24 +570,21 @@ object PlateDetectionEngine {
             }
         }
         
-        // 4. 최종 판단
         var refinedPts = finalPts 
         if (candidates.isNotEmpty()) {
             candidates.sortByDescending { it.score }
             val best = candidates.first()
             refinedPts = best.pts
-            stepLogs.add(" -> [정밀 적출 성공] 가장 높은 점수(${String.format("%.1f", best.score)}점)의 물리 테두리 채택!")
+            scoreLogs.add(" -> [정밀 적출 성공] 가장 높은 점수(${String.format("%.1f", best.score)}점)의 테두리 채택")
             candidates.forEachIndexed { index, cand -> 
-                stepLogs.add("     - 후보${index+1}: ${cand.log}") 
+                scoreLogs.add("     - 후보${index+1}: ${cand.log}") 
             }
         } else {
-            stepLogs.add(" -> [정밀 적출 실패] 조건을 만족하는 물리 테두리가 없어 1.35배 영역 유지.")
+            scoreLogs.add(" -> [정밀 적출 포기] 조건을 만족하는 테두리가 없어 1.35배 영역 유지.")
         }
 
         roiGray.release(); edges.release(); kernel.release(); hierarchy2.release()
         plateContours.forEach { it.release() }
-        // --------------------------------------------------------------------------------------
-
 
         debugListener?.let {
             val debugMat = fullMat.clone()
@@ -560,9 +603,9 @@ object PlateDetectionEngine {
             Utils.matToBitmap(debugMat, debugBmp)
             
             it.pauseAndShowStep(
-                "디버그 9/9: 점수 기반 테두리 채택", debugBmp,
-                "[9/9] 디버깅 완료: 종합 점수 기반 최적 테두리 적출",
-                stepLogs
+                "디버그 6단계: 점수 기반 테두리 채택", debugBmp,
+                "[최종] 종합 점수 기반 최적 테두리 적출",
+                scoreLogs
             )
             debugMat.release(); debugBmp.recycle()
         }
