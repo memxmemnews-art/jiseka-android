@@ -47,8 +47,9 @@ object PlateDetectionEngine {
     }
 
     fun prepareWideCrop(fullBitmap: Bitmap, touchX: Float, touchY: Float): SeedCropResult {
-        val cropW = (fullBitmap.width * 0.10f).toInt()
-        val cropH = (fullBitmap.height * 0.05f).toInt()
+        // ⭐️ 수정: 가로 25%, 세로 10%로 초기 탐색 영역 확대
+        val cropW = (fullBitmap.width * 0.25f).toInt()
+        val cropH = (fullBitmap.height * 0.10f).toInt()
 
         val safeRect = getSafeRect(
             (touchX - cropW / 2).toInt(),
@@ -62,7 +63,6 @@ object PlateDetectionEngine {
         return SeedCropResult(safeRect.x, safeRect.y, croppedBitmap, safeRect)
     }
 
-    // ⭐️ 수정: 디버그 리스너 추가하여 실패 원인 시각화
     private fun splitAndTightenWithOpenCV(
         fullGray: Mat, mlKitGlobalRect: Rect, fullCols: Int, fullRows: Int, seedWidth: Double?, debugListener: DetectionDebugListener?
     ): List<CharData> {
@@ -92,7 +92,6 @@ object PlateDetectionEngine {
         val totalPixels = thresh.rows() * thresh.cols()
         val density = nonZeroPixels.toDouble() / max(1, totalPixels).toDouble()
 
-        // 🚨 실패 관문 1: 픽셀 밀도 검사 (노이즈, 그릴, 아스팔트 등)
         if (density < 0.08 || density > 0.75) {
             debugListener?.let {
                 val debugBmp = Bitmap.createBitmap(thresh.cols(), thresh.rows(), Bitmap.Config.ARGB_8888)
@@ -111,6 +110,20 @@ object PlateDetectionEngine {
         val tempClose = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
         Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_CLOSE, tempClose)
         tempClose.release()
+
+        debugListener?.let {
+            val debugBmp = Bitmap.createBitmap(thresh.cols(), thresh.rows(), Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(thresh, debugBmp)
+            it.pauseAndShowStep(
+                "디버그 [검증 1]: 이진화(Threshold) 상태", debugBmp,
+                "[원인 검증] 빛 반사에 의한 글자 증발 여부",
+                listOf(
+                    "-> 우측 글자(3562) 모양이 하얗게 뚜렷한가요?",
+                    "-> 여기서 글자가 뭉개졌거나 까맣게 날아갔다면 이진화(빛 반사)가 원인입니다."
+                )
+            )
+            debugBmp.recycle()
+        }
 
         val projection = IntArray(thresh.cols())
         for (col in 0 until thresh.cols()) {
@@ -225,7 +238,7 @@ object PlateDetectionEngine {
 
         if (uniqueChars.isEmpty()) {
             fullMat.release(); fullGray.release()
-            return null // 밀도 검사에서 이미 실패 화면을 띄웠음
+            return null 
         }
 
         uniqueChars.sortBy { it.rect.x }
@@ -235,6 +248,25 @@ object PlateDetectionEngine {
             val trueHeight = if (heightsDesc.size >= 3) heightsDesc[2] else heightsDesc.first()
             val purgeHeightLimit = trueHeight * 0.50
             
+            debugListener?.let {
+                val debugMat = fullMat.clone()
+                uniqueChars.forEach { char -> Imgproc.rectangle(debugMat, char.rect, Scalar(0.0, 255.0, 255.0, 255.0), 3) }
+                val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
+                Utils.matToBitmap(debugMat, debugBmp)
+                
+                it.pauseAndShowStep(
+                    "디버그 [검증 2]: 높이 청소 직전 덩어리들", debugBmp,
+                    "[원인 검증] 그릴 노이즈가 기준 높이를 올렸는지 확인",
+                    listOf(
+                        "-> 인식된 덩어리 개수: ${uniqueChars.size}개",
+                        "-> 기준값(trueHeight): ${String.format("%.1f", trueHeight)}",
+                        "-> 삭제 하한선: ${String.format("%.1f", purgeHeightLimit)}",
+                        "-> 노이즈 때문에 기준값이 너무 높게 잡혔다면 이 다음 단계에서 진짜 글자가 지워집니다."
+                    )
+                )
+                debugMat.release(); debugBmp.recycle()
+            }
+
             val purgeIterator = uniqueChars.iterator()
             while (purgeIterator.hasNext()) {
                 if (purgeIterator.next().height < purgeHeightLimit) {
@@ -243,7 +275,6 @@ object PlateDetectionEngine {
             }
         }
 
-        // 🚨 실패 관문 2: 노이즈 청소 후 글자가 2개 미만일 때 (기울기 선을 그을 수 없음)
         if (uniqueChars.size < 2) {
             debugListener?.let {
                 val debugMat = fullMat.clone()
@@ -353,7 +384,6 @@ object PlateDetectionEngine {
             }
         }
 
-        // 🚨 실패 관문 3: 레이더 탐색 후에도 4개가 안될 때 
         val isFailed = validChars.size < 4
         if (isFailed) {
             stepLogs.add(" -> [FAIL] 유효 문자가 ${validChars.size}개뿐이므로 기하학 조립을 포기합니다.")
@@ -361,7 +391,6 @@ object PlateDetectionEngine {
             stepLogs.add("[진단] 최종 ${validChars.size}개 문자로 와이어프레임 렌더링을 진행합니다.")
         }
 
-        // ⭐️ 실패하든 성공하든 무조건 화면을 띄워서 결과를 보여줌
         debugListener?.let {
             val debugMat = fullMat.clone()
             validChars.forEach { char -> 
@@ -481,13 +510,26 @@ object PlateDetectionEngine {
         val baseCy = midY
         val baseAngle = Math.toDegrees(Math.atan2(baseTr.y - baseTl.y, baseTr.x - baseTl.x))
 
+        // ⭐️ 수정: 가로 2.5배, 세로 2.0배 탐색 ROI 팽창 적용
         val roiMinX = finalPts.minOf { it.x }.toInt()
         val roiMinY = finalPts.minOf { it.y }.toInt()
         val roiMaxX = finalPts.maxOf { it.x }.toInt()
         val roiMaxY = finalPts.maxOf { it.y }.toInt()
 
-        val pad = 10
-        val plateRoiRect = getSafeRect(roiMinX - pad, roiMinY - pad, roiMaxX - roiMinX + pad * 2, roiMaxY - roiMinY + pad * 2, fullGray.cols(), fullGray.rows())
+        val baseW_roi = roiMaxX - roiMinX
+        val baseH_roi = roiMaxY - roiMinY
+        val expandW = (baseW_roi * 2.5).toInt()
+        val expandH = (baseH_roi * 2.0).toInt()
+        val cx = roiMinX + baseW_roi / 2
+        val cy = roiMinY + baseH_roi / 2
+
+        val plateRoiRect = getSafeRect(
+            cx - expandW / 2, 
+            cy - expandH / 2, 
+            expandW, 
+            expandH, 
+            fullGray.cols(), fullGray.rows()
+        )
         val roiArea = plateRoiRect.width * plateRoiRect.height
 
         val roiGray = Mat()
