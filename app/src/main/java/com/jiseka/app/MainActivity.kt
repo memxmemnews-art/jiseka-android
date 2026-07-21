@@ -281,11 +281,10 @@ class MainActivity : AppCompatActivity() {
                     
                     buildFinalWireframe(safeBitmap, globalLineBox, currentSession, debugInterceptor)
                 } else {
-                    // 🚨 실패 관문 0: ML Kit가 텍스트를 찾지 못함
                     val debugBmp = localCrop.croppedBitmap.copy(Bitmap.Config.ARGB_8888, true)
                     debugInterceptor.pauseAndShowStep(
                         "디버그 1단계: [FAIL] ML Kit 탐색 실패", debugBmp,
-                        "[FAIL] 10% x 5% 영역 내 텍스트 없음",
+                        "[FAIL] 25% x 10% 영역 내 텍스트 없음",
                         listOf("-> 원인: 터치된 좁은 구역 안에 한글이나 숫자가 포함되어 있지 않습니다.")
                     )
                     localCrop.croppedBitmap.recycle()
