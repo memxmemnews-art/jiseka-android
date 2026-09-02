@@ -1,0 +1,7 @@
+dependencies {
+    // 기존 ML Kit 제거 (선택 사항)
+    // implementation 'com.google.mlkit:text-recognition-korean:...'
+
+    // TensorFlow Lite Task Vision 추가
+    implementation 'org.tensorflow:tensorflow-lite-task-vision:0.4.4'
+}
