@@ -7,11 +7,9 @@ import org.opencv.core.*
 import org.opencv.imgproc.Imgproc
 import kotlin.math.abs
 import kotlin.math.atan2
-import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.sin
 
 object PlateDetectionEngine {
 
@@ -489,8 +487,7 @@ object PlateDetectionEngine {
     }
 
     // =========================================================
-    // 이하 로직 (buildQuadFromLines ~ MIN_FINAL_SCORE) 은 변경되지 않았습니다.
-    // 기존과 동일하게 유지됩니다.
+    // 4개 선의 교점으로 사각형 생성
     // =========================================================
 
     private fun buildQuadFromLines(
@@ -504,6 +501,10 @@ object PlateDetectionEngine {
         if (p1 == null || p2 == null || p3 == null || p4 == null) return null
         return listOf(p1, p2, p3, p4)
     }
+
+    // =========================================================
+    // 두 직선 교점
+    // =========================================================
 
     private fun intersection(
         p1: Point, p2: Point, p3: Point, p4: Point
@@ -521,6 +522,10 @@ object PlateDetectionEngine {
         return Point(px, py)
     }
 
+    // =========================================================
+    // 사각형 기본 유효성
+    // =========================================================
+
     private fun isReasonableQuad(
         pts: List<Point>, width: Int, height: Int
     ): Boolean {
@@ -537,36 +542,64 @@ object PlateDetectionEngine {
         return true
     }
 
+    // =========================================================
+    // 후보 평가 (Android Rect 기반 로직으로 완벽 호환 조치됨)
+    // =========================================================
+
     private fun evaluateCandidate(
-        pts: List<Point>, aiRect: Rect, roiWidth: Int, roiHeight: Int
+        pts: List<Point>,
+        aiRect: Rect,
+        roiWidth: Int,
+        roiHeight: Int
     ): ScoreResult {
-        if (pts.size != 4) return ScoreResult(0.0, "4점 아님")
+
+        if (pts.size != 4) {
+            return ScoreResult(0.0, "4점 아님")
+        }
 
         val p = sortCorners(pts)
-        val tl = p[0]; val tr = p[1]; val br = p[2]; val bl = p[3]
 
+        val tl = p[0]
+        val tr = p[1]
+        val br = p[2]
+        val bl = p[3]
+
+        // ---------------------------------------------
+        // 변 길이
+        // ---------------------------------------------
         val top = hypot(tr.x - tl.x, tr.y - tl.y)
         val bottom = hypot(br.x - bl.x, br.y - bl.y)
         val left = hypot(bl.x - tl.x, bl.y - tl.y)
         val right = hypot(br.x - tr.x, br.y - tr.y)
 
-        if (top <= 1 || bottom <= 1 || left <= 1 || right <= 1) return ScoreResult(0.0, "변 길이 오류")
+        if (top <= 1 || bottom <= 1 || left <= 1 || right <= 1) {
+            return ScoreResult(0.0, "변 길이 오류")
+        }
 
         val widthAvg = (top + bottom) / 2.0
         val heightAvg = (left + right) / 2.0
         val aspectRatio = widthAvg / heightAvg
 
+        // ---------------------------------------------
+        // 1. 종횡비
+        // ---------------------------------------------
         val aspectScore = if (aspectRatio in 1.8..6.0) {
             100.0 - abs(aspectRatio - 3.0) * 12.0
         } else {
             max(0.0, 100.0 - abs(aspectRatio - 3.0) * 30.0)
         }
 
+        // ---------------------------------------------
+        // 2. 상하변 평행성
+        // ---------------------------------------------
         val topAngle = lineAngle(tl, tr)
         val bottomAngle = lineAngle(bl, br)
         val horizontalParallel = angleDifference(topAngle, bottomAngle)
         val horizontalScore = max(0.0, 100.0 - horizontalParallel * 6.0)
 
+        // ---------------------------------------------
+        // 3. 좌우변 평행성
+        // ---------------------------------------------
         val leftAngle = lineAngle(tl, bl)
         val rightAngle = lineAngle(tr, br)
         val verticalParallel = angleDifference(leftAngle, rightAngle)
@@ -574,9 +607,17 @@ object PlateDetectionEngine {
 
         val parallelScore = (horizontalScore + verticalScore) / 2.0
 
+        // ---------------------------------------------
+        // 4. AI Box 내부 적합도 (Android Rect API 적용)
+        // ---------------------------------------------
         val candidateArea = abs(polygonArea(p))
-        val aiArea = aiRect.width.toDouble() * aiRect.height.toDouble()
-        if (aiArea <= 0) return ScoreResult(0.0, "AI Box 면적 오류")
+        val aiWidth = aiRect.width().toDouble()
+        val aiHeight = aiRect.height().toDouble()
+        val aiArea = aiWidth * aiHeight
+
+        if (aiArea <= 0) {
+            return ScoreResult(0.0, "AI Box 면적 오류")
+        }
 
         val areaRatio = candidateArea / aiArea
         val areaFitScore = when {
@@ -585,38 +626,71 @@ object PlateDetectionEngine {
             else -> max(0.0, 100.0 - (areaRatio - 1.05) * 150.0)
         }
 
+        // ---------------------------------------------
+        // 5. 중심 위치 (Android Rect API 적용)
+        // ---------------------------------------------
         val centerX = p.map { it.x }.average()
         val centerY = p.map { it.y }.average()
-        val aiCenterX = aiRect.x + aiRect.width / 2.0
-        val aiCenterY = aiRect.y + aiRect.height / 2.0
+
+        val aiCenterX = (aiRect.left + aiRect.right) / 2.0
+        val aiCenterY = (aiRect.top + aiRect.bottom) / 2.0
 
         val centerDistance = hypot(centerX - aiCenterX, centerY - aiCenterY)
-        val maxCenterDistance = hypot(aiRect.width.toDouble(), aiRect.height.toDouble()) / 2.0
-        val centerScore = max(0.0, 100.0 - (centerDistance / maxCenterDistance.coerceAtLeast(1.0)) * 100.0)
+        val maxCenterDistance = hypot(aiWidth, aiHeight) / 2.0
 
+        val centerScore = max(
+            0.0,
+            100.0 - (centerDistance / maxCenterDistance.coerceAtLeast(1.0)) * 100.0
+        )
+
+        // ---------------------------------------------
+        // 6. AI Box 밖으로 나간 점 (Android Rect API 적용)
+        // ---------------------------------------------
         var overflow = 0.0
+
         for (point in p) {
             val dx = when {
-                point.x < aiRect.x -> aiRect.x - point.x
-                point.x > aiRect.x + aiRect.width -> point.x - (aiRect.x + aiRect.width)
+                point.x < aiRect.left -> aiRect.left - point.x
+                point.x > aiRect.right -> point.x - aiRect.right
                 else -> 0.0
             }
+
             val dy = when {
-                point.y < aiRect.y -> aiRect.y - point.y
-                point.y > aiRect.y + aiRect.height -> point.y - (aiRect.y + aiRect.height)
+                point.y < aiRect.top -> aiRect.top - point.y
+                point.y > aiRect.bottom -> point.y - aiRect.bottom
                 else -> 0.0
             }
+
             overflow += hypot(dx, dy)
         }
 
-        val overflowRatio = overflow / (aiRect.width + aiRect.height).toDouble()
+        val overflowRatio = overflow / (aiWidth + aiHeight)
         val overflowScore = max(0.0, 100.0 - overflowRatio * 200.0)
 
-        val finalScore = (aspectScore * 0.20 + parallelScore * 0.25 + areaFitScore * 0.20 + centerScore * 0.20 + overflowScore * 0.15)
-        val log = "점수=${String.format("%.1f", finalScore)} AR=${aspectScore.toInt()} 평행=${parallelScore.toInt()} 크기=${areaFitScore.toInt()} 중심=${centerScore.toInt()} Over=${overflowScore.toInt()}"
+        // ---------------------------------------------
+        // 최종 점수
+        // ---------------------------------------------
+        val finalScore = (
+            aspectScore * 0.20 +
+            parallelScore * 0.25 +
+            areaFitScore * 0.20 +
+            centerScore * 0.20 +
+            overflowScore * 0.15
+        )
+
+        val log = "점수=${String.format("%.1f", finalScore)} " +
+                "AR=${aspectScore.toInt()} " +
+                "평행=${parallelScore.toInt()} " +
+                "크기=${areaFitScore.toInt()} " +
+                "중심=${centerScore.toInt()} " +
+                "Over=${overflowScore.toInt()}"
 
         return ScoreResult(finalScore, log)
     }
+
+    // =========================================================
+    // 선 각도
+    // =========================================================
 
     private fun lineAngle(a: Point, b: Point): Double {
         var angle = Math.toDegrees(atan2(b.y - a.y, b.x - a.x))
@@ -624,11 +698,19 @@ object PlateDetectionEngine {
         return angle
     }
 
+    // =========================================================
+    // 각도 차이
+    // =========================================================
+
     private fun angleDifference(a: Double, b: Double): Double {
         var diff = abs(a - b)
         while (diff > 180.0) diff -= 180.0
         return min(diff, 180.0 - diff)
     }
+
+    // =========================================================
+    // Polygon 면적
+    // =========================================================
 
     private fun polygonArea(pts: List<Point>): Double {
         var area = 0.0
@@ -639,6 +721,10 @@ object PlateDetectionEngine {
         return area / 2.0
     }
 
+    // =========================================================
+    // 꼭지점 정렬
+    // =========================================================
+
     private fun sortCorners(pts: List<Point>): List<Point> {
         if (pts.size != 4) return pts
         val centerX = pts.map { it.x }.average()
@@ -647,6 +733,10 @@ object PlateDetectionEngine {
         val startIndex = sorted.indices.minByOrNull { i -> sorted[i].x + sorted[i].y } ?: 0
         return List(4) { index -> sorted[(startIndex + index) % 4] }
     }
+
+    // =========================================================
+    // 최소 점수
+    // =========================================================
 
     private const val MIN_CANDIDATE_SCORE = 35.0
     private const val MIN_FINAL_SCORE = 65.0
