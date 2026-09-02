@@ -38,9 +38,9 @@ android {
     }
     kotlinOptions { jvmTarget = '17' }
 
-    // ⭐️ AI 모델(tflite) 파일이 빌드 시 압축되지 않도록 설정 (앱 튕김 방지)
-    aaptOptions {
-        noCompress "tflite"
+    // ⭐️ [수정됨] 최신 AGP(8.0+) 규격에 맞게 aaptOptions를 androidResources로 변경
+    androidResources {
+        noCompress 'tflite'
     }
 }
 
