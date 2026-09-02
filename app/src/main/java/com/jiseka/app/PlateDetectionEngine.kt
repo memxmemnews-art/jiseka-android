@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import org.opencv.android.Utils
 import org.opencv.core.*
 import org.opencv.imgproc.Imgproc
+import kotlin.math.max
 
 object PlateDetectionEngine {
 
@@ -26,11 +27,18 @@ object PlateDetectionEngine {
         return Rect(safeX, safeY, safeW, safeH)
     }
 
-    // 1. 사용자가 터치한 곳 주변을 크롭하여 AI에게 넘겨줄 이미지를 준비하는 함수
+    // 1. 사용자가 터치한 곳 주변을 크롭하여 AI에게 넘겨줄 이미지를 준비하는 함수 (해상도 방어 로직 추가)
     fun prepareWideCrop(fullBitmap: Bitmap, touchX: Float, touchY: Float): SeedCropResult {
-        // 가로 25%, 세로 10% 영역 탐색
-        val cropW = (fullBitmap.width * 0.25f).toInt()
-        val cropH = (fullBitmap.height * 0.10f).toInt()
+        // 비율 기반 기본 크기 계산 (가로 25%, 세로 15%)
+        var cropW = (fullBitmap.width * 0.25f).toInt()
+        var cropH = (fullBitmap.height * 0.15f).toInt()
+
+        // ⭐️ 최소 물리적 픽셀 크기 보장 (번호판이 온전히 담길 수 있는 최소한의 공간)
+        val minPhysicalWidth = 400 
+        val minPhysicalHeight = 200
+
+        cropW = max(cropW, minPhysicalWidth).coerceAtMost(fullBitmap.width)
+        cropH = max(cropH, minPhysicalHeight).coerceAtMost(fullBitmap.height)
 
         val safeRect = getSafeRect(
             (touchX - cropW / 2).toInt(),
@@ -45,7 +53,6 @@ object PlateDetectionEngine {
     }
 
     // 2. AI가 찾은 번호판 바운딩 박스를 받아, OpenCV로 정밀한 4개의 꼭지점을 스냅하는 함수
-    // (MainActivity와의 호환성을 위해 함수명은 processWithMLKitResult 그대로 유지)
     suspend fun processWithMLKitResult(
         fullBitmap: Bitmap, 
         aiGlobalBox: android.graphics.Rect, 
