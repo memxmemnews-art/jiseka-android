@@ -4,7 +4,10 @@ import android.graphics.Bitmap
 import org.opencv.android.Utils
 import org.opencv.core.*
 import org.opencv.imgproc.Imgproc
+import kotlin.math.abs
+import kotlin.math.hypot
 import kotlin.math.max
+import kotlin.math.min
 
 object PlateDetectionEngine {
 
@@ -19,6 +22,13 @@ object PlateDetectionEngine {
         val roiRect: Rect
     )
 
+    // 스코어링된 사각형 후보 데이터 클래스
+    private data class PlateCandidate(
+        val pts: List<Point>,
+        val score: Double,
+        val debugLog: String
+    )
+
     private fun getSafeRect(x: Int, y: Int, w: Int, h: Int, maxW: Int, maxH: Int): Rect {
         val safeX = x.coerceIn(0, maxW - 1)
         val safeY = y.coerceIn(0, maxH - 1)
@@ -27,13 +37,11 @@ object PlateDetectionEngine {
         return Rect(safeX, safeY, safeW, safeH)
     }
 
-    // 1. 사용자가 터치한 곳 주변을 크롭하여 AI에게 넘겨줄 이미지를 준비하는 함수 (해상도 방어 로직 추가)
+    // 1. 터치 주변 크롭 (최소 픽셀 보장 및 작은 3~5% 마진 적용)
     fun prepareWideCrop(fullBitmap: Bitmap, touchX: Float, touchY: Float): SeedCropResult {
-        // 비율 기반 기본 크기 계산 (가로 25%, 세로 15%)
         var cropW = (fullBitmap.width * 0.25f).toInt()
         var cropH = (fullBitmap.height * 0.15f).toInt()
 
-        // ⭐️ 최소 물리적 픽셀 크기 보장 (번호판이 온전히 담길 수 있는 최소한의 공간)
         val minPhysicalWidth = 400 
         val minPhysicalHeight = 200
 
@@ -52,7 +60,7 @@ object PlateDetectionEngine {
         return SeedCropResult(safeRect.x, safeRect.y, croppedBitmap, safeRect)
     }
 
-    // 2. AI가 찾은 번호판 바운딩 박스를 받아, OpenCV로 정밀한 4개의 꼭지점을 스냅하는 함수
+    // 2. 3중 방어 파이프라인 메인 진입점
     suspend fun processWithMLKitResult(
         fullBitmap: Bitmap, 
         aiGlobalBox: android.graphics.Rect, 
@@ -64,103 +72,127 @@ object PlateDetectionEngine {
         Utils.bitmapToMat(fullBitmap, fullMat)
         Imgproc.cvtColor(fullMat, fullGray, Imgproc.COLOR_RGBA2GRAY)
 
-        // AI가 찾은 박스를 상하좌우 15% 팽창 (번호판 끝부분 모서리가 잘리지 않도록 안전 공간 확보)
-        val expandW = (aiGlobalBox.width() * 0.15f).toInt()
-        val expandH = (aiGlobalBox.height() * 0.15f).toInt()
+        // [1차 방어선: AI Box 제한] 그릴 유입을 막기 위해 15%가 아닌 5%의 최소한의 마진만 확장
+        val marginX = (aiGlobalBox.width() * 0.05f).toInt()
+        val marginY = (aiGlobalBox.height() * 0.05f).toInt()
         val safeRoi = getSafeRect(
-            aiGlobalBox.left - expandW,
-            aiGlobalBox.top - expandH,
-            aiGlobalBox.width() + expandW * 2,
-            aiGlobalBox.height() + expandH * 2,
+            aiGlobalBox.left - marginX,
+            aiGlobalBox.top - marginY,
+            aiGlobalBox.width() + marginX * 2,
+            aiGlobalBox.height() + marginY * 2,
             fullMat.cols(), fullMat.rows()
         )
 
-        // 해당 영역만 잘라내어 Canny 엣지 및 모폴로지(노이즈 제거) 연산 수행
         val roiGray = Mat()
         fullGray.submat(safeRoi).copyTo(roiGray)
 
-        val edges = Mat()
-        Imgproc.GaussianBlur(roiGray, edges, Size(5.0, 5.0), 0.0)
-        Imgproc.Canny(edges, edges, 50.0, 150.0) // 엣지 추출
+        // [2차 방어선: 3-Way 다중 후보 생성]
+        val rawContours = mutableListOf<MatOfPoint>()
         
-        val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
-        Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_CLOSE, kernel)
+        // 경로 A: 원본 Canny
+        val edgesA = Mat()
+        Imgproc.GaussianBlur(roiGray, edgesA, Size(5.0, 5.0), 0.0)
+        Imgproc.Canny(edgesA, edgesA, 50.0, 150.0)
+        extractContoursTo(edgesA, rawContours)
+        edgesA.release()
 
-        // 윤곽선(Contours) 찾기
-        val contours = ArrayList<MatOfPoint>()
-        val hierarchy = Mat()
-        Imgproc.findContours(edges, contours, hierarchy, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE)
+        // 경로 B: 약한 Close 연산 적용
+        val edgesB = Mat()
+        Imgproc.GaussianBlur(roiGray, edgesB, Size(5.0, 5.0), 0.0)
+        Imgproc.Canny(edgesB, edgesB, 50.0, 150.0)
+        val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
+        Imgproc.morphologyEx(edgesB, edgesB, Imgproc.MORPH_CLOSE, kernel)
+        kernel.release()
+        extractContoursTo(edgesB, rawContours)
+        edgesB.release()
 
-        var bestCorners: List<Point>? = null
-        var maxArea = 0.0
+        // 경로 C: HoughLinesP 기반 직선 조합 후보 생성
+        val houghContours = extractHoughRects(roiGray)
+        rawContours.addAll(houghContours)
+
+        // [3차 방어선: Geometry 스코어링 평가 시스템]
+        val candidates = mutableListOf<PlateCandidate>()
+        val roiArea = (safeRoi.width * safeRoi.height).toDouble()
         
-        // 최소한 팽창된 전체 영역의 15% 이상 크기를 가져야 번호판 테두리로 인정
-        val minAreaThreshold = (safeRoi.width * safeRoi.height) * 0.15 
+        // AI 기준 박스 (로컬 좌표계)
+        val localAiRect = Rect(
+            aiGlobalBox.left - safeRoi.x,
+            aiGlobalBox.top - safeRoi.y,
+            aiGlobalBox.width(),
+            aiGlobalBox.height()
+        )
 
-        for (contour in contours) {
+        for (contour in rawContours) {
             val peri = Imgproc.arcLength(MatOfPoint2f(*contour.toArray()), true)
             val approx = MatOfPoint2f()
-            // 다각형 근사화 (0.03 ~ 0.05 사이값이 사각형 모서리를 가장 잘 땀)
             Imgproc.approxPolyDP(MatOfPoint2f(*contour.toArray()), approx, 0.03 * peri, true)
 
-            // 4개의 꼭지점을 가진 볼록 다각형(사각형)인지 확인
             if (approx.toArray().size == 4 && Imgproc.isContourConvex(MatOfPoint(*approx.toArray()))) {
                 val area = Imgproc.contourArea(approx)
-                // 가장 면적이 큰 사각형을 번호판 외곽선으로 채택
-                if (area > maxArea && area > minAreaThreshold) {
-                    maxArea = area
-                    bestCorners = approx.toArray().toList()
+                
+                // [필터] 너무 작거나 ROI 전체를 다 먹어버리는 거대한 contour는 제거
+                if (area < roiArea * 0.08 || area > roiArea * 0.95) {
+                    approx.release()
+                    continue
+                }
+
+                val pts = sortCorners(approx.toArray().toList())
+                val scoreResult = evaluateCandidate(pts, localAiRect, roiWidth = safeRoi.width, roiHeight = safeRoi.height)
+
+                if (scoreResult.score > 30.0) { // 최소 커트라인
+                    candidates.add(PlateCandidate(pts, scoreResult.score, scoreResult.log))
                 }
             }
             approx.release()
         }
 
-        roiGray.release(); edges.release(); kernel.release(); hierarchy.release()
-        contours.forEach { it.release() }
+        roiGray.release()
+        rawContours.forEach { it.release() }
 
-        // 최종 꼭지점 좌표 결정 (로컬 ROI 좌표 -> 글로벌 좌표로 변환)
-        val finalCorners = if (bestCorners == null) {
-            // 만약 OpenCV가 뚜렷한 사각형 테두리를 찾지 못했다면, 
-            // AI가 찾았던 원본 바운딩 박스를 그대로 4개의 꼭지점으로 변환하여 사용 (안전망)
-            listOf(
-                Point(aiGlobalBox.left.toDouble(), aiGlobalBox.top.toDouble()),
-                Point(aiGlobalBox.right.toDouble(), aiGlobalBox.top.toDouble()),
-                Point(aiGlobalBox.right.toDouble(), aiGlobalBox.bottom.toDouble()),
-                Point(aiGlobalBox.left.toDouble(), aiGlobalBox.bottom.toDouble())
-            )
+        // 최고 점수 후보 채택 (없을 경우 AI Box 기본 사각형으로 폴백)
+        val bestCandidate = candidates.maxByOrNull { it.score }
+        
+        val finalLocalPts = if (bestCandidate != null) {
+            bestCandidate.pts
         } else {
-            // OpenCV가 찾은 꼭지점을 (좌상, 우상, 우하, 좌하) 순서로 정렬하고 글로벌 좌표로 이동
-            sortCorners(bestCorners).map { 
-                Point(it.x + safeRoi.x, it.y + safeRoi.y) 
-            }
+            listOf(
+                Point(localAiRect.x.toDouble(), localAiRect.y.toDouble()),
+                Point((localAiRect.x + localAiRect.width).toDouble(), localAiRect.y.toDouble()),
+                Point((localAiRect.x + localAiRect.width).toDouble(), (localAiRect.y + localAiRect.height).toDouble()),
+                Point(localAiRect.x.toDouble(), (localAiRect.y + localAiRect.height).toDouble())
+            )
         }
 
-        val globalPts = finalCorners.map {
-            ImmutablePoint(it.x.toFloat(), it.y.toFloat())
+        // 글로벌 화면 좌표로 복원
+        val globalPts = finalLocalPts.map {
+            ImmutablePoint((it.x + safeRoi.x).toFloat(), (it.y + safeRoi.y).toFloat())
         }
 
-        // 디버그 리스너: 화면에 결과 그려주기
+        // 디버그 리스너 로깅
         debugListener?.let {
             val debugMat = fullMat.clone()
-            
-            // 1. AI가 최초에 잡아준 바운딩 박스 (노란색 사각형)
             val cvRect = Rect(aiGlobalBox.left, aiGlobalBox.top, aiGlobalBox.width(), aiGlobalBox.height())
             Imgproc.rectangle(debugMat, cvRect, Scalar(0.0, 255.0, 255.0, 255.0), 3)
-            
-            // 2. OpenCV가 정밀하게 다듬은 최종 4개 꼭지점 (초록색 선, 빨간색 점)
+
             for (i in 0..3) {
                 val pt1 = Point(globalPts[i].x.toDouble(), globalPts[i].y.toDouble())
                 val pt2 = Point(globalPts[(i+1)%4].x.toDouble(), globalPts[(i+1)%4].y.toDouble())
                 Imgproc.line(debugMat, pt1, pt2, Scalar(0.0, 255.0, 0.0, 255.0), 5)
-                Imgproc.circle(debugMat, pt1, 10, Scalar(255.0, 0.0, 0.0, 255.0), -1)
+                Imgproc.circle(debugMat, pt1, 10, Scalar(255.0, 0.0, 255.0, 255.0), -1)
             }
-            
+
             val debugBmp = Bitmap.createBitmap(debugMat.cols(), debugMat.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(debugMat, debugBmp)
-            
-            val logMessage = if (bestCorners != null) "-> 정밀 엣지 기반 외곽선 렌더링 완료" else "-> [경고] 정밀 외곽선을 찾지 못해 AI 영역을 그대로 사용합니다"
-            it.pauseAndShowStep("디버그: 꼭지점 정밀 스냅", debugBmp, "AI 박스 내부 정밀 모서리 탐색", listOf(logMessage))
-            
+
+            val logList = mutableListOf<String>()
+            if (bestCandidate != null) {
+                logList.add("-> [성공] 3중 방어 통과 최고 점수 채택")
+                logList.add("-> ${bestCandidate.debugLog}")
+            } else {
+                logList.add("-> [경고] 기하학 조건을 만족하는 후보가 없어 AI Box로 대체합니다.")
+            }
+
+            it.pauseAndShowStep("디버그: 3중 방어 스코어링", debugBmp, "Geometry Scoring 결과", logList)
             debugMat.release(); debugBmp.recycle()
         }
 
@@ -168,7 +200,97 @@ object PlateDetectionEngine {
         return globalPts
     }
 
-    // 꼭지점이 뒤틀리지 않도록 좌상(TL), 우상(TR), 우하(BR), 좌하(BL) 순서로 정렬하는 유틸리티
+    // 보조 함수: Canny 에지에서 Contour 수집
+    private fun extractContoursTo(edges: Mat, outList: MutableList<MatOfPoint>) {
+        val contours = ArrayList<MatOfPoint>()
+        val hierarchy = Mat()
+        Imgproc.findContours(edges, contours, hierarchy, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE)
+        outList.addAll(contours)
+        hierarchy.release()
+    }
+
+    // 보조 함수: HoughLinesP를 이용해 사각형 구조물 후보(MatOfPoint) 생성
+    private fun extractHoughRects(gray: Mat): List<MatOfPoint> {
+        val lines = Mat()
+        Imgproc.HoughLinesP(gray, lines, 1.0, Math.PI / 180, 50, 30.0, 10.0)
+        
+        val pts = mutableListOf<Point>()
+        for (i in 0 until lines.rows()) {
+            val v = lines.get(i, 0)
+            pts.add(Point(v[0], v[1]))
+            pts.add(Point(v[2], v[3]))
+        }
+        lines.release()
+
+        if (pts.size < 4) return emptyList()
+
+        // 수집된 선들의 양 끝점을 감싸는 최소 외곽 사각형을 후보로 등록
+        val matOfPt = MatOfPoint(*pts.toTypedArray())
+        val rect = Imgproc.boundingRect(matOfPt)
+        matOfPt.release()
+
+        val rectContour = MatOfPoint(
+            Point(rect.x.toDouble(), rect.y.toDouble()),
+            Point((rect.x + rect.width).toDouble(), rect.y.toDouble()),
+            Point((rect.x + rect.width).toDouble(), (rect.y + rect.height).toDouble()),
+            Point(rect.x.toDouble(), (rect.y + rect.height).toDouble())
+        )
+        return listOf(rectContour)
+    }
+
+    // 7-Factor 기하학적 스코어링 평가 엔진
+    private data class ScoreResult(val score: Double, val log: String)
+
+    private fun evaluateCandidate(pts: List<Point>, aiRect: Rect, roiWidth: Int, roiHeight: Int): ScoreResult {
+        val tl = pts[0]; val tr = pts[1]; val br = pts[2]; val bl = pts[3]
+
+        val w = (hypot(tr.x - tl.x, tr.y - tl.y) + hypot(br.x - bl.x, br.y - bl.y)) / 2.0
+        val h = (hypot(bl.x - tl.x, bl.y - tl.y) + hypot(br.x - tr.x, br.y - tr.y)) / 2.0
+        if (h <= 0 || w <= 0) return ScoreResult(0.0, "Invalid dimension")
+
+        // 1. 종횡비 검사 (한국 번호판 표준 비율: 약 2.0 ~ 5.5 범위 허용)
+        val aspectRatio = w / h
+        val arScore = if (aspectRatio in 1.8..6.0) 100.0 else max(0.0, 100.0 - abs(aspectRatio - 3.0) * 25.0)
+
+        // 2. 평행성 검사 (상단 변과 하단 변의 각도 차이)
+        val angleTop = Math.toDegrees(Math.atan2(tr.y - tl.y, tr.x - tl.x))
+        val angleBottom = Math.toDegrees(Math.atan2(br.x - bl.x, br.y - bl.y)) // 수정된 각도 계산
+        val angleDiff = abs(angleTop - angleBottom).let { if (it > 180) 360 - it else it }
+        val parallelismScore = max(0.0, 100.0 - (angleDiff * 5.0))
+
+        // 3. AI Box 일치도 (Overlap Score)
+        val candRect = Rect(
+            min(tl.x, bl.x).toInt(),
+            min(tl.y, tr.y).toInt(),
+            w.toInt(),
+            h.toInt()
+        )
+        
+        // 교집합 영역 계산
+        val intersect = aiRect.intersect(candRect)
+        val overlapArea = if (intersect) {
+            val xOverlap = max(0, min(aiRect.x + aiRect.width, candRect.x + candRect.width) - max(aiRect.x, candRect.x))
+            val yOverlap = max(0, min(aiRect.y + aiRect.height, candRect.y + candRect.height) - max(aiRect.y, candRect.y))
+            (xOverlap * yOverlap).toDouble()
+        } else 0.0
+
+        val aiBoxArea = (aiRect.width * aiRect.height).toDouble()
+        val overlapRatio = if (aiBoxArea > 0) overlapArea / aiBoxArea else 0.0
+        val aiOverlapScore = overlapRatio * 100.0
+
+        // 4. Overflow Penalty (AI Box 밖으로 튀어나간 면적에 대한 강력한 감점)
+        val candArea = w * h
+        val excessArea = max(0.0, candArea - overlapArea)
+        val overflowPenalty = (excessArea / aiBoxArea) * 50.0
+
+        // 최종 종합 점수 산출 (가중치 적용)
+        val finalScore = (0.35 * aiOverlapScore) + (0.25 * arScore) + (0.25 * parallelismScore) - (0.15 * overflowPenalty)
+
+        val logStr = "점수:${String.format("%.1f", finalScore)} (종횡비:${arScore.toInt()}, 평행:${parallelismScore.toInt()}, AI일치:${aiOverlapScore.toInt()})"
+        return ScoreResult(max(0.0, finalScore), logStr)
+    }
+
+    // 꼭지점 정렬 유틸리티
     private fun sortCorners(pts: List<Point>): List<Point> {
         val sumSorted = pts.sortedBy { it.x + it.y }
         val tl = sumSorted.first()
