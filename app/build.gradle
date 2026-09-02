@@ -37,6 +37,11 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = '17' }
+
+    // ⭐️ AI 모델(tflite) 파일이 빌드 시 압축되지 않도록 설정 (앱 튕김 방지)
+    aaptOptions {
+        noCompress "tflite"
+    }
 }
 
 dependencies {
@@ -53,10 +58,13 @@ dependencies {
     implementation "androidx.camera:camera-lifecycle:$camerax_version"
     implementation "androidx.camera:camera-view:$camerax_version"
 
-    // 💡 구글 ML Kit (번호판의 한글 문자 '가~힣' 인식을 위해 반드시 Korean 모델 사용)
-    implementation 'com.google.mlkit:text-recognition-korean:16.0.0'
+    // 💡 TensorFlow Lite Task Vision (직접 훈련한 번호판 탐지 AI 모델 구동용)
+    implementation 'org.tensorflow:tensorflow-lite-task-vision:0.4.4'
 
-    // 💡 OpenCV (기존 외부 라이브러리 참조 방식 유지)
+    // 💡 구글 ML Kit (현재 AI 모델로 번호판 영역을 찾으므로 제외, 글자 인식이 다시 필요할 때 주석 해제)
+    // implementation 'com.google.mlkit:text-recognition-korean:16.0.0'
+
+    // 💡 OpenCV (번호판 정밀 모서리 탐지용)
     implementation 'com.quickbirdstudios:opencv:4.5.3.0'
     
     // 테스트 라이브러리
