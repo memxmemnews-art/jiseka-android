@@ -49,6 +49,7 @@ import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 import org.tensorflow.lite.support.image.TensorImage
+import org.tensorflow.lite.task.vision.detector.Detection
 import org.tensorflow.lite.task.vision.detector.ObjectDetector
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CountDownLatch
@@ -140,7 +141,7 @@ class MainActivity : AppCompatActivity() {
         precomputeExecutor = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(1), ThreadPoolExecutor.DiscardOldestPolicy())
         maskExecutor = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(1), ThreadPoolExecutor.AbortPolicy())
 
-        initCustomAIModel() // ⭐️ AI 모델 초기화 호출
+        initCustomAIModel()
         setupDebugUI() 
         setupUIListeners()
         setupOrientationListener()
@@ -153,10 +154,9 @@ class MainActivity : AppCompatActivity() {
     private fun initCustomAIModel() {
         try {
             val options = ObjectDetector.ObjectDetectorOptions.builder()
-                .setMaxResults(3) // 탐지 결과 최대 3개로 제한 (속도 최적화)
-                .setScoreThreshold(0.5f) // 신뢰도 임계값
+                .setMaxResults(3)
+                .setScoreThreshold(0.5f)
                 .build()
-            // 깃허브에 올린 파일명과 일치하게 설정
             objectDetector = ObjectDetector.createFromFileAndOptions(this, "mobilenet_plate.tflite", options)
         } catch (e: Exception) {
             Log.e("AI_DEBUG", "AI 모델 초기화 실패", e)
@@ -262,7 +262,6 @@ class MainActivity : AppCompatActivity() {
                     inverseMatrix.mapPoints(touchCoords)
                     val debugInterceptor = createDebugInterceptor()
 
-                    // ⭐️ ML Kit 대신 TFLite 모델 기반 탐지 호출
                     runAIPipeline(safeBitmap, touchCoords[0], touchCoords[1], currentSession, debugInterceptor)
                 } else {
                     runOnUiThread { progressBar?.visibility = View.GONE }
@@ -271,7 +270,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ⭐️ 터치된 지점 주변만 크롭한 뒤 AI를 통해 번호판을 찾는 함수
+    // ⭐️ 터치된 지점 주변만 크롭한 뒤, "UX 최우선(터치 포함 여부)"으로 번호판을 찾는 함수
     private fun runAIPipeline(
         safeBitmap: Bitmap, touchX: Float, touchY: Float,
         currentSession: Int, debugInterceptor: PlateDetectionEngine.DetectionDebugListener
@@ -291,13 +290,44 @@ class MainActivity : AppCompatActivity() {
         // 3. AI 모델 추론 실행 (작은 영역 안에서 번호판 탐색)
         val results = objectDetector?.detect(tensorImage)
 
-        // 4. 탐지된 결과 중 신뢰도(Score)가 가장 높은 것 선택
-        val bestDetection = results?.maxByOrNull { it.categories.firstOrNull()?.score ?: 0f }
+        // 크롭된 영역 기준의 터치 좌표 (크롭 영역의 정중앙)
+        val localTouchX = localCrop.croppedBitmap.width / 2f
+        val localTouchY = localCrop.croppedBitmap.height / 2f
+
+        var bestDetection: Detection? = null
+
+        if (!results.isNullOrEmpty()) {
+            // [1순위 필터링] 터치점(크롭의 중앙)이 바운딩 박스 '내부'에 포함되는 것들 찾기
+            val containingDetections = results.filter { 
+                it.boundingBox.contains(localTouchX, localTouchY) 
+            }
+
+            if (containingDetections.isNotEmpty()) {
+                // 포함된 박스가 1개 이상이면, 그 중에서 가장 신뢰도가 높은 것을 선택
+                bestDetection = containingDetections.maxByOrNull { it.categories.firstOrNull()?.score ?: 0f }
+            } else {
+                // [2순위 필터링] 포함된 박스가 하나도 없다면, 중심점이 터치점과 가장 '가까운' 박스 탐색
+                var minDistance = Float.MAX_VALUE
+                // 최대 허용 거리 제한 (크롭 영역 짧은 변의 30%를 넘어가면 엉뚱한 물체로 간주)
+                val maxAllowedDistance = Math.min(localCrop.croppedBitmap.width, localCrop.croppedBitmap.height) * 0.3f
+                
+                for (detection in results) {
+                    val cx = detection.boundingBox.centerX()
+                    val cy = detection.boundingBox.centerY()
+                    val dist = Math.hypot((cx - localTouchX).toDouble(), (cy - localTouchY).toDouble()).toFloat()
+                    
+                    if (dist < minDistance && dist < maxAllowedDistance) {
+                        minDistance = dist
+                        bestDetection = detection
+                    }
+                }
+            }
+        }
 
         if (bestDetection != null) {
             val localBox = bestDetection.boundingBox
 
-            // 5. 로컬 이미지 기준 Bounding Box를 전체 원본 화면(Global) 좌표로 복원
+            // 4. 로컬 이미지 기준 Bounding Box를 전체 원본 화면(Global) 좌표로 복원
             val globalLineBox = android.graphics.Rect(
                 localCrop.offsetX + localBox.left.toInt(),
                 localCrop.offsetY + localBox.top.toInt(),
@@ -307,7 +337,7 @@ class MainActivity : AppCompatActivity() {
             
             localCrop.croppedBitmap.recycle()
             
-            // 6. 글로벌 Box를 바탕으로 정밀 외곽선(Wireframe) 추출 단계로 이동
+            // 5. 글로벌 Box를 바탕으로 정밀 외곽선(Wireframe) 추출 단계로 이동
             buildFinalWireframe(safeBitmap, globalLineBox, currentSession, debugInterceptor)
         } else {
             // 터치 영역 주변에서 번호판을 못 찾았을 경우
@@ -315,7 +345,10 @@ class MainActivity : AppCompatActivity() {
             debugInterceptor.pauseAndShowStep(
                 "디버그 1단계: [FAIL] AI 모델 탐색 실패", debugBmp,
                 "[FAIL] 터치 영역 내 번호판 없음",
-                listOf("-> 원인: 터치된 구역 안에서 AI가 번호판을 감지하지 못했습니다.")
+                listOf(
+                    "-> 원인: 터치된 구역 안에서 AI가 번호판을 감지하지 못했습니다.",
+                    "-> 조치: 번호판 안쪽을 정확히 다시 터치해주세요."
+                )
             )
             localCrop.croppedBitmap.recycle()
             safeBitmap.recycle()
@@ -333,7 +366,6 @@ class MainActivity : AppCompatActivity() {
                 return@launch
             }
 
-            // 엔진 쪽 함수명은 기존 그대로 사용 (내부 로직은 AI 윤곽선 기반으로 동작함)
             val targetPolygon = PlateDetectionEngine.processWithMLKitResult(
                 safeBitmap, aiGlobalBox, debugInterceptor
             )
