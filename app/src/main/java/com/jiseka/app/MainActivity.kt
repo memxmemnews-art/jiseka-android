@@ -36,9 +36,6 @@ import androidx.camera.view.TransformExperimental
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope 
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
 import kotlinx.coroutines.Dispatchers 
 import kotlinx.coroutines.launch 
 import org.opencv.android.OpenCVLoader
@@ -51,6 +48,8 @@ import org.opencv.core.Point
 import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
+import org.tensorflow.lite.support.image.TensorImage
+import org.tensorflow.lite.task.vision.detector.ObjectDetector
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
@@ -107,6 +106,9 @@ class MainActivity : AppCompatActivity() {
         }?.start()
     }
 
+    // ⭐️ 커스텀 번호판 탐지 AI 모델
+    private var objectDetector: ObjectDetector? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
@@ -138,6 +140,7 @@ class MainActivity : AppCompatActivity() {
         precomputeExecutor = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(1), ThreadPoolExecutor.DiscardOldestPolicy())
         maskExecutor = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(1), ThreadPoolExecutor.AbortPolicy())
 
+        initCustomAIModel() // ⭐️ AI 모델 초기화 호출
         setupDebugUI() 
         setupUIListeners()
         setupOrientationListener()
@@ -145,6 +148,20 @@ class MainActivity : AppCompatActivity() {
 
         if (allPermissionsGranted()) viewFinder?.post { startCamera() }
         else ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
+    }
+
+    private fun initCustomAIModel() {
+        try {
+            val options = ObjectDetector.ObjectDetectorOptions.builder()
+                .setMaxResults(3) // 탐지 결과 최대 3개로 제한 (속도 최적화)
+                .setScoreThreshold(0.5f) // 신뢰도 임계값
+                .build()
+            // 깃허브에 올린 파일명과 일치하게 설정
+            objectDetector = ObjectDetector.createFromFileAndOptions(this, "mobilenet_plate.tflite", options)
+        } catch (e: Exception) {
+            Log.e("AI_DEBUG", "AI 모델 초기화 실패", e)
+            Toast.makeText(this, "AI 모델을 불러오지 못했습니다.", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun setupDebugUI() {
@@ -245,7 +262,8 @@ class MainActivity : AppCompatActivity() {
                     inverseMatrix.mapPoints(touchCoords)
                     val debugInterceptor = createDebugInterceptor()
 
-                    runMLKitPipeline(safeBitmap, touchCoords[0], touchCoords[1], currentSession, debugInterceptor)
+                    // ⭐️ ML Kit 대신 TFLite 모델 기반 탐지 호출
+                    runAIPipeline(safeBitmap, touchCoords[0], touchCoords[1], currentSession, debugInterceptor)
                 } else {
                     runOnUiThread { progressBar?.visibility = View.GONE }
                 }
@@ -253,78 +271,60 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun runMLKitPipeline(
+    // ⭐️ 터치된 지점 주변만 크롭한 뒤 AI를 통해 번호판을 찾는 함수
+    private fun runAIPipeline(
         safeBitmap: Bitmap, touchX: Float, touchY: Float,
         currentSession: Int, debugInterceptor: PlateDetectionEngine.DetectionDebugListener
     ) {
-        val recognizer = TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
-
-        val localCrop = PlateDetectionEngine.prepareWideCrop(safeBitmap, touchX, touchY)
-        val image = InputImage.fromBitmap(localCrop.croppedBitmap, 0)
-
-        recognizer.process(image)
-            .addOnSuccessListener { visionText ->
-                val localTouchX = touchX - localCrop.offsetX
-                val localTouchY = touchY - localCrop.offsetY
-
-                val localLineBox = findClosestLineBox(visionText, localTouchX, localTouchY)
-
-                if (localLineBox != null) {
-                    val globalLineBox = android.graphics.Rect(
-                        localCrop.offsetX + localLineBox.left,
-                        localCrop.offsetY + localLineBox.top,
-                        localCrop.offsetX + localLineBox.right,
-                        localCrop.offsetY + localLineBox.bottom
-                    )
-                    
-                    localCrop.croppedBitmap.recycle()
-                    
-                    buildFinalWireframe(safeBitmap, globalLineBox, currentSession, debugInterceptor)
-                } else {
-                    val debugBmp = localCrop.croppedBitmap.copy(Bitmap.Config.ARGB_8888, true)
-                    debugInterceptor.pauseAndShowStep(
-                        "디버그 1단계: [FAIL] ML Kit 탐색 실패", debugBmp,
-                        "[FAIL] 25% x 10% 영역 내 텍스트 없음",
-                        listOf("-> 원인: 터치된 좁은 구역 안에 한글이나 숫자가 포함되어 있지 않습니다.")
-                    )
-                    localCrop.croppedBitmap.recycle()
-                    safeBitmap.recycle()
-                    fallbackToManualMode(currentSession, "해당 위치 주변에서 텍스트를 찾지 못했습니다.")
-                }
-            }
-            .addOnFailureListener {
-                localCrop.croppedBitmap.recycle()
-                safeBitmap.recycle()
-                fallbackToManualMode(currentSession, "텍스트 인식 엔진 오류입니다.")
-            }
-    }
-
-    private fun findClosestLineBox(visionText: com.google.mlkit.vision.text.Text, touchX: Float, touchY: Float): android.graphics.Rect? {
-        var closestLineBox: android.graphics.Rect? = null
-        var minDistance = Float.MAX_VALUE
-
-        for (block in visionText.textBlocks) {
-            for (line in block.lines) {
-                val box = line.boundingBox
-                if (box != null) {
-                    if (box.contains(touchX.toInt(), touchY.toInt())) {
-                        return box
-                    }
-                    val cx = box.exactCenterX()
-                    val cy = box.exactCenterY()
-                    val dist = Math.hypot((cx - touchX).toDouble(), (cy - touchY).toDouble()).toFloat()
-                    if (dist < minDistance) {
-                        minDistance = dist
-                        closestLineBox = box
-                    }
-                }
-            }
+        if (objectDetector == null) {
+            fallbackToManualMode(currentSession, "AI 모델이 로드되지 않았습니다.")
+            safeBitmap.recycle()
+            return
         }
-        return closestLineBox
+
+        // 1. 터치 위치 주변을 크롭 (가로 25%, 세로 10%)
+        val localCrop = PlateDetectionEngine.prepareWideCrop(safeBitmap, touchX, touchY)
+        
+        // 2. 크롭된 이미지를 TensorImage로 변환
+        val tensorImage = TensorImage.fromBitmap(localCrop.croppedBitmap)
+        
+        // 3. AI 모델 추론 실행 (작은 영역 안에서 번호판 탐색)
+        val results = objectDetector?.detect(tensorImage)
+
+        // 4. 탐지된 결과 중 신뢰도(Score)가 가장 높은 것 선택
+        val bestDetection = results?.maxByOrNull { it.categories.firstOrNull()?.score ?: 0f }
+
+        if (bestDetection != null) {
+            val localBox = bestDetection.boundingBox
+
+            // 5. 로컬 이미지 기준 Bounding Box를 전체 원본 화면(Global) 좌표로 복원
+            val globalLineBox = android.graphics.Rect(
+                localCrop.offsetX + localBox.left.toInt(),
+                localCrop.offsetY + localBox.top.toInt(),
+                localCrop.offsetX + localBox.right.toInt(),
+                localCrop.offsetY + localBox.bottom.toInt()
+            )
+            
+            localCrop.croppedBitmap.recycle()
+            
+            // 6. 글로벌 Box를 바탕으로 정밀 외곽선(Wireframe) 추출 단계로 이동
+            buildFinalWireframe(safeBitmap, globalLineBox, currentSession, debugInterceptor)
+        } else {
+            // 터치 영역 주변에서 번호판을 못 찾았을 경우
+            val debugBmp = localCrop.croppedBitmap.copy(Bitmap.Config.ARGB_8888, true)
+            debugInterceptor.pauseAndShowStep(
+                "디버그 1단계: [FAIL] AI 모델 탐색 실패", debugBmp,
+                "[FAIL] 터치 영역 내 번호판 없음",
+                listOf("-> 원인: 터치된 구역 안에서 AI가 번호판을 감지하지 못했습니다.")
+            )
+            localCrop.croppedBitmap.recycle()
+            safeBitmap.recycle()
+            fallbackToManualMode(currentSession, "해당 위치 주변에서 번호판을 찾지 못했습니다.")
+        }
     }
 
     private fun buildFinalWireframe(
-        safeBitmap: Bitmap, mlKitBox: android.graphics.Rect,
+        safeBitmap: Bitmap, aiGlobalBox: android.graphics.Rect,
         currentSession: Int, debugInterceptor: PlateDetectionEngine.DetectionDebugListener
     ) {
         lifecycleScope.launch(Dispatchers.Default) {
@@ -333,8 +333,9 @@ class MainActivity : AppCompatActivity() {
                 return@launch
             }
 
+            // 엔진 쪽 함수명은 기존 그대로 사용 (내부 로직은 AI 윤곽선 기반으로 동작함)
             val targetPolygon = PlateDetectionEngine.processWithMLKitResult(
-                safeBitmap, mlKitBox, debugInterceptor
+                safeBitmap, aiGlobalBox, debugInterceptor
             )
 
             runOnUiThread {
@@ -795,7 +796,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 1001 && allPermissionsGranted()) viewFinder?.post { startCamera() }
+        if (requestCode == REQUEST_CODE_PERMISSIONS && allPermissionsGranted()) viewFinder?.post { startCamera() }
     }
     
     override fun onDestroy() {
@@ -814,6 +815,8 @@ class MainActivity : AppCompatActivity() {
         
         cachedTextureMat?.release()
         cachedTextureMat = null
+
+        objectDetector?.close() // 모델 메모리 해제
 
         cameraExecutor.shutdownNow()
         precomputeExecutor.shutdownNow()
