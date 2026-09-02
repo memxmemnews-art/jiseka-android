@@ -49,6 +49,22 @@ object PlateDetectionEngine {
         val angle: Double
     )
 
+    // =========================================================
+    // 디버그 이미지 렌더링 최적화 헬퍼 (중복 방지 및 메모리 누수 방지)
+    // =========================================================
+    private fun emitDebug(
+        listener: DetectionDebugListener,
+        mat: Mat,
+        stageName: String,
+        title: String,
+        logs: List<String>
+    ) {
+        val bmp = Bitmap.createBitmap(mat.cols(), mat.rows(), Bitmap.Config.ARGB_8888)
+        Utils.matToBitmap(mat, bmp)
+        listener.pauseAndShowStep(stageName, bmp, title, logs)
+        bmp.recycle() // 콜백 호출 후 즉시 메모리 반환
+    }
+
     // ---------------------------------------------------------
     // 안전한 Rect
     // ---------------------------------------------------------
@@ -61,23 +77,15 @@ object PlateDetectionEngine {
         maxW: Int,
         maxH: Int
     ): Rect {
-
         if (maxW <= 0 || maxH <= 0) {
             return Rect(0, 0, 0, 0)
         }
-
         val safeX = x.coerceIn(0, maxW - 1)
         val safeY = y.coerceIn(0, maxH - 1)
-
         val safeW = w.coerceAtMost(maxW - safeX)
         val safeH = h.coerceAtMost(maxH - safeY)
 
-        return Rect(
-            safeX,
-            safeY,
-            safeW,
-            safeH
-        )
+        return Rect(safeX, safeY, safeW, safeH)
     }
 
     // ---------------------------------------------------------
@@ -96,11 +104,8 @@ object PlateDetectionEngine {
         val minPhysicalWidth = 400
         val minPhysicalHeight = 200
 
-        cropW = max(cropW, minPhysicalWidth)
-            .coerceAtMost(fullBitmap.width)
-
-        cropH = max(cropH, minPhysicalHeight)
-            .coerceAtMost(fullBitmap.height)
+        cropW = max(cropW, minPhysicalWidth).coerceAtMost(fullBitmap.width)
+        cropH = max(cropH, minPhysicalHeight).coerceAtMost(fullBitmap.height)
 
         val safeRect = getSafeRect(
             (touchX - cropW / 2).toInt(),
@@ -112,19 +117,10 @@ object PlateDetectionEngine {
         )
 
         val croppedBitmap = Bitmap.createBitmap(
-            fullBitmap,
-            safeRect.x,
-            safeRect.y,
-            safeRect.width,
-            safeRect.height
+            fullBitmap, safeRect.x, safeRect.y, safeRect.width, safeRect.height
         )
 
-        return SeedCropResult(
-            safeRect.x,
-            safeRect.y,
-            croppedBitmap,
-            safeRect
-        )
+        return SeedCropResult(safeRect.x, safeRect.y, croppedBitmap, safeRect)
     }
 
     // ---------------------------------------------------------
@@ -145,21 +141,8 @@ object PlateDetectionEngine {
         val fullGray = Mat()
 
         try {
-
             Utils.bitmapToMat(fullBitmap, fullMat)
-
-            Imgproc.cvtColor(
-                fullMat,
-                fullGray,
-                Imgproc.COLOR_RGBA2GRAY
-            )
-
-            // =================================================
-            // 핵심 변경
-            //
-            // AI Box를 확장하지 않는다.
-            // AI가 정한 영역 자체를 OpenCV 검색 영역으로 사용한다.
-            // =================================================
+            Imgproc.cvtColor(fullMat, fullGray, Imgproc.COLOR_RGBA2GRAY)
 
             val safeRoi = getSafeRect(
                 aiGlobalBox.left,
@@ -174,282 +157,130 @@ object PlateDetectionEngine {
                 return null
             }
 
+            // [디버그 1] AI 영역 확보
+            debugListener?.let {
+                val debugMat = fullMat.clone()
+                Imgproc.rectangle(debugMat, safeRoi, Scalar(0.0, 255.0, 0.0, 255.0), 5)
+                emitDebug(it, debugMat, "1. AI Box 탐색 영역", "ROI 설정 완료", listOf(
+                    "X: ${safeRoi.x}, Y: ${safeRoi.y}",
+                    "Width: ${safeRoi.width}, Height: ${safeRoi.height}",
+                    "이 영역 안에서만 연산을 수행합니다."
+                ))
+                debugMat.release()
+            }
+
             val roiGray = Mat()
+            fullGray.submat(safeRoi).copyTo(roiGray)
 
-            fullGray
-                .submat(safeRoi)
-                .copyTo(roiGray)
-
-            // =================================================
-            // AI Box는 그대로 유지
-            // =================================================
-
-            val localAiRect = Rect(
-                0,
-                0,
-                safeRoi.width,
-                safeRoi.height
-            )
-
-            // =================================================
-            // 후보 생성
-            //
-            // A. 원본 Canny
-            // B. 약한 Close Canny
-            // C. HoughLinesP
-            // =================================================
-
+            val localAiRect = Rect(0, 0, safeRoi.width, safeRoi.height)
             val candidates = mutableListOf<PlateCandidate>()
 
             // -------------------------------------------------
             // A. Contour 후보
             // -------------------------------------------------
-
-            val contourCandidates =
-                extractContourCandidates(roiGray)
-
-            candidates.addAll(
-                contourCandidates.mapNotNull { pts ->
-
-                    val score =
-                        evaluateCandidate(
-                            pts,
-                            localAiRect,
-                            safeRoi.width,
-                            safeRoi.height
-                        )
-
-                    if (score.score >= MIN_CANDIDATE_SCORE) {
-                        PlateCandidate(
-                            pts,
-                            score.score,
-                            score.log
-                        )
-                    } else {
-                        null
-                    }
-                }
-            )
+            val contourCandidates = extractContourCandidates(roiGray, debugListener)
+            candidates.addAll(contourCandidates.mapNotNull { pts ->
+                val score = evaluateCandidate(pts, localAiRect, safeRoi.width, safeRoi.height)
+                if (score.score >= MIN_CANDIDATE_SCORE) PlateCandidate(pts, score.score, score.log) else null
+            })
 
             // -------------------------------------------------
             // B. Hough 기반 실제 4선 조합
             // -------------------------------------------------
+            val houghCandidates = extractHoughQuadCandidates(roiGray, debugListener)
+            candidates.addAll(houghCandidates.mapNotNull { pts ->
+                val score = evaluateCandidate(pts, localAiRect, safeRoi.width, safeRoi.height)
+                if (score.score >= MIN_CANDIDATE_SCORE) PlateCandidate(pts, score.score, score.log) else null
+            })
 
-            val houghCandidates =
-                extractHoughQuadCandidates(roiGray)
+            // =================================================
+            // 최고 후보 도출
+            // =================================================
+            val bestCandidate = candidates.maxByOrNull { it.score }
 
-            candidates.addAll(
-                houghCandidates.mapNotNull { pts ->
+            // [디버그 4] 최종 후보군 렌더링 및 평가 내역
+            debugListener?.let { listener ->
+                val debugMat = Mat()
+                Imgproc.cvtColor(roiGray, debugMat, Imgproc.COLOR_GRAY2RGBA)
 
-                    val score =
-                        evaluateCandidate(
-                            pts,
-                            localAiRect,
-                            safeRoi.width,
-                            safeRoi.height
-                        )
+                // 후보군 전체 렌더링 (회색)
+                candidates.forEach { c ->
+                    val poly = MatOfPoint(*c.pts.toTypedArray())
+                    Imgproc.polylines(debugMat, listOf(poly), true, Scalar(180.0, 180.0, 180.0, 255.0), 1)
+                    poly.release()
+                }
 
-                    if (score.score >= MIN_CANDIDATE_SCORE) {
-                        PlateCandidate(
-                            pts,
-                            score.score,
-                            score.log
-                        )
-                    } else {
-                        null
+                // 1등 후보군 렌더링 (진녹색)
+                bestCandidate?.let { best ->
+                    val poly = MatOfPoint(*best.pts.toTypedArray())
+                    Imgproc.polylines(debugMat, listOf(poly), true, Scalar(0.0, 255.0, 0.0, 255.0), 3)
+                    poly.release()
+                    for (p in best.pts) {
+                        Imgproc.circle(debugMat, p, 4, Scalar(0.0, 200.0, 255.0, 255.0), -1)
                     }
                 }
-            )
+
+                emitDebug(listener, debugMat, "4. 전체 후보 평가", "점수 계산 및 최적 후보 선정", listOf(
+                    "통과 기준점: $MIN_FINAL_SCORE",
+                    "총 도출된 후보 수: ${candidates.size}",
+                    "최고 점수: ${bestCandidate?.score?.let { s -> String.format("%.1f", s) } ?: "없음"}",
+                    bestCandidate?.debugLog ?: "평가된 후보가 없습니다."
+                ))
+                debugMat.release()
+            }
 
             // =================================================
-            // 최고 후보
+            // 실패 처리
             // =================================================
-
-            val bestCandidate =
-                candidates
-                    .maxByOrNull { it.score }
-
-            // =================================================
-            // 매우 중요
-            //
-            // 후보가 없거나 신뢰도가 낮으면 실패.
-            // AI Box로 fallback 하지 않는다.
-            // =================================================
-
-            if (
-                bestCandidate == null ||
-                bestCandidate.score < MIN_FINAL_SCORE
-            ) {
-
+            if (bestCandidate == null || bestCandidate.score < MIN_FINAL_SCORE) {
+                // [디버그 5-Fail] OpenCV 정밀화 실패
                 debugListener?.let {
-
                     val debugMat = fullMat.clone()
-
-                    Imgproc.rectangle(
-                        debugMat,
-                        safeRoi,
-                        Scalar(
-                            0.0,
-                            255.0,
-                            255.0,
-                            255.0
-                        ),
-                        3
-                    )
-
-                    val debugBmp =
-                        Bitmap.createBitmap(
-                            debugMat.cols(),
-                            debugMat.rows(),
-                            Bitmap.Config.ARGB_8888
-                        )
-
-                    Utils.matToBitmap(
-                        debugMat,
-                        debugBmp
-                    )
-
-                    it.pauseAndShowStep(
-                        "OpenCV 정밀화 실패",
-                        debugBmp,
-                        "번호판 4점 확정 실패",
-                        listOf(
-                            "AI Box는 정상적으로 검출됨",
-                            "하지만 신뢰할 수 있는 4점 후보를 찾지 못함",
-                            "→ AI Box fallback을 사용하지 않음",
-                            "→ 마스킹하지 않음"
-                        )
-                    )
-
+                    Imgproc.rectangle(debugMat, safeRoi, Scalar(255.0, 0.0, 0.0, 255.0), 5) // Red Box
+                    emitDebug(it, debugMat, "5. OpenCV 정밀화 실패", "번호판 4점 확정 실패", listOf(
+                        "AI Box는 정상적으로 검출됨",
+                        "하지만 신뢰할 수 있는 4점 후보를 찾지 못함",
+                        "기준 점수 미달: ${bestCandidate?.score?.let { s -> String.format("%.1f", s) } ?: "0.0"} < $MIN_FINAL_SCORE",
+                        "→ 마스킹 로직으로 넘어가지 않음"
+                    ))
                     debugMat.release()
-                    debugBmp.recycle()
                 }
-
                 roiGray.release()
-
                 return null
             }
 
             // =================================================
-            // 최종 4점
+            // 최종 4점 성공
             // =================================================
+            val finalLocalPts = sortCorners(bestCandidate.pts)
+            val globalPts = finalLocalPts.map {
+                ImmutablePoint((it.x + safeRoi.x).toFloat(), (it.y + safeRoi.y).toFloat())
+            }
 
-            val finalLocalPts =
-                sortCorners(bestCandidate.pts)
-
-            val globalPts =
-                finalLocalPts.map {
-
-                    ImmutablePoint(
-                        (it.x + safeRoi.x).toFloat(),
-                        (it.y + safeRoi.y).toFloat()
-                    )
-                }
-
-            // =================================================
-            // 디버그
-            // =================================================
-
+            // [디버그 5-Success] 최종 결과 확정
             debugListener?.let {
+                val debugMat = fullMat.clone()
+                Imgproc.rectangle(debugMat, safeRoi, Scalar(0.0, 255.0, 255.0, 255.0), 3) // Yellow Box
 
-                val debugMat =
-                    fullMat.clone()
-
-                // AI Box
-                Imgproc.rectangle(
-                    debugMat,
-                    safeRoi,
-                    Scalar(
-                        0.0,
-                        255.0,
-                        255.0,
-                        255.0
-                    ),
-                    3
-                )
-
-                // 최종 4점
                 for (i in 0 until 4) {
-
-                    val p1 =
-                        Point(
-                            globalPts[i].x.toDouble(),
-                            globalPts[i].y.toDouble()
-                        )
-
-                    val p2 =
-                        Point(
-                            globalPts[(i + 1) % 4].x.toDouble(),
-                            globalPts[(i + 1) % 4].y.toDouble()
-                        )
-
-                    Imgproc.line(
-                        debugMat,
-                        p1,
-                        p2,
-                        Scalar(
-                            0.0,
-                            255.0,
-                            0.0,
-                            255.0
-                        ),
-                        5
-                    )
-
-                    Imgproc.circle(
-                        debugMat,
-                        p1,
-                        10,
-                        Scalar(
-                            255.0,
-                            0.0,
-                            255.0,
-                            255.0
-                        ),
-                        -1
-                    )
+                    val p1 = Point(globalPts[i].x.toDouble(), globalPts[i].y.toDouble())
+                    val p2 = Point(globalPts[(i + 1) % 4].x.toDouble(), globalPts[(i + 1) % 4].y.toDouble())
+                    Imgproc.line(debugMat, p1, p2, Scalar(0.0, 255.0, 0.0, 255.0), 5)
+                    Imgproc.circle(debugMat, p1, 10, Scalar(255.0, 0.0, 255.0, 255.0), -1)
                 }
 
-                val debugBmp =
-                    Bitmap.createBitmap(
-                        debugMat.cols(),
-                        debugMat.rows(),
-                        Bitmap.Config.ARGB_8888
-                    )
-
-                Utils.matToBitmap(
-                    debugMat,
-                    debugBmp
-                )
-
-                it.pauseAndShowStep(
-                    "AI → OpenCV 정밀화",
-                    debugBmp,
-                    "최종 번호판 4점",
-                    listOf(
-                        "AI Box 내부에서만 정밀화",
-                        "AI Box 확장 없음",
-                        "후보 수: ${candidates.size}",
-                        "최종 점수: ${
-                            String.format(
-                                "%.1f",
-                                bestCandidate.score
-                            )
-                        }",
-                        bestCandidate.debugLog
-                    )
-                )
-
+                emitDebug(it, debugMat, "5. AI → OpenCV 정밀화 완료", "최종 번호판 영역 확정", listOf(
+                    "AI Box 내부 정밀화 성공",
+                    "최종 점수: ${String.format("%.1f", bestCandidate.score)}",
+                    bestCandidate.debugLog
+                ))
                 debugMat.release()
-                debugBmp.recycle()
             }
 
             roiGray.release()
-
             return globalPts
 
         } finally {
-
             fullGray.release()
             fullMat.release()
         }
@@ -460,154 +291,91 @@ object PlateDetectionEngine {
     // =========================================================
 
     private fun extractContourCandidates(
-        gray: Mat
+        gray: Mat,
+        debugListener: DetectionDebugListener?
     ): List<List<Point>> {
-
-        val result =
-            mutableListOf<List<Point>>()
-
-        // ---------------------------------------------
-        // 두 가지 edge 경로
-        // ---------------------------------------------
-
-        val edgeMats =
-            mutableListOf<Mat>()
+        val result = mutableListOf<List<Point>>()
+        val edgeMats = mutableListOf<Mat>()
 
         // A. 기본 Canny
         run {
-
             val blurred = Mat()
             val edges = Mat()
-
-            Imgproc.GaussianBlur(
-                gray,
-                blurred,
-                Size(3.0, 3.0),
-                0.0
-            )
-
-            Imgproc.Canny(
-                blurred,
-                edges,
-                40.0,
-                120.0
-            )
-
+            Imgproc.GaussianBlur(gray, blurred, Size(3.0, 3.0), 0.0)
+            Imgproc.Canny(blurred, edges, 40.0, 120.0)
+            
+            // [디버그 2-1] 기본 Canny 
+            debugListener?.let {
+                emitDebug(it, edges, "2-1. Contour - 기본 Canny", "Canny 엣지 추출", listOf("Blur(3x3) -> Canny(40, 120)"))
+            }
+            
             edgeMats.add(edges)
-
             blurred.release()
         }
 
         // B. 약한 Close
         run {
-
             val blurred = Mat()
             val edges = Mat()
+            Imgproc.GaussianBlur(gray, blurred, Size(3.0, 3.0), 0.0)
+            Imgproc.Canny(blurred, edges, 40.0, 120.0)
 
-            Imgproc.GaussianBlur(
-                gray,
-                blurred,
-                Size(3.0, 3.0),
-                0.0
-            )
-
-            Imgproc.Canny(
-                blurred,
-                edges,
-                40.0,
-                120.0
-            )
-
-            val kernel =
-                Imgproc.getStructuringElement(
-                    Imgproc.MORPH_RECT,
-                    Size(2.0, 2.0)
-                )
-
-            Imgproc.morphologyEx(
-                edges,
-                edges,
-                Imgproc.MORPH_CLOSE,
-                kernel
-            )
+            val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
+            Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_CLOSE, kernel)
+            
+            // [디버그 2-2] Morph Close
+            debugListener?.let {
+                emitDebug(it, edges, "2-2. Contour - Morph Close", "끊어진 선 연결", listOf("Morphology Close (2x2) 적용됨"))
+            }
 
             kernel.release()
-
             edgeMats.add(edges)
-
             blurred.release()
         }
 
-        // ---------------------------------------------
-        // contour
-        // ---------------------------------------------
-
         for (edges in edgeMats) {
-
-            val contours =
-                ArrayList<MatOfPoint>()
-
+            val contours = ArrayList<MatOfPoint>()
             val hierarchy = Mat()
-
-            Imgproc.findContours(
-                edges,
-                contours,
-                hierarchy,
-                Imgproc.RETR_LIST,
-                Imgproc.CHAIN_APPROX_SIMPLE
-            )
-
+            Imgproc.findContours(edges, contours, hierarchy, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE)
             hierarchy.release()
 
             for (contour in contours) {
-
                 if (contour.total() < 4) {
                     contour.release()
                     continue
                 }
 
-                val contour2f =
-                    MatOfPoint2f(
-                        *contour.toArray()
-                    )
+                val contour2f = MatOfPoint2f(*contour.toArray())
+                val peri = Imgproc.arcLength(contour2f, true)
+                val approx = MatOfPoint2f()
 
-                val peri =
-                    Imgproc.arcLength(
-                        contour2f,
-                        true
-                    )
+                Imgproc.approxPolyDP(contour2f, approx, 0.02 * peri, true)
+                val points = approx.toArray().toList()
 
-                val approx =
-                    MatOfPoint2f()
-
-                Imgproc.approxPolyDP(
-                    contour2f,
-                    approx,
-                    0.02 * peri,
-                    true
-                )
-
-                val points =
-                    approx.toArray().toList()
-
-                if (
-                    points.size == 4 &&
-                    Imgproc.isContourConvex(
-                        MatOfPoint(*points.toTypedArray())
-                    )
-                ) {
-
-                    result.add(
-                        sortCorners(points)
-                    )
+                if (points.size == 4 && Imgproc.isContourConvex(MatOfPoint(*points.toTypedArray()))) {
+                    result.add(sortCorners(points))
                 }
 
                 approx.release()
                 contour2f.release()
                 contour.release()
             }
-
             edges.release()
+        }
+
+        // [디버그 2-3] 추출된 다각형 필터링 결과
+        debugListener?.let { listener ->
+            val debugMat = Mat()
+            Imgproc.cvtColor(gray, debugMat, Imgproc.COLOR_GRAY2RGBA)
+            result.forEach { pts ->
+                val poly = MatOfPoint(*pts.toTypedArray())
+                Imgproc.polylines(debugMat, listOf(poly), true, Scalar(0.0, 255.0, 0.0, 255.0), 2)
+                poly.release()
+            }
+            emitDebug(listener, debugMat, "2-3. Contour - 다각형", "4점 다각형 필터링", listOf(
+                "검출된 볼록 다각형(Convex) 수: ${result.size}"
+            ))
+            debugMat.release()
         }
 
         return result
@@ -618,749 +386,268 @@ object PlateDetectionEngine {
     // =========================================================
 
     private fun extractHoughQuadCandidates(
-        gray: Mat
+        gray: Mat,
+        debugListener: DetectionDebugListener?
     ): List<List<Point>> {
-
-        val result =
-            mutableListOf<List<Point>>()
-
+        val result = mutableListOf<List<Point>>()
         val edges = Mat()
 
-        Imgproc.Canny(
-            gray,
-            edges,
-            40.0,
-            120.0
-        )
+        Imgproc.Canny(gray, edges, 40.0, 120.0)
+
+        // [디버그 3-1] Hough용 Canny
+        debugListener?.let {
+            emitDebug(it, edges, "3-1. Hough - Canny", "직선 추출용 엣지", listOf("Canny(40, 120)"))
+        }
 
         val lines = Mat()
-
         Imgproc.HoughLinesP(
-            edges,
-            lines,
-            1.0,
-            Math.PI / 180.0,
-            25,
-            min(gray.cols(), gray.rows()) * 0.18,
-            8.0
+            edges, lines, 1.0, Math.PI / 180.0, 25,
+            min(gray.cols(), gray.rows()) * 0.18, 8.0
         )
 
-        val houghLines =
-            mutableListOf<HoughLine>()
-
+        val houghLines = mutableListOf<HoughLine>()
         for (i in 0 until lines.rows()) {
-
-            val v =
-                lines.get(i, 0)
-                    ?: continue
-
-            val p1 =
-                Point(
-                    v[0],
-                    v[1]
-                )
-
-            val p2 =
-                Point(
-                    v[2],
-                    v[3]
-                )
+            val v = lines.get(i, 0) ?: continue
+            val p1 = Point(v[0], v[1])
+            val p2 = Point(v[2], v[3])
 
             val dx = p2.x - p1.x
             val dy = p2.y - p1.y
+            val length = hypot(dx, dy)
 
-            val length =
-                hypot(dx, dy)
+            if (length < 20.0) continue
 
-            if (length < 20.0) {
-                continue
-            }
+            var angle = Math.toDegrees(atan2(dy, dx))
+            if (angle < 0) angle += 180.0
 
-            var angle =
-                Math.toDegrees(
-                    atan2(dy, dx)
-                )
-
-            if (angle < 0) {
-                angle += 180.0
-            }
-
-            houghLines.add(
-                HoughLine(
-                    p1,
-                    p2,
-                    length,
-                    angle
-                )
-            )
+            houghLines.add(HoughLine(p1, p2, length, angle))
         }
 
         lines.release()
         edges.release()
 
-        // 너무 많은 조합 방지
-        val selectedLines =
-            houghLines
-                .sortedByDescending { it.length }
-                .take(24)
+        // [디버그 3-2] 검출된 직선 렌더링
+        debugListener?.let { listener ->
+            val debugMat = Mat()
+            Imgproc.cvtColor(gray, debugMat, Imgproc.COLOR_GRAY2RGBA)
+            houghLines.forEach { hl ->
+                Imgproc.line(debugMat, hl.p1, hl.p2, Scalar(255.0, 0.0, 0.0, 255.0), 1)
+            }
+            emitDebug(listener, debugMat, "3-2. Hough - 선 검출", "직선 성분 추출", listOf(
+                "검출된 선분 수: ${houghLines.size}", 
+                "상위 24개 추출 및 필터링 후 교점 탐색 진행"
+            ))
+            debugMat.release()
+        }
 
-        // ---------------------------------------------
-        // 서로 거의 평행한 두 선을 찾는다.
-        // ---------------------------------------------
-
-        val parallelPairs =
-            mutableListOf<Pair<HoughLine, HoughLine>>()
+        val selectedLines = houghLines.sortedByDescending { it.length }.take(24)
+        val parallelPairs = mutableListOf<Pair<HoughLine, HoughLine>>()
 
         for (i in selectedLines.indices) {
-
             for (j in i + 1 until selectedLines.size) {
+                val a = selectedLines[i]
+                val b = selectedLines[j]
+                val diff = angleDifference(a.angle, b.angle)
+                if (diff <= 12.0) parallelPairs.add(Pair(a, b))
+            }
+        }
 
-                val a =
-                    selectedLines[i]
+        for (i in parallelPairs.indices) {
+            val pairA = parallelPairs[i]
+            val angleA = pairA.first.angle
+            for (j in i + 1 until parallelPairs.size) {
+                val pairB = parallelPairs[j]
+                val angleB = pairB.first.angle
+                val perpendicularDiff = abs(angleDifference(angleA, angleB) - 90.0)
 
-                val b =
-                    selectedLines[j]
+                if (perpendicularDiff > 20.0) continue
 
-                val diff =
-                    angleDifference(
-                        a.angle,
-                        b.angle
-                    )
+                val quad = buildQuadFromLines(pairA.first, pairA.second, pairB.first, pairB.second) ?: continue
 
-                if (diff <= 12.0) {
-                    parallelPairs.add(
-                        Pair(a, b)
-                    )
+                if (isReasonableQuad(quad, gray.cols(), gray.rows())) {
+                    result.add(sortCorners(quad))
                 }
             }
         }
 
-        // ---------------------------------------------
-        // 서로 거의 직각인 두 방향의 pair를 결합
-        // ---------------------------------------------
-
-        for (i in parallelPairs.indices) {
-
-            val pairA =
-                parallelPairs[i]
-
-            val angleA =
-                pairA.first.angle
-
-            for (j in i + 1 until parallelPairs.size) {
-
-                val pairB =
-                    parallelPairs[j]
-
-                val angleB =
-                    pairB.first.angle
-
-                val perpendicularDiff =
-                    abs(
-                        angleDifference(
-                            angleA,
-                            angleB
-                        ) - 90.0
-                    )
-
-                if (perpendicularDiff > 20.0) {
-                    continue
-                }
-
-                val quad =
-                    buildQuadFromLines(
-                        pairA.first,
-                        pairA.second,
-                        pairB.first,
-                        pairB.second
-                    )
-                    ?: continue
-
-                if (
-                    isReasonableQuad(
-                        quad,
-                        gray.cols(),
-                        gray.rows()
-                    )
-                ) {
-
-                    result.add(
-                        sortCorners(quad)
-                    )
-                }
+        // [디버그 3-3] 선의 교점으로 만들어진 사각형 렌더링
+        debugListener?.let { listener ->
+            val debugMat = Mat()
+            Imgproc.cvtColor(gray, debugMat, Imgproc.COLOR_GRAY2RGBA)
+            result.forEach { pts ->
+                val poly = MatOfPoint(*pts.toTypedArray())
+                Imgproc.polylines(debugMat, listOf(poly), true, Scalar(255.0, 255.0, 0.0, 255.0), 2)
+                poly.release()
             }
+            emitDebug(listener, debugMat, "3-3. Hough - 조합 사각형", "교점 기반 4점 조합", listOf(
+                "교점으로 생성된 사각형 수: ${result.size}"
+            ))
+            debugMat.release()
         }
 
         return result
     }
 
     // =========================================================
-    // 4개 선의 교점으로 사각형 생성
+    // 이하 로직 (buildQuadFromLines ~ MIN_FINAL_SCORE) 은 변경되지 않았습니다.
+    // 기존과 동일하게 유지됩니다.
     // =========================================================
 
     private fun buildQuadFromLines(
-        a1: HoughLine,
-        a2: HoughLine,
-        b1: HoughLine,
-        b2: HoughLine
+        a1: HoughLine, a2: HoughLine, b1: HoughLine, b2: HoughLine
     ): List<Point>? {
+        val p1 = intersection(a1.p1, a1.p2, b1.p1, b1.p2)
+        val p2 = intersection(a1.p1, a1.p2, b2.p1, b2.p2)
+        val p3 = intersection(a2.p1, a2.p2, b2.p1, b2.p2)
+        val p4 = intersection(a2.p1, a2.p2, b1.p1, b1.p2)
 
-        val p1 =
-            intersection(
-                a1.p1,
-                a1.p2,
-                b1.p1,
-                b1.p2
-            )
-
-        val p2 =
-            intersection(
-                a1.p1,
-                a1.p2,
-                b2.p1,
-                b2.p2
-            )
-
-        val p3 =
-            intersection(
-                a2.p1,
-                a2.p2,
-                b2.p1,
-                b2.p2
-            )
-
-        val p4 =
-            intersection(
-                a2.p1,
-                a2.p2,
-                b1.p1,
-                b1.p2
-            )
-
-        if (
-            p1 == null ||
-            p2 == null ||
-            p3 == null ||
-            p4 == null
-        ) {
-            return null
-        }
-
-        return listOf(
-            p1,
-            p2,
-            p3,
-            p4
-        )
+        if (p1 == null || p2 == null || p3 == null || p4 == null) return null
+        return listOf(p1, p2, p3, p4)
     }
 
-    // =========================================================
-    // 두 직선 교점
-    // =========================================================
-
     private fun intersection(
-        p1: Point,
-        p2: Point,
-        p3: Point,
-        p4: Point
+        p1: Point, p2: Point, p3: Point, p4: Point
     ): Point? {
+        val x1 = p1.x; val y1 = p1.y
+        val x2 = p2.x; val y2 = p2.y
+        val x3 = p3.x; val y3 = p3.y
+        val x4 = p4.x; val y4 = p4.y
 
-        val x1 = p1.x
-        val y1 = p1.y
-        val x2 = p2.x
-        val y2 = p2.y
+        val denominator = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+        if (abs(denominator) < 1e-6) return null
 
-        val x3 = p3.x
-        val y3 = p3.y
-        val x4 = p4.x
-        val y4 = p4.y
-
-        val denominator =
-            (x1 - x2) * (y3 - y4) -
-            (y1 - y2) * (x3 - x4)
-
-        if (abs(denominator) < 1e-6) {
-            return null
-        }
-
-        val px =
-            (
-                (x1 * y2 - y1 * x2) * (x3 - x4) -
-                (x1 - x2) * (x3 * y4 - y3 * x4)
-            ) / denominator
-
-        val py =
-            (
-                (x1 * y2 - y1 * x2) * (y3 - y4) -
-                (y1 - y2) * (x3 * y4 - y3 * x4)
-            ) / denominator
-
+        val px = ((x1 * y2 - y1 * x2) * (x3 - x4) - (x1 - x2) * (x3 * y4 - y3 * x4)) / denominator
+        val py = ((x1 * y2 - y1 * x2) * (y3 - y4) - (y1 - y2) * (x3 * y4 - y3 * x4)) / denominator
         return Point(px, py)
     }
 
-    // =========================================================
-    // 사각형 기본 유효성
-    // =========================================================
-
     private fun isReasonableQuad(
-        pts: List<Point>,
-        width: Int,
-        height: Int
+        pts: List<Point>, width: Int, height: Int
     ): Boolean {
-
-        if (pts.size != 4) {
-            return false
-        }
-
+        if (pts.size != 4) return false
         for (p in pts) {
-
-            if (
-                p.x < -width * 0.15 ||
-                p.x > width * 1.15 ||
-                p.y < -height * 0.15 ||
-                p.y > height * 1.15
-            ) {
+            if (p.x < -width * 0.15 || p.x > width * 1.15 ||
+                p.y < -height * 0.15 || p.y > height * 1.15) {
                 return false
             }
         }
-
-        val ordered =
-            sortCorners(pts)
-
-        val area =
-            abs(
-                polygonArea(ordered)
-            )
-
-        if (area < width * height * 0.03) {
-            return false
-        }
-
+        val ordered = sortCorners(pts)
+        val area = abs(polygonArea(ordered))
+        if (area < width * height * 0.03) return false
         return true
     }
 
-    // =========================================================
-    // 후보 평가
-    // =========================================================
-
     private fun evaluateCandidate(
-        pts: List<Point>,
-        aiRect: Rect,
-        roiWidth: Int,
-        roiHeight: Int
+        pts: List<Point>, aiRect: Rect, roiWidth: Int, roiHeight: Int
     ): ScoreResult {
+        if (pts.size != 4) return ScoreResult(0.0, "4점 아님")
 
-        if (pts.size != 4) {
-            return ScoreResult(
-                0.0,
-                "4점 아님"
-            )
+        val p = sortCorners(pts)
+        val tl = p[0]; val tr = p[1]; val br = p[2]; val bl = p[3]
+
+        val top = hypot(tr.x - tl.x, tr.y - tl.y)
+        val bottom = hypot(br.x - bl.x, br.y - bl.y)
+        val left = hypot(bl.x - tl.x, bl.y - tl.y)
+        val right = hypot(br.x - tr.x, br.y - tr.y)
+
+        if (top <= 1 || bottom <= 1 || left <= 1 || right <= 1) return ScoreResult(0.0, "변 길이 오류")
+
+        val widthAvg = (top + bottom) / 2.0
+        val heightAvg = (left + right) / 2.0
+        val aspectRatio = widthAvg / heightAvg
+
+        val aspectScore = if (aspectRatio in 1.8..6.0) {
+            100.0 - abs(aspectRatio - 3.0) * 12.0
+        } else {
+            max(0.0, 100.0 - abs(aspectRatio - 3.0) * 30.0)
         }
 
-        val p =
-            sortCorners(pts)
+        val topAngle = lineAngle(tl, tr)
+        val bottomAngle = lineAngle(bl, br)
+        val horizontalParallel = angleDifference(topAngle, bottomAngle)
+        val horizontalScore = max(0.0, 100.0 - horizontalParallel * 6.0)
 
-        val tl = p[0]
-        val tr = p[1]
-        val br = p[2]
-        val bl = p[3]
+        val leftAngle = lineAngle(tl, bl)
+        val rightAngle = lineAngle(tr, br)
+        val verticalParallel = angleDifference(leftAngle, rightAngle)
+        val verticalScore = max(0.0, 100.0 - verticalParallel * 6.0)
 
-        // ---------------------------------------------
-        // 변 길이
-        // ---------------------------------------------
+        val parallelScore = (horizontalScore + verticalScore) / 2.0
 
-        val top =
-            hypot(
-                tr.x - tl.x,
-                tr.y - tl.y
-            )
+        val candidateArea = abs(polygonArea(p))
+        val aiArea = aiRect.width.toDouble() * aiRect.height.toDouble()
+        if (aiArea <= 0) return ScoreResult(0.0, "AI Box 면적 오류")
 
-        val bottom =
-            hypot(
-                br.x - bl.x,
-                br.y - bl.y
-            )
-
-        val left =
-            hypot(
-                bl.x - tl.x,
-                bl.y - tl.y
-            )
-
-        val right =
-            hypot(
-                br.x - tr.x,
-                br.y - tr.y
-            )
-
-        if (
-            top <= 1 ||
-            bottom <= 1 ||
-            left <= 1 ||
-            right <= 1
-        ) {
-            return ScoreResult(
-                0.0,
-                "변 길이 오류"
-            )
+        val areaRatio = candidateArea / aiArea
+        val areaFitScore = when {
+            areaRatio in 0.45..1.05 -> 100.0
+            areaRatio < 0.45 -> max(0.0, areaRatio / 0.45 * 100.0)
+            else -> max(0.0, 100.0 - (areaRatio - 1.05) * 150.0)
         }
 
-        val widthAvg =
-            (top + bottom) / 2.0
+        val centerX = p.map { it.x }.average()
+        val centerY = p.map { it.y }.average()
+        val aiCenterX = aiRect.x + aiRect.width / 2.0
+        val aiCenterY = aiRect.y + aiRect.height / 2.0
 
-        val heightAvg =
-            (left + right) / 2.0
-
-        val aspectRatio =
-            widthAvg / heightAvg
-
-        // ---------------------------------------------
-        // 1. 종횡비
-        // ---------------------------------------------
-
-        val aspectScore =
-            if (aspectRatio in 1.8..6.0) {
-
-                100.0 -
-                    abs(aspectRatio - 3.0) * 12.0
-
-            } else {
-
-                max(
-                    0.0,
-                    100.0 -
-                        abs(aspectRatio - 3.0) * 30.0
-                )
-            }
-
-        // ---------------------------------------------
-        // 2. 상하변 평행성
-        // ---------------------------------------------
-
-        val topAngle =
-            lineAngle(tl, tr)
-
-        val bottomAngle =
-            lineAngle(bl, br)
-
-        val horizontalParallel =
-            angleDifference(
-                topAngle,
-                bottomAngle
-            )
-
-        val horizontalScore =
-            max(
-                0.0,
-                100.0 -
-                    horizontalParallel * 6.0
-            )
-
-        // ---------------------------------------------
-        // 3. 좌우변 평행성
-        // ---------------------------------------------
-
-        val leftAngle =
-            lineAngle(tl, bl)
-
-        val rightAngle =
-            lineAngle(tr, br)
-
-        val verticalParallel =
-            angleDifference(
-                leftAngle,
-                rightAngle
-            )
-
-        val verticalScore =
-            max(
-                0.0,
-                100.0 -
-                    verticalParallel * 6.0
-            )
-
-        val parallelScore =
-            (horizontalScore + verticalScore) / 2.0
-
-        // ---------------------------------------------
-        // 4. AI Box 내부 적합도
-        //
-        // 후보의 실제 4점이 AI Box를 얼마나 잘 채우는가
-        // ---------------------------------------------
-
-        val candidateArea =
-            abs(
-                polygonArea(p)
-            )
-
-        val aiArea =
-            aiRect.width.toDouble() *
-            aiRect.height.toDouble()
-
-        if (aiArea <= 0) {
-            return ScoreResult(
-                0.0,
-                "AI Box 면적 오류"
-            )
-        }
-
-        val areaRatio =
-            candidateArea / aiArea
-
-        val areaFitScore =
-            when {
-                areaRatio in 0.45..1.05 ->
-                    100.0
-
-                areaRatio < 0.45 ->
-                    max(
-                        0.0,
-                        areaRatio / 0.45 * 100.0
-                    )
-
-                else ->
-                    max(
-                        0.0,
-                        100.0 -
-                            (areaRatio - 1.05) * 150.0
-                    )
-            }
-
-        // ---------------------------------------------
-        // 5. 중심 위치
-        // ---------------------------------------------
-
-        val centerX =
-            p.map { it.x }.average()
-
-        val centerY =
-            p.map { it.y }.average()
-
-        val aiCenterX =
-            aiRect.x +
-                aiRect.width / 2.0
-
-        val aiCenterY =
-            aiRect.y +
-                aiRect.height / 2.0
-
-        val centerDistance =
-            hypot(
-                centerX - aiCenterX,
-                centerY - aiCenterY
-            )
-
-        val maxCenterDistance =
-            hypot(
-                aiRect.width.toDouble(),
-                aiRect.height.toDouble()
-            ) / 2.0
-
-        val centerScore =
-            max(
-                0.0,
-                100.0 -
-                    (
-                        centerDistance /
-                            maxCenterDistance.coerceAtLeast(1.0)
-                    ) * 100.0
-            )
-
-        // ---------------------------------------------
-        // 6. AI Box 밖으로 나간 점
-        // ---------------------------------------------
+        val centerDistance = hypot(centerX - aiCenterX, centerY - aiCenterY)
+        val maxCenterDistance = hypot(aiRect.width.toDouble(), aiRect.height.toDouble()) / 2.0
+        val centerScore = max(0.0, 100.0 - (centerDistance / maxCenterDistance.coerceAtLeast(1.0)) * 100.0)
 
         var overflow = 0.0
-
         for (point in p) {
-
-            val dx =
-                when {
-                    point.x < aiRect.x ->
-                        aiRect.x - point.x
-
-                    point.x >
-                        aiRect.x + aiRect.width ->
-                        point.x -
-                            (aiRect.x + aiRect.width)
-
-                    else -> 0.0
-                }
-
-            val dy =
-                when {
-                    point.y < aiRect.y ->
-                        aiRect.y - point.y
-
-                    point.y >
-                        aiRect.y + aiRect.height ->
-                        point.y -
-                            (aiRect.y + aiRect.height)
-
-                    else -> 0.0
-                }
-
+            val dx = when {
+                point.x < aiRect.x -> aiRect.x - point.x
+                point.x > aiRect.x + aiRect.width -> point.x - (aiRect.x + aiRect.width)
+                else -> 0.0
+            }
+            val dy = when {
+                point.y < aiRect.y -> aiRect.y - point.y
+                point.y > aiRect.y + aiRect.height -> point.y - (aiRect.y + aiRect.height)
+                else -> 0.0
+            }
             overflow += hypot(dx, dy)
         }
 
-        val overflowRatio =
-            overflow /
-                (
-                    aiRect.width +
-                        aiRect.height
-                ).toDouble()
+        val overflowRatio = overflow / (aiRect.width + aiRect.height).toDouble()
+        val overflowScore = max(0.0, 100.0 - overflowRatio * 200.0)
 
-        val overflowScore =
-            max(
-                0.0,
-                100.0 -
-                    overflowRatio * 200.0
-            )
+        val finalScore = (aspectScore * 0.20 + parallelScore * 0.25 + areaFitScore * 0.20 + centerScore * 0.20 + overflowScore * 0.15)
+        val log = "점수=${String.format("%.1f", finalScore)} AR=${aspectScore.toInt()} 평행=${parallelScore.toInt()} 크기=${areaFitScore.toInt()} 중심=${centerScore.toInt()} Over=${overflowScore.toInt()}"
 
-        // ---------------------------------------------
-        // 최종 점수
-        // ---------------------------------------------
-
-        val finalScore =
-            (
-                aspectScore * 0.20 +
-                parallelScore * 0.25 +
-                areaFitScore * 0.20 +
-                centerScore * 0.20 +
-                overflowScore * 0.15
-            )
-
-        val log =
-            "점수=${String.format("%.1f", finalScore)} " +
-            "AR=${aspectScore.toInt()} " +
-            "평행=${parallelScore.toInt()} " +
-            "크기=${areaFitScore.toInt()} " +
-            "중심=${centerScore.toInt()} " +
-            "Overflow=${overflowScore.toInt()}"
-
-        return ScoreResult(
-            finalScore,
-            log
-        )
+        return ScoreResult(finalScore, log)
     }
 
-    // =========================================================
-    // 선 각도
-    // =========================================================
-
-    private fun lineAngle(
-        a: Point,
-        b: Point
-    ): Double {
-
-        var angle =
-            Math.toDegrees(
-                atan2(
-                    b.y - a.y,
-                    b.x - a.x
-                )
-            )
-
-        if (angle < 0) {
-            angle += 180.0
-        }
-
+    private fun lineAngle(a: Point, b: Point): Double {
+        var angle = Math.toDegrees(atan2(b.y - a.y, b.x - a.x))
+        if (angle < 0) angle += 180.0
         return angle
     }
 
-    // =========================================================
-    // 각도 차이
-    // =========================================================
-
-    private fun angleDifference(
-        a: Double,
-        b: Double
-    ): Double {
-
-        var diff =
-            abs(a - b)
-
-        while (diff > 180.0) {
-            diff -= 180.0
-        }
-
-        return min(
-            diff,
-            180.0 - diff
-        )
+    private fun angleDifference(a: Double, b: Double): Double {
+        var diff = abs(a - b)
+        while (diff > 180.0) diff -= 180.0
+        return min(diff, 180.0 - diff)
     }
 
-    // =========================================================
-    // Polygon 면적
-    // =========================================================
-
-    private fun polygonArea(
-        pts: List<Point>
-    ): Double {
-
+    private fun polygonArea(pts: List<Point>): Double {
         var area = 0.0
-
         for (i in pts.indices) {
-
-            val j =
-                (i + 1) % pts.size
-
-            area +=
-                pts[i].x * pts[j].y -
-                pts[j].x * pts[i].y
+            val j = (i + 1) % pts.size
+            area += pts[i].x * pts[j].y - pts[j].x * pts[i].y
         }
-
         return area / 2.0
     }
 
-    // =========================================================
-    // 꼭지점 정렬
-    // =========================================================
-
-    private fun sortCorners(
-        pts: List<Point>
-    ): List<Point> {
-
-        if (pts.size != 4) {
-            return pts
-        }
-
-        val centerX =
-            pts.map { it.x }.average()
-
-        val centerY =
-            pts.map { it.y }.average()
-
-        val sorted =
-            pts.sortedBy {
-
-                atan2(
-                    it.y - centerY,
-                    it.x - centerX
-                )
-            }
-
-        // 시계 방향으로 정렬된 뒤
-        // 가장 좌상단에 가까운 점을 첫 점으로 이동
-
-        val startIndex =
-            sorted.indices.minByOrNull { i ->
-                sorted[i].x +
-                    sorted[i].y
-            } ?: 0
-
-        return List(4) { index ->
-            sorted[
-                (startIndex + index) % 4
-            ]
-        }
+    private fun sortCorners(pts: List<Point>): List<Point> {
+        if (pts.size != 4) return pts
+        val centerX = pts.map { it.x }.average()
+        val centerY = pts.map { it.y }.average()
+        val sorted = pts.sortedBy { atan2(it.y - centerY, it.x - centerX) }
+        val startIndex = sorted.indices.minByOrNull { i -> sorted[i].x + sorted[i].y } ?: 0
+        return List(4) { index -> sorted[(startIndex + index) % 4] }
     }
 
-    // =========================================================
-    // 최소 점수
-    // =========================================================
-
     private const val MIN_CANDIDATE_SCORE = 35.0
-
     private const val MIN_FINAL_SCORE = 65.0
 }
