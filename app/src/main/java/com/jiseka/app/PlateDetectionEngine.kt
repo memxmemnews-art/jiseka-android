@@ -1,7 +1,7 @@
 package com.jiseka.app
 
 import android.graphics.Bitmap
-import android.graphics.Rect
+import android.graphics.Rect as AndroidRect // 1. 명확한 분리를 위한 Alias 적용
 import org.opencv.android.Utils
 import org.opencv.core.*
 import org.opencv.imgproc.Imgproc
@@ -26,7 +26,7 @@ object PlateDetectionEngine {
         val offsetX: Int,
         val offsetY: Int,
         val croppedBitmap: Bitmap,
-        val roiRect: Rect
+        val roiRect: AndroidRect
     )
 
     private data class PlateCandidate(
@@ -64,9 +64,8 @@ object PlateDetectionEngine {
     }
 
     // ---------------------------------------------------------
-    // 안전한 Rect
+    // 안전한 Rect (AndroidRect 반환)
     // ---------------------------------------------------------
-
     private fun getSafeRect(
         x: Int,
         y: Int,
@@ -74,22 +73,21 @@ object PlateDetectionEngine {
         h: Int,
         maxW: Int,
         maxH: Int
-    ): Rect {
+    ): AndroidRect {
         if (maxW <= 0 || maxH <= 0) {
-            return Rect(0, 0, 0, 0)
+            return AndroidRect(0, 0, 0, 0)
         }
         val safeX = x.coerceIn(0, maxW - 1)
         val safeY = y.coerceIn(0, maxH - 1)
         val safeW = w.coerceAtMost(maxW - safeX)
         val safeH = h.coerceAtMost(maxH - safeY)
 
-        return Rect(safeX, safeY, safeW, safeH)
+        return AndroidRect(safeX, safeY, safeW, safeH)
     }
 
     // ---------------------------------------------------------
     // 1. 터치 주변 AI용 Crop
     // ---------------------------------------------------------
-
     fun prepareWideCrop(
         fullBitmap: Bitmap,
         touchX: Float,
@@ -115,19 +113,27 @@ object PlateDetectionEngine {
         )
 
         val croppedBitmap = Bitmap.createBitmap(
-            fullBitmap, safeRect.x, safeRect.y, safeRect.width, safeRect.height
+            fullBitmap, 
+            safeRect.left, 
+            safeRect.top, 
+            safeRect.width(), 
+            safeRect.height()
         )
 
-        return SeedCropResult(safeRect.x, safeRect.y, croppedBitmap, safeRect)
+        return SeedCropResult(
+            safeRect.left, 
+            safeRect.top, 
+            croppedBitmap, 
+            safeRect
+        )
     }
 
     // ---------------------------------------------------------
     // 2. AI Box → OpenCV 정밀화
     // ---------------------------------------------------------
-
     suspend fun processWithMLKitResult(
         fullBitmap: Bitmap,
-        aiGlobalBox: Rect,
+        aiGlobalBox: AndroidRect, // AndroidRect 명시
         debugListener: DetectionDebugListener? = null
     ): List<ImmutablePoint>? {
 
@@ -151,26 +157,41 @@ object PlateDetectionEngine {
                 fullMat.rows()
             )
 
-            if (safeRoi.width <= 5 || safeRoi.height <= 5) {
+            if (safeRoi.width() <= 5 || safeRoi.height() <= 5) {
                 return null
             }
 
-            // [디버그 1] AI 영역 확보
+            // OpenCV API용 전용 Rect 생성
+            val cvSafeRoi = Rect(
+                safeRoi.left,
+                safeRoi.top,
+                safeRoi.width(),
+                safeRoi.height()
+            )
+
+            // [디버그 1] AI 영역 확보 (cvSafeRoi 사용)
             debugListener?.let {
                 val debugMat = fullMat.clone()
-                Imgproc.rectangle(debugMat, safeRoi, Scalar(0.0, 255.0, 0.0, 255.0), 5)
+                Imgproc.rectangle(debugMat, cvSafeRoi, Scalar(0.0, 255.0, 0.0, 255.0), 5)
                 emitDebug(it, debugMat, "1. AI Box 탐색 영역", "ROI 설정 완료", listOf(
-                    "X: ${safeRoi.x}, Y: ${safeRoi.y}",
-                    "Width: ${safeRoi.width}, Height: ${safeRoi.height}",
+                    "X: ${safeRoi.left}, Y: ${safeRoi.top}",
+                    "Width: ${safeRoi.width()}, Height: ${safeRoi.height()}",
                     "이 영역 안에서만 연산을 수행합니다."
                 ))
                 debugMat.release()
             }
 
             val roiGray = Mat()
-            fullGray.submat(safeRoi).copyTo(roiGray)
+            fullGray.submat(cvSafeRoi).copyTo(roiGray) // cvSafeRoi 사용
 
-            val localAiRect = Rect(0, 0, safeRoi.width, safeRoi.height)
+            // 지역 평가용 AndroidRect 생성
+            val localAiRect = AndroidRect(
+                0, 
+                0, 
+                safeRoi.width(), 
+                safeRoi.height()
+            )
+            
             val candidates = mutableListOf<PlateCandidate>()
 
             // -------------------------------------------------
@@ -178,7 +199,7 @@ object PlateDetectionEngine {
             // -------------------------------------------------
             val contourCandidates = extractContourCandidates(roiGray, debugListener)
             candidates.addAll(contourCandidates.mapNotNull { pts ->
-                val score = evaluateCandidate(pts, localAiRect, safeRoi.width, safeRoi.height)
+                val score = evaluateCandidate(pts, localAiRect, safeRoi.width(), safeRoi.height())
                 if (score.score >= MIN_CANDIDATE_SCORE) PlateCandidate(pts, score.score, score.log) else null
             })
 
@@ -187,7 +208,7 @@ object PlateDetectionEngine {
             // -------------------------------------------------
             val houghCandidates = extractHoughQuadCandidates(roiGray, debugListener)
             candidates.addAll(houghCandidates.mapNotNull { pts ->
-                val score = evaluateCandidate(pts, localAiRect, safeRoi.width, safeRoi.height)
+                val score = evaluateCandidate(pts, localAiRect, safeRoi.width(), safeRoi.height())
                 if (score.score >= MIN_CANDIDATE_SCORE) PlateCandidate(pts, score.score, score.log) else null
             })
 
@@ -234,7 +255,7 @@ object PlateDetectionEngine {
                 // [디버그 5-Fail] OpenCV 정밀화 실패
                 debugListener?.let {
                     val debugMat = fullMat.clone()
-                    Imgproc.rectangle(debugMat, safeRoi, Scalar(255.0, 0.0, 0.0, 255.0), 5) // Red Box
+                    Imgproc.rectangle(debugMat, cvSafeRoi, Scalar(255.0, 0.0, 0.0, 255.0), 5) // Red Box
                     emitDebug(it, debugMat, "5. OpenCV 정밀화 실패", "번호판 4점 확정 실패", listOf(
                         "AI Box는 정상적으로 검출됨",
                         "하지만 신뢰할 수 있는 4점 후보를 찾지 못함",
@@ -252,13 +273,13 @@ object PlateDetectionEngine {
             // =================================================
             val finalLocalPts = sortCorners(bestCandidate.pts)
             val globalPts = finalLocalPts.map {
-                ImmutablePoint((it.x + safeRoi.x).toFloat(), (it.y + safeRoi.y).toFloat())
+                ImmutablePoint((it.x + safeRoi.left).toFloat(), (it.y + safeRoi.top).toFloat())
             }
 
             // [디버그 5-Success] 최종 결과 확정
             debugListener?.let {
                 val debugMat = fullMat.clone()
-                Imgproc.rectangle(debugMat, safeRoi, Scalar(0.0, 255.0, 255.0, 255.0), 3) // Yellow Box
+                Imgproc.rectangle(debugMat, cvSafeRoi, Scalar(0.0, 255.0, 255.0, 255.0), 3) // Yellow Box
 
                 for (i in 0 until 4) {
                     val p1 = Point(globalPts[i].x.toDouble(), globalPts[i].y.toDouble())
@@ -543,12 +564,12 @@ object PlateDetectionEngine {
     }
 
     // =========================================================
-    // 후보 평가 (Android Rect 기반 로직으로 완벽 호환 조치됨)
+    // 후보 평가
     // =========================================================
 
     private fun evaluateCandidate(
         pts: List<Point>,
-        aiRect: Rect,
+        aiRect: AndroidRect,
         roiWidth: Int,
         roiHeight: Int
     ): ScoreResult {
@@ -608,7 +629,7 @@ object PlateDetectionEngine {
         val parallelScore = (horizontalScore + verticalScore) / 2.0
 
         // ---------------------------------------------
-        // 4. AI Box 내부 적합도 (Android Rect API 적용)
+        // 4. AI Box 내부 적합도
         // ---------------------------------------------
         val candidateArea = abs(polygonArea(p))
         val aiWidth = aiRect.width().toDouble()
@@ -627,7 +648,7 @@ object PlateDetectionEngine {
         }
 
         // ---------------------------------------------
-        // 5. 중심 위치 (Android Rect API 적용)
+        // 5. 중심 위치
         // ---------------------------------------------
         val centerX = p.map { it.x }.average()
         val centerY = p.map { it.y }.average()
@@ -644,7 +665,7 @@ object PlateDetectionEngine {
         )
 
         // ---------------------------------------------
-        // 6. AI Box 밖으로 나간 점 (Android Rect API 적용)
+        // 6. AI Box 밖으로 나간 점
         // ---------------------------------------------
         var overflow = 0.0
 
