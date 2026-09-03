@@ -48,9 +48,14 @@ import org.opencv.core.Point
 import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
-import org.tensorflow.lite.support.image.TensorImage
-import org.tensorflow.lite.task.vision.detector.Detection
-import org.tensorflow.lite.task.vision.detector.ObjectDetector
+
+// 💡 MediaPipe 패키지 import
+import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.tasks.components.containers.Detection
+import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.vision.core.RunningMode
+import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
+
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
@@ -107,7 +112,7 @@ class MainActivity : AppCompatActivity() {
         }?.start()
     }
 
-    // ⭐️ 커스텀 번호판 탐지 AI 모델
+    // ⭐️ 커스텀 번호판 탐지 AI 모델 (MediaPipe ObjectDetector)
     private var objectDetector: ObjectDetector? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -153,12 +158,19 @@ class MainActivity : AppCompatActivity() {
 
     private fun initCustomAIModel() {
         try {
+            // 💡 MediaPipe 규격에 맞춘 모델 초기화
+            val baseOptions = BaseOptions.builder()
+                .setModelAssetPath("plate_detector.tflite")
+                .build()
+
             val options = ObjectDetector.ObjectDetectorOptions.builder()
+                .setBaseOptions(baseOptions)
                 .setMaxResults(3)
                 .setScoreThreshold(0.5f)
+                .setRunningMode(RunningMode.IMAGE)
                 .build()
-            // 💡 새 모델 이름으로 변경 완료
-            objectDetector = ObjectDetector.createFromFileAndOptions(this, "plate_detector.tflite", options)
+                
+            objectDetector = ObjectDetector.createFromOptions(this, options)
         } catch (e: Exception) {
             Log.e("AI_DEBUG", "AI 모델 초기화 실패", e)
             Toast.makeText(this, "AI 모델을 불러오지 못했습니다.", Toast.LENGTH_SHORT).show()
@@ -285,11 +297,12 @@ class MainActivity : AppCompatActivity() {
         // 1. 터치 위치 주변을 크롭 (가로 25%, 세로 10%)
         val localCrop = PlateDetectionEngine.prepareWideCrop(safeBitmap, touchX, touchY)
         
-        // 2. 크롭된 이미지를 TensorImage로 변환
-        val tensorImage = TensorImage.fromBitmap(localCrop.croppedBitmap)
+        // 2. 크롭된 이미지를 MediaPipe MPImage로 변환
+        val mpImage = BitmapImageBuilder(localCrop.croppedBitmap).build()
         
         // 3. AI 모델 추론 실행 (작은 영역 안에서 번호판 탐색)
-        val results = objectDetector?.detect(tensorImage)
+        val results = objectDetector?.detect(mpImage)
+        val detections = results?.detections() ?: emptyList()
 
         // 크롭된 영역 기준의 터치 좌표 (크롭 영역의 정중앙)
         val localTouchX = localCrop.croppedBitmap.width / 2f
@@ -297,24 +310,24 @@ class MainActivity : AppCompatActivity() {
 
         var bestDetection: Detection? = null
 
-        if (!results.isNullOrEmpty()) {
+        if (detections.isNotEmpty()) {
             // [1순위 필터링] 터치점(크롭의 중앙)이 바운딩 박스 '내부'에 포함되는 것들 찾기
-            val containingDetections = results.filter { 
-                it.boundingBox.contains(localTouchX, localTouchY) 
+            val containingDetections = detections.filter { 
+                it.boundingBox().contains(localTouchX, localTouchY) 
             }
 
             if (containingDetections.isNotEmpty()) {
                 // 포함된 박스가 1개 이상이면, 그 중에서 가장 신뢰도가 높은 것을 선택
-                bestDetection = containingDetections.maxByOrNull { it.categories.firstOrNull()?.score ?: 0f }
+                bestDetection = containingDetections.maxByOrNull { it.categories().firstOrNull()?.score() ?: 0f }
             } else {
                 // [2순위 필터링] 포함된 박스가 하나도 없다면, 중심점이 터치점과 가장 '가까운' 박스 탐색
                 var minDistance = Float.MAX_VALUE
                 // 최대 허용 거리 제한 (크롭 영역 짧은 변의 30%를 넘어가면 엉뚱한 물체로 간주)
                 val maxAllowedDistance = Math.min(localCrop.croppedBitmap.width, localCrop.croppedBitmap.height) * 0.3f
                 
-                for (detection in results) {
-                    val cx = detection.boundingBox.centerX()
-                    val cy = detection.boundingBox.centerY()
+                for (detection in detections) {
+                    val cx = detection.boundingBox().centerX()
+                    val cy = detection.boundingBox().centerY()
                     val dist = Math.hypot((cx - localTouchX).toDouble(), (cy - localTouchY).toDouble()).toFloat()
                     
                     if (dist < minDistance && dist < maxAllowedDistance) {
@@ -326,7 +339,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         if (bestDetection != null) {
-            val localBox = bestDetection.boundingBox
+            val localBox = bestDetection.boundingBox()
 
             // 4. 로컬 이미지 기준 Bounding Box를 전체 원본 화면(Global) 좌표로 복원
             val globalLineBox = android.graphics.Rect(
