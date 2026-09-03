@@ -157,7 +157,8 @@ class MainActivity : AppCompatActivity() {
                 .setMaxResults(3)
                 .setScoreThreshold(0.5f)
                 .build()
-            objectDetector = ObjectDetector.createFromFileAndOptions(this, "mobilenet_plate.tflite", options)
+            // 💡 새 모델 이름으로 변경 완료
+            objectDetector = ObjectDetector.createFromFileAndOptions(this, "plate_detector.tflite", options)
         } catch (e: Exception) {
             Log.e("AI_DEBUG", "AI 모델 초기화 실패", e)
             Toast.makeText(this, "AI 모델을 불러오지 못했습니다.", Toast.LENGTH_SHORT).show()
