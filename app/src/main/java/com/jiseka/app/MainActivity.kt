@@ -216,7 +216,8 @@ class MainActivity : AppCompatActivity() {
                     debugBitmap = Bitmap.createBitmap(800, 450, Bitmap.Config.ARGB_8888)
                 }
 
-                val canvas = Canvas(debugBitmap)
+                // ⭐️ Null safety(!!)를 적용하여 컴파일 에러 해결
+                val canvas = Canvas(debugBitmap!!)
                 val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                     textSize = 28f
                     isFakeBoldText = true
@@ -237,7 +238,8 @@ class MainActivity : AppCompatActivity() {
                 val lineHeight = 38f
                 val overlayHeight = 35f + lineHeight * lines.size
 
-                canvas.drawRect(0f, 0f, debugBitmap.width.toFloat(), overlayHeight, backgroundPaint)
+                // ⭐️ Null safety(!!) 적용
+                canvas.drawRect(0f, 0f, debugBitmap!!.width.toFloat(), overlayHeight, backgroundPaint)
 
                 var y = 35f
                 for (line in lines) {
@@ -264,7 +266,8 @@ class MainActivity : AppCompatActivity() {
 
                 try {
                     contentResolver.openOutputStream(uri)?.use { outputStream ->
-                        val success = debugBitmap.compress(Bitmap.CompressFormat.JPEG, 92, outputStream)
+                        // ⭐️ Null safety(!!) 적용
+                        val success = debugBitmap!!.compress(Bitmap.CompressFormat.JPEG, 92, outputStream)
                         if (!success) {
                             throw IllegalStateException("Bitmap JPEG 압축 실패")
                         }
@@ -489,7 +492,6 @@ class MainActivity : AppCompatActivity() {
 
         nativeGuideView?.onTouchPointListener = touchDrop@{ uiPoint ->
             
-            // ⭐️ 01_TOUCH
             saveDebugStage(
                 "01_TOUCH",
                 listOf("UI X = ${uiPoint.x}", "UI Y = ${uiPoint.y}", "MatrixReady = $isMatrixReady")
@@ -526,7 +528,6 @@ class MainActivity : AppCompatActivity() {
         safeBitmap: Bitmap, touchX: Float, touchY: Float,
         currentSession: Int, debugInterceptor: PlateDetectionEngine.DetectionDebugListener
     ) {
-        // ⭐️ 02_PIPELINE_START
         saveDebugBitmap(
             "02_PIPELINE_START", safeBitmap,
             listOf("touchX = $touchX", "touchY = $touchY", "session = $currentSession")
@@ -538,12 +539,10 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // ⭐️ 03_BEFORE_CROP
         saveDebugStage("03_BEFORE_CROP", listOf("touchX = $touchX", "touchY = $touchY"))
 
         val localCrop = PlateDetectionEngine.prepareWideCrop(safeBitmap, touchX, touchY)
 
-        // ⭐️ 04_AFTER_CROP
         saveDebugBitmap("04_AFTER_CROP", localCrop.croppedBitmap, listOf(
             "cropWidth = ${localCrop.croppedBitmap.width}", "cropHeight = ${localCrop.croppedBitmap.height}",
             "offsetX = ${localCrop.offsetX}", "offsetY = ${localCrop.offsetY}"
@@ -556,7 +555,6 @@ class MainActivity : AppCompatActivity() {
                 throw IllegalStateException("AI 입력 Crop Bitmap이 이미 recycle되었습니다.")
             }
 
-            // ⭐️ 05_BEFORE_RESIZE
             saveDebugStage("05_BEFORE_RESIZE", listOf(
                 "source = ${localCrop.croppedBitmap.width}x${localCrop.croppedBitmap.height}",
                 "target = ${inputWidth}x${inputHeight}"
@@ -564,18 +562,14 @@ class MainActivity : AppCompatActivity() {
 
             resizedBitmap = Bitmap.createScaledBitmap(localCrop.croppedBitmap, inputWidth, inputHeight, true)
 
-            // ⭐️ 06_AFTER_RESIZE
             saveDebugBitmap("06_AFTER_RESIZE", resizedBitmap, listOf("width = ${resizedBitmap.width}", "height = ${resizedBitmap.height}"))
 
-            // ⭐️ 07_BEFORE_INPUT_BUFFER
             saveDebugStage("07_BEFORE_INPUT_BUFFER", listOf("Bitmap = ${resizedBitmap.width}x${resizedBitmap.height}", "type = FLOAT32"))
 
             val inputBuffer = convertBitmapToByteBuffer(resizedBitmap)
 
-            // ⭐️ 08_AFTER_INPUT_BUFFER
             saveDebugStage("08_AFTER_INPUT_BUFFER", listOf("capacity = ${inputBuffer.capacity()}", "position = ${inputBuffer.position()}", "limit = ${inputBuffer.limit()}"))
 
-            // ⭐️ 09_BEFORE_OUTPUT_BUFFER
             saveDebugStage("09_BEFORE_OUTPUT_BUFFER", listOf(
                 "boxesIndex = $outIdxBoxes", "scoresIndex = $outIdxScores", "classesIndex = $outIdxClasses", "numIndex = $outIdxNum", "maxDetections = $maxDetections"
             ))
@@ -595,7 +589,6 @@ class MainActivity : AppCompatActivity() {
             val outClassesBuf = ByteBuffer.allocateDirect(classesBytes).order(ByteOrder.nativeOrder())
             val outNumBuf = ByteBuffer.allocateDirect(numBytes).order(ByteOrder.nativeOrder())
 
-            // ⭐️ 10_AFTER_OUTPUT_BUFFER
             saveDebugStage("10_AFTER_OUTPUT_BUFFER", listOf("boxesBytes = $boxesBytes", "scoresBytes = $scoresBytes", "classesBytes = $classesBytes", "numBytes = $numBytes"))
 
             val outputs = HashMap<Int, Any>()
@@ -604,7 +597,6 @@ class MainActivity : AppCompatActivity() {
             outputs[outIdxClasses] = outClassesBuf
             outputs[outIdxNum] = outNumBuf
 
-            // ⭐️ 11_BEFORE_TFLITE_RUN
             saveDebugStage("11_BEFORE_TFLITE_RUN", listOf(
                 "inputBytes = ${inputBuffer.capacity()}", "boxesBytes = ${outBoxesBuf.capacity()}", 
                 "scoresBytes = ${outScoresBuf.capacity()}", "classesBytes = ${outClassesBuf.capacity()}", 
@@ -616,10 +608,8 @@ class MainActivity : AppCompatActivity() {
                 interpreter.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputs)
             }
 
-            // ⭐️ 12_AFTER_TFLITE_RUN
             saveDebugStage("12_AFTER_TFLITE_RUN", listOf("TFLite 실행 성공", "output buffers populated"))
 
-            // ⭐️ 13_BEFORE_OUTPUT_READ
             saveDebugStage("13_BEFORE_OUTPUT_READ")
 
             outBoxesBuf.rewind()
@@ -627,7 +617,6 @@ class MainActivity : AppCompatActivity() {
             outClassesBuf.rewind()
             outNumBuf.rewind()
 
-            // ⭐️ 14_AFTER_OUTPUT_REWIND
             saveDebugStage("14_AFTER_OUTPUT_REWIND")
 
             val boxesFloat = outBoxesBuf.asFloatBuffer()
@@ -638,7 +627,6 @@ class MainActivity : AppCompatActivity() {
             val reportedNum = if (numInt.remaining() > 0) numInt.get(0) else 0
             val detectionCount = reportedNum.coerceIn(0, maxDetections)
 
-            // ⭐️ 15_DETECTION_COUNT
             saveDebugStage("15_DETECTION_COUNT", listOf("reportedNum = $reportedNum", "detectionCount = $detectionCount"))
 
             val localTouchX = localCrop.croppedBitmap.width / 2f
@@ -703,7 +691,6 @@ class MainActivity : AppCompatActivity() {
             if (bestBoxRect != null) {
                 val box = bestBoxRect
 
-                // ⭐️ 16_AI_BOX
                 saveDebugBitmap("16_AI_BOX", localCrop.croppedBitmap, listOf(
                     "score = $bestScore", "left = ${box.left}", "top = ${box.top}", "right = ${box.right}", "bottom = ${box.bottom}"
                 ))
@@ -716,6 +703,9 @@ class MainActivity : AppCompatActivity() {
                 )
 
                 localCrop.croppedBitmap.recycle()
+                
+                saveDebugBitmap("17_BEFORE_GEOMETRY", safeBitmap, listOf("AI Box = $aiGlobalBox"))
+
                 buildFinalWireframe(safeBitmap, globalLineBox, currentSession, debugInterceptor)
                 return
 
@@ -760,12 +750,10 @@ class MainActivity : AppCompatActivity() {
                 return@launch
             }
 
-            // ⭐️ 17_BEFORE_GEOMETRY
-            saveDebugBitmap("17_BEFORE_GEOMETRY", safeBitmap, listOf("AI Box = $aiGlobalBox"))
+            val targetPolygon = PlateDetectionEngine.processWithMLKitResult(
+                safeBitmap, aiGlobalBox, debugInterceptor
+            )
 
-            val targetPolygon = PlateDetectionEngine.processWithMLKitResult(safeBitmap, aiGlobalBox, debugInterceptor)
-
-            // ⭐️ 18_AFTER_GEOMETRY
             saveDebugStage("18_AFTER_GEOMETRY", listOf("polygonFound = ${targetPolygon != null}", "polygonSize = ${targetPolygon?.size ?: 0}"))
 
             runOnUiThread {
@@ -790,7 +778,6 @@ class MainActivity : AppCompatActivity() {
             return 
         }
         
-        // ⭐️ 19_BEFORE_MASK
         saveDebugStage("19_BEFORE_MASK")
 
         val currentSessionId = captureSessionId.get()
@@ -823,7 +810,6 @@ class MainActivity : AppCompatActivity() {
                         Utils.matToBitmap(resultMat, resultBitmap)
                         resultMat.release()
                         
-                        // ⭐️ 20_MASK_COMPLETE
                         saveDebugBitmap("20_MASK_COMPLETE", resultBitmap, listOf("mask completed"))
 
                         runOnUiThread {
@@ -869,11 +855,132 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun applyMaskToMat(mat: Mat, corners: List<ImmutablePoint>, textureInput: Mat) {
+        if (corners.size != 4) return
+
+        var maskMat: Mat? = null
+        var contour: org.opencv.core.MatOfPoint? = null
+        var blurredMask: Mat? = null
+        var alphaMat: Mat? = null
+        var preparedTexture: Mat? = null
+        var warpedTexture: Mat? = null
+
+        var originalWasRgba = false
+        if (mat.channels() == 4) {
+            originalWasRgba = true
+            Imgproc.cvtColor(mat, mat, Imgproc.COLOR_RGBA2RGB)
+        }
+
+        try {
+            val pts = corners.map { Point(it.x.toDouble(), it.y.toDouble()) }
+
+            maskMat = Mat.zeros(mat.size(), CvType.CV_8UC1)
+            contour = org.opencv.core.MatOfPoint(*pts.toTypedArray())
+            Imgproc.fillPoly(maskMat, listOf(contour), Scalar(255.0))
+
+            blurredMask = Mat()
+            Imgproc.GaussianBlur(maskMat, blurredMask, Size(15.0, 15.0), 5.0)
+
+            alphaMat = Mat()
+            blurredMask.convertTo(alphaMat, CvType.CV_32F, 1.0 / 255.0)
+
+            preparedTexture = Mat()
+            if (textureInput.channels() != mat.channels()) {
+                if (mat.channels() == 3 && textureInput.channels() == 4) {
+                    Imgproc.cvtColor(textureInput, preparedTexture, Imgproc.COLOR_RGBA2RGB)
+                } else {
+                    textureInput.copyTo(preparedTexture)
+                }
+            } else {
+                textureInput.copyTo(preparedTexture)
+            }
+
+            warpedTexture = Mat.zeros(mat.size(), mat.type())
+            val srcPts = MatOfPoint2f(
+                Point(0.0, 0.0),
+                Point(preparedTexture.cols().toDouble(), 0.0),
+                Point(preparedTexture.cols().toDouble(), preparedTexture.rows().toDouble()),
+                Point(0.0, preparedTexture.rows().toDouble())
+            )
+            
+            val dstPts = MatOfPoint2f(*pts.toTypedArray())
+
+            val perspectiveMat = Imgproc.getPerspectiveTransform(srcPts, dstPts)
+            Imgproc.warpPerspective(preparedTexture, warpedTexture, perspectiveMat, mat.size(), Imgproc.INTER_LINEAR)
+
+            srcPts.release()
+            dstPts.release()
+            perspectiveMat.release()
+
+            val matChannels = ArrayList<Mat>()
+            val textureChannels = ArrayList<Mat>()
+            Core.split(mat, matChannels)
+            Core.split(warpedTexture, textureChannels)
+
+            for (i in 0 until 3) {
+                var mcF: Mat? = null; var ccF: Mat? = null; var blendedF: Mat? = null
+                var invAlpha: Mat? = null; var scalarMat: Mat? = null
+                try {
+                    mcF = Mat(); ccF = Mat()
+                    matChannels[i].convertTo(mcF, CvType.CV_32F)
+                    textureChannels[i].convertTo(ccF, CvType.CV_32F)
+
+                    blendedF = Mat()
+                    Core.multiply(ccF, alphaMat, ccF) 
+         
+                    invAlpha = Mat()
+                    scalarMat = Mat(alphaMat.size(), alphaMat.type(), Scalar(1.0))
+
+                    Core.subtract(scalarMat, alphaMat, invAlpha) 
+                    Core.multiply(mcF, invAlpha, mcF) 
+
+                    Core.add(ccF, mcF, blendedF) 
+                    blendedF.convertTo(matChannels[i], CvType.CV_8U)
+                } finally {
+                    mcF?.release(); ccF?.release(); blendedF?.release()
+                    invAlpha?.release(); scalarMat?.release()
+                }
+            }
+            Core.merge(matChannels, mat)
+            matChannels.forEach { it.release() }
+            textureChannels.forEach { it.release() }
+
+        } finally {
+            maskMat?.release()
+            contour?.release()
+            blurredMask?.release()
+            alphaMat?.release()
+            preparedTexture?.release()
+            warpedTexture?.release()
+
+            if (originalWasRgba) {
+                Imgproc.cvtColor(mat, mat, Imgproc.COLOR_RGB2RGBA)
+            }
+        }
+    }
+
+    // ⭐️ 누락되었던 saveBitmapToGallery 복구
+    private fun saveBitmapToGallery(bitmap: Bitmap) {
+        try {
+            val filename = "JiSeKa_${System.currentTimeMillis()}.jpg"
+            val values = ContentValues().apply { 
+                put(MediaStore.Images.Media.DISPLAY_NAME, filename)
+                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg") 
+            }
+     
+            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return
+            contentResolver.openOutputStream(uri)?.use { bitmap.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+            Toast.makeText(this, "💾 저장 완료", Toast.LENGTH_SHORT).show()
+            resetToLiveMode()
+        } catch (e: Exception) { 
+            Toast.makeText(this, "저장 실패", Toast.LENGTH_SHORT).show() 
+        }
+    }
+
     private fun createDebugInterceptor(): PlateDetectionEngine.DetectionDebugListener {
         return object : PlateDetectionEngine.DetectionDebugListener {
             override fun pauseAndShowStep(stageName: String, debugBitmap: Bitmap, title: String, logs: List<String>) {
                 
-                // ⭐️ ENGINE_... 단계 저장
                 saveDebugBitmap("ENGINE_${stageName.replace(" ", "_")}", debugBitmap, listOf("title = $title") + logs)
 
                 debugLatch = CountDownLatch(1)
@@ -1116,110 +1223,6 @@ class MainActivity : AppCompatActivity() {
         bgView.invalidate() 
     }
 
-    private fun applyMaskToMat(mat: Mat, corners: List<ImmutablePoint>, textureInput: Mat) {
-        if (corners.size != 4) return
-
-        var maskMat: Mat? = null
-        var contour: org.opencv.core.MatOfPoint? = null
-        var blurredMask: Mat? = null
-        var alphaMat: Mat? = null
-        var preparedTexture: Mat? = null
-        var warpedTexture: Mat? = null
-
-        var originalWasRgba = false
-        if (mat.channels() == 4) {
-            originalWasRgba = true
-            Imgproc.cvtColor(mat, mat, Imgproc.COLOR_RGBA2RGB)
-        }
-
-        try {
-            val pts = corners.map { Point(it.x.toDouble(), it.y.toDouble()) }
-
-            maskMat = Mat.zeros(mat.size(), CvType.CV_8UC1)
-            contour = org.opencv.core.MatOfPoint(*pts.toTypedArray())
-            Imgproc.fillPoly(maskMat, listOf(contour), Scalar(255.0))
-
-            blurredMask = Mat()
-            Imgproc.GaussianBlur(maskMat, blurredMask, Size(15.0, 15.0), 5.0)
-
-            alphaMat = Mat()
-            blurredMask.convertTo(alphaMat, CvType.CV_32F, 1.0 / 255.0)
-
-            preparedTexture = Mat()
-            if (textureInput.channels() != mat.channels()) {
-                if (mat.channels() == 3 && textureInput.channels() == 4) {
-                    Imgproc.cvtColor(textureInput, preparedTexture, Imgproc.COLOR_RGBA2RGB)
-                } else {
-                    textureInput.copyTo(preparedTexture)
-                }
-            } else {
-                textureInput.copyTo(preparedTexture)
-            }
-
-            warpedTexture = Mat.zeros(mat.size(), mat.type())
-            val srcPts = MatOfPoint2f(
-                Point(0.0, 0.0),
-                Point(preparedTexture.cols().toDouble(), 0.0),
-                Point(preparedTexture.cols().toDouble(), preparedTexture.rows().toDouble()),
-                Point(0.0, preparedTexture.rows().toDouble())
-            )
-            
-            val dstPts = MatOfPoint2f(*pts.toTypedArray())
-
-            val perspectiveMat = Imgproc.getPerspectiveTransform(srcPts, dstPts)
-            Imgproc.warpPerspective(preparedTexture, warpedTexture, perspectiveMat, mat.size(), Imgproc.INTER_LINEAR)
-
-            srcPts.release()
-            dstPts.release()
-            perspectiveMat.release()
-
-            val matChannels = ArrayList<Mat>()
-            val textureChannels = ArrayList<Mat>()
-            Core.split(mat, matChannels)
-            Core.split(warpedTexture, textureChannels)
-
-            for (i in 0 until 3) {
-                var mcF: Mat? = null; var ccF: Mat? = null; var blendedF: Mat? = null
-                var invAlpha: Mat? = null; var scalarMat: Mat? = null
-                try {
-                    mcF = Mat(); ccF = Mat()
-                    matChannels[i].convertTo(mcF, CvType.CV_32F)
-                    textureChannels[i].convertTo(ccF, CvType.CV_32F)
-
-                    blendedF = Mat()
-                    Core.multiply(ccF, alphaMat, ccF) 
-         
-                    invAlpha = Mat()
-                    scalarMat = Mat(alphaMat.size(), alphaMat.type(), Scalar(1.0))
-
-                    Core.subtract(scalarMat, alphaMat, invAlpha) 
-                    Core.multiply(mcF, invAlpha, mcF) 
-
-                    Core.add(ccF, mcF, blendedF) 
-                    blendedF.convertTo(matChannels[i], CvType.CV_8U)
-                } finally {
-                    mcF?.release(); ccF?.release(); blendedF?.release()
-                    invAlpha?.release(); scalarMat?.release()
-                }
-            }
-            Core.merge(matChannels, mat)
-            matChannels.forEach { it.release() }
-            textureChannels.forEach { it.release() }
-
-        } finally {
-            maskMat?.release()
-            contour?.release()
-            blurredMask?.release()
-            alphaMat?.release()
-            preparedTexture?.release()
-            warpedTexture?.release()
-
-            if (originalWasRgba) {
-                Imgproc.cvtColor(mat, mat, Imgproc.COLOR_RGB2RGBA)
-            }
-        }
-    }
-
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQUEST_CODE_PERMISSIONS && allPermissionsGranted()) viewFinder?.post { startCamera() }
@@ -1242,7 +1245,6 @@ class MainActivity : AppCompatActivity() {
         cachedTextureMat?.release()
         cachedTextureMat = null
 
-        // ⭐️ 리소스 완벽 해제
         synchronized(tfliteLock) {
             try {
                 tflite?.close()
