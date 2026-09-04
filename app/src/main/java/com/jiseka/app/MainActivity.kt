@@ -534,7 +534,8 @@ class MainActivity : AppCompatActivity() {
             // ⭐️ 5. 실행 전 정지 (UI 버튼 클릭 대기)
             // ------------------------------------------------------------
             saveCrashStage("5_BEFORE_TFLITE_RUN")
-            updateDebugStep("[6] TFLite 실행 준비 완료.\n버튼을 누르면 추론을 시작합니다.", requireClick = true)
+            updateDebugStep("[6] TFLite 실행 준비 완료.\n버튼을 누르면 추론을 시작합니다.", waitForClick = true)
+            
 
             // ------------------------------------------------------------
             // ⭐️ 6. TFLite 실행 (여기서 죽으면 이 단계가 저장됨)
