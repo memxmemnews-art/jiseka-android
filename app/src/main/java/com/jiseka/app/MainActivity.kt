@@ -50,6 +50,7 @@ import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 
+// 💡 TFLite & Debug용 추가 import
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 import java.io.FileInputStream
@@ -68,6 +69,15 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
 import kotlin.math.min
 
+import android.os.Build
+import android.os.Environment
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.RectF
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
 @OptIn(TransformExperimental::class)
 class MainActivity : AppCompatActivity() {
 
@@ -81,14 +91,13 @@ class MainActivity : AppCompatActivity() {
     private var progressBar: ProgressBar? = null
     private var guideText: TextView? = null
 
-    // ⭐️ AI 디버그 패널 UI 변수
+    // ⭐️ 화면 디버그 UI 변수
     private var debugLatch: CountDownLatch? = null
     private var btnDebugNext: Button? = null
     private var debugHudContainer: LinearLayout? = null
     private var debugHudTitle: TextView? = null
     private var debugHudLogs: TextView? = null
     private var debugImageView: ImageView? = null
-    private val debugLogBuilder = java.lang.StringBuilder()
 
     private var orientationEventListener: OrientationEventListener? = null
     private var currentLogicalRotation = 0f
@@ -119,9 +128,23 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ============================================================
+    // 갤러리 자동 디버그 기록
+    // ============================================================
+    private val debugSaveLock = Any()
+    private var debugSequence = 0
+    private var debugLastStage = "앱 시작"
+    private val debugDateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault())
+
+    // ============================================================
     // TFLite - plate_detector.tflite 실제 구조에 맞춘 설정
     // ============================================================
     private var tflite: Interpreter? = null
+    
+    private var modelAssetFileDescriptor: android.content.res.AssetFileDescriptor? = null
+    private var modelInputStream: FileInputStream? = null
+    private var modelFileChannel: FileChannel? = null
+    private var modelMappedBuffer: java.nio.MappedByteBuffer? = null
+
     private var inputWidth = 256
     private var inputHeight = 256
     private var inputType: DataType = DataType.FLOAT32
@@ -136,8 +159,6 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        
-        checkPreviousCrash() // ⭐️ 크래시 기록 확인
 
         if (!OpenCVLoader.initDebug()) {
             Toast.makeText(this, "엔진 초기화에 실패했습니다. 앱을 다시 실행해주세요.", Toast.LENGTH_LONG).show()
@@ -178,30 +199,100 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ============================================================
-    // ⭐️ SharedPreferences 크래시 추적 로직
+    // 디버그 파일 저장 함수 (동기식)
     // ============================================================
-    private fun checkPreviousCrash() {
-        val prefs = getSharedPreferences("JisekaCrashLog", MODE_PRIVATE)
-        val lastStage = prefs.getString("LAST_STAGE", "NONE")
-        
-        if (lastStage != "NONE" && lastStage != "7_SUCCESS") {
-            android.app.AlertDialog.Builder(this)
-                .setTitle("🚨 지난 실행 강제 종료 감지")
-                .setMessage("이전 실행에서 AI 연산 도중 앱이 종료되었습니다.\n\n마지막 기록 단계:\n$lastStage\n\n이 지점에서 TFLite Native Crash가 발생했을 확률이 99%입니다.")
-                .setPositiveButton("확인", null)
-                .show()
+    private fun saveDebugBitmap(stage: String, sourceBitmap: Bitmap?, extraLines: List<String> = emptyList()) {
+        synchronized(debugSaveLock) {
+            debugSequence++
+            val sequence = String.format(Locale.US, "%03d", debugSequence)
+            debugLastStage = stage
+            val now = debugDateFormat.format(Date())
+            var debugBitmap: Bitmap? = null
+
+            try {
+                if (sourceBitmap != null && !sourceBitmap.isRecycled) {
+                    debugBitmap = sourceBitmap.copy(Bitmap.Config.ARGB_8888, true)
+                } else {
+                    debugBitmap = Bitmap.createBitmap(800, 450, Bitmap.Config.ARGB_8888)
+                }
+
+                val canvas = Canvas(debugBitmap)
+                val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    textSize = 28f
+                    isFakeBoldText = true
+                    color = Color.YELLOW
+                    setShadowLayer(5f, 2f, 2f, Color.BLACK)
+                }
+                val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = Color.argb(190, 0, 0, 0)
+                }
+
+                val lines = ArrayList<String>()
+                lines.add("JiSeKa DEBUG")
+                lines.add("Stage: $stage")
+                lines.add("Time: $now")
+                lines.add("Sequence: $sequence")
+                lines.addAll(extraLines)
+
+                val lineHeight = 38f
+                val overlayHeight = 35f + lineHeight * lines.size
+
+                canvas.drawRect(0f, 0f, debugBitmap.width.toFloat(), overlayHeight, backgroundPaint)
+
+                var y = 35f
+                for (line in lines) {
+                    canvas.drawText(line, 20f, y, paint)
+                    y += lineHeight
+                }
+
+                val filename = "JiSeKa_Debug_${sequence}_${stage}.jpg"
+
+                val values = ContentValues().apply {
+                    put(MediaStore.Images.Media.DISPLAY_NAME, filename)
+                    put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/JiSeKa_Debug")
+                        put(MediaStore.Images.Media.IS_PENDING, 1)
+                    }
+                }
+
+                val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                if (uri == null) {
+                    Log.e("JI_DEBUG_FILE", "디버그 이미지 URI 생성 실패: $filename")
+                    return
+                }
+
+                try {
+                    contentResolver.openOutputStream(uri)?.use { outputStream ->
+                        val success = debugBitmap.compress(Bitmap.CompressFormat.JPEG, 92, outputStream)
+                        if (!success) {
+                            throw IllegalStateException("Bitmap JPEG 압축 실패")
+                        }
+                    }
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        val completedValues = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
+                        contentResolver.update(uri, completedValues, null, null)
+                    }
+                    Log.d("JI_DEBUG_FILE", "디버그 저장 완료: $filename")
+
+                } catch (e: Throwable) {
+                    try { contentResolver.delete(uri, null, null) } catch (_: Throwable) { }
+                    Log.e("JI_DEBUG_FILE", "디버그 이미지 저장 실패: $filename", e)
+                }
+
+            } catch (e: Throwable) {
+                Log.e("JI_DEBUG_FILE", "디버그 기록 전체 실패: $stage", e)
+            } finally {
+                if (debugBitmap != null && !debugBitmap.isRecycled) {
+                    debugBitmap.recycle()
+                }
+            }
         }
-        
-        // 확인 후 초기화
-        prefs.edit().putString("LAST_STAGE", "NONE").commit()
     }
 
-    private fun saveCrashStage(stage: String) {
-        // commit()을 사용해 동기식으로 확실히 기록한 뒤 다음 코드로 넘어감
-        getSharedPreferences("JisekaCrashLog", MODE_PRIVATE)
-            .edit()
-            .putString("LAST_STAGE", stage)
-            .commit()
+    private fun saveDebugStage(stage: String, lines: List<String> = emptyList()) {
+        saveDebugBitmap(stage = stage, sourceBitmap = null, extraLines = lines)
     }
 
     // ============================================================
@@ -209,29 +300,25 @@ class MainActivity : AppCompatActivity() {
     // ============================================================
     private fun initCustomAIModel() {
         try {
-            Log.d("AI_DEBUG", "========================================")
-            Log.d("AI_DEBUG", "TFLite 모델 초기화 시작")
-
-            val assetFileDescriptor = assets.openFd("plate_detector.tflite")
-            val mappedByteBuffer = FileInputStream(assetFileDescriptor.fileDescriptor).use { inputStream ->
-                val fileChannel = inputStream.channel
-                fileChannel.map(FileChannel.MapMode.READ_ONLY, assetFileDescriptor.startOffset, assetFileDescriptor.declaredLength)
-            }
-            assetFileDescriptor.close()
+            modelAssetFileDescriptor = assets.openFd("plate_detector.tflite")
+            modelInputStream = FileInputStream(modelAssetFileDescriptor!!.fileDescriptor)
+            modelFileChannel = modelInputStream!!.channel
+            modelMappedBuffer = modelFileChannel!!.map(
+                FileChannel.MapMode.READ_ONLY,
+                modelAssetFileDescriptor!!.startOffset,
+                modelAssetFileDescriptor!!.declaredLength
+            )
 
             val options = Interpreter.Options().apply {
-                // ⭐️ [크래시 디버그용] 스레드 1개로 제한
-                setNumThreads(1)
+                setNumThreads(1) // 디버깅 중에는 1 thread
             }
 
-            val interpreter = Interpreter(mappedByteBuffer, options)
+            val interpreter = Interpreter(modelMappedBuffer!!, options)
 
-            // 1. INPUT 검사
+            // INPUT 검사
             val inputTensor = interpreter.getInputTensor(0)
             val inputShape = inputTensor.shape()
             val actualInputType = inputTensor.dataType()
-
-            Log.d("AI_DEBUG", "INPUT shape=${inputShape.contentToString()}, type=$actualInputType")
 
             if (!inputShape.contentEquals(intArrayOf(1, 256, 256, 3))) {
                 interpreter.close()
@@ -246,20 +333,16 @@ class MainActivity : AppCompatActivity() {
             inputWidth = inputShape[2]
             inputType = actualInputType
 
-            // 2. OUTPUT 검사
+            // OUTPUT 검사
             outIdxBoxes = -1
             outIdxScores = -1
             outIdxClasses = -1
             outIdxNum = -1
 
-            Log.d("AI_DEBUG", "OUTPUT Tensor count=${interpreter.outputTensorCount}")
-
             for (i in 0 until interpreter.outputTensorCount) {
                 val tensor = interpreter.getOutputTensor(i)
                 val shape = tensor.shape()
                 val type = tensor.dataType()
-
-                Log.d("AI_DEBUG", "OUTPUT[$i] shape=${shape.contentToString()}, type=$type, name=${tensor.name()}")
 
                 if (shape.size == 3 && shape[0] == 1 && shape[2] == 4 && type == DataType.FLOAT32) {
                     outIdxBoxes = i
@@ -283,27 +366,18 @@ class MainActivity : AppCompatActivity() {
                 tflite = interpreter
             }
 
-            Log.d("AI_DEBUG", "========================================")
-            Log.d("AI_DEBUG", "TFLite 초기화 성공 (Single Thread)")
-            Log.d("AI_DEBUG", "boxes index = $outIdxBoxes, scores index = $outIdxScores")
-            Log.d("AI_DEBUG", "classes index = $outIdxClasses, num index = $outIdxNum")
-            Log.d("AI_DEBUG", "maxDetections = $maxDetections")
-            Log.d("AI_DEBUG", "========================================")
+            saveDebugStage(
+                "00_TFLITE_INITIALIZED",
+                listOf("Input = [1,256,256,3]", "InputType = FLOAT32", "Threads = 1", "Model = plate_detector.tflite")
+            )
 
         } catch (e: Throwable) {
-            synchronized(tfliteLock) {
-                tflite?.close()
-                tflite = null
-            }
+            saveDebugStage(
+                "00_TFLITE_INIT_FAILED",
+                listOf("Error = ${e.javaClass.name}", "Message = ${e.message}")
+            )
             Log.e("AI_DEBUG", "TFLite 초기화 실패", e)
-            runOnUiThread {
-                android.app.AlertDialog.Builder(this)
-                    .setTitle("AI 로드 에러")
-                    .setMessage("plate_detector.tflite 초기화에 실패했습니다.\n\n${e.message}")
-                    .setPositiveButton("확인", null)
-                    .setCancelable(false)
-                    .show()
-            }
+            tflite = null
         }
     }
 
@@ -336,9 +410,6 @@ class MainActivity : AppCompatActivity() {
         return byteBuffer
     }
 
-    // ============================================================
-    // ⭐️ 진화된 디버그 UI 생성
-    // ============================================================
     private fun setupDebugUI() {
         debugHudContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -365,11 +436,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val scrollView = ScrollView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 
-                0, 
-                1.0f
-            )
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.0f)
         }
 
         debugHudLogs = TextView(this).apply {
@@ -380,7 +447,7 @@ class MainActivity : AppCompatActivity() {
         scrollView.addView(debugHudLogs)
 
         btnDebugNext = Button(this).apply {
-            text = "▶ TFLite 실행"
+            text = "▶ 다음 단계"
             textSize = 18f
             setBackgroundColor(Color.parseColor("#FF3333"))
             setTextColor(Color.WHITE)
@@ -394,39 +461,8 @@ class MainActivity : AppCompatActivity() {
         debugHudContainer?.addView(scrollView)
         debugHudContainer?.addView(btnDebugNext)
 
-        val hudParams = FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT,
-            FrameLayout.LayoutParams.MATCH_PARENT
-        )
+        val hudParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
         addContentView(debugHudContainer, hudParams)
-    }
-
-    // 디버그 진행 헬퍼
-    private fun updateDebugStep(logText: String, image: Bitmap? = null, waitForClick: Boolean = false) {
-        debugLogBuilder.append("\n").append(logText)
-        val currentLog = debugLogBuilder.toString()
-        
-        if (waitForClick) {
-            debugLatch = CountDownLatch(1)
-        }
-
-        runOnUiThread {
-            debugHudContainer?.visibility = View.VISIBLE
-            debugHudLogs?.text = currentLog
-            image?.let { debugImageView?.setImageBitmap(it) }
-            
-            if (waitForClick) {
-                btnDebugNext?.text = "▶ TFLite 실행 (터치 대기중)"
-                btnDebugNext?.visibility = View.VISIBLE
-            } else {
-                btnDebugNext?.visibility = View.GONE
-            }
-        }
-
-        if (waitForClick) {
-            debugLatch?.await() // 클릭할 때까지 백그라운드 스레드 일시정지
-            runOnUiThread { btnDebugNext?.visibility = View.GONE }
-        }
     }
 
     private fun loadTextureSafely() {
@@ -452,6 +488,13 @@ class MainActivity : AppCompatActivity() {
         }
 
         nativeGuideView?.onTouchPointListener = touchDrop@{ uiPoint ->
+            
+            // ⭐️ 01_TOUCH
+            saveDebugStage(
+                "01_TOUCH",
+                listOf("UI X = ${uiPoint.x}", "UI Y = ${uiPoint.y}", "MatrixReady = $isMatrixReady")
+            )
+
             if (!isMatrixReady) return@touchDrop
 
             val currentSession = captureSessionId.get()
@@ -471,10 +514,6 @@ class MainActivity : AppCompatActivity() {
                     inverseMatrix.mapPoints(touchCoords)
                     val debugInterceptor = createDebugInterceptor()
 
-                    // 초기화
-                    debugLogBuilder.clear()
-                    debugLogBuilder.append("[1] 터치 감지됨: X=${touchCoords[0].toInt()}, Y=${touchCoords[1].toInt()}")
-
                     runAIPipeline(safeBitmap, touchCoords[0], touchCoords[1], currentSession, debugInterceptor)
                 } else {
                     runOnUiThread { progressBar?.visibility = View.GONE }
@@ -487,15 +526,28 @@ class MainActivity : AppCompatActivity() {
         safeBitmap: Bitmap, touchX: Float, touchY: Float,
         currentSession: Int, debugInterceptor: PlateDetectionEngine.DetectionDebugListener
     ) {
+        // ⭐️ 02_PIPELINE_START
+        saveDebugBitmap(
+            "02_PIPELINE_START", safeBitmap,
+            listOf("touchX = $touchX", "touchY = $touchY", "session = $currentSession")
+        )
+
         if (tflite == null) {
             fallbackToManualMode(currentSession, "AI 모델이 로드되지 않았습니다.")
             safeBitmap.recycle()
             return
         }
 
-        saveCrashStage("1_CROP_START")
+        // ⭐️ 03_BEFORE_CROP
+        saveDebugStage("03_BEFORE_CROP", listOf("touchX = $touchX", "touchY = $touchY"))
+
         val localCrop = PlateDetectionEngine.prepareWideCrop(safeBitmap, touchX, touchY)
-        updateDebugStep("[2] Crop 성공: ${localCrop.croppedBitmap.width} x ${localCrop.croppedBitmap.height}", localCrop.croppedBitmap)
+
+        // ⭐️ 04_AFTER_CROP
+        saveDebugBitmap("04_AFTER_CROP", localCrop.croppedBitmap, listOf(
+            "cropWidth = ${localCrop.croppedBitmap.width}", "cropHeight = ${localCrop.croppedBitmap.height}",
+            "offsetX = ${localCrop.offsetX}", "offsetY = ${localCrop.offsetY}"
+        ))
 
         var resizedBitmap: Bitmap? = null
 
@@ -504,60 +556,90 @@ class MainActivity : AppCompatActivity() {
                 throw IllegalStateException("AI 입력 Crop Bitmap이 이미 recycle되었습니다.")
             }
 
-            saveCrashStage("2_RESIZE")
+            // ⭐️ 05_BEFORE_RESIZE
+            saveDebugStage("05_BEFORE_RESIZE", listOf(
+                "source = ${localCrop.croppedBitmap.width}x${localCrop.croppedBitmap.height}",
+                "target = ${inputWidth}x${inputHeight}"
+            ))
+
             resizedBitmap = Bitmap.createScaledBitmap(localCrop.croppedBitmap, inputWidth, inputHeight, true)
-            updateDebugStep("[3] Resize 성공: 256x256", resizedBitmap)
 
-            saveCrashStage("3_INPUT_BUFFER")
+            // ⭐️ 06_AFTER_RESIZE
+            saveDebugBitmap("06_AFTER_RESIZE", resizedBitmap, listOf("width = ${resizedBitmap.width}", "height = ${resizedBitmap.height}"))
+
+            // ⭐️ 07_BEFORE_INPUT_BUFFER
+            saveDebugStage("07_BEFORE_INPUT_BUFFER", listOf("Bitmap = ${resizedBitmap.width}x${resizedBitmap.height}", "type = FLOAT32"))
+
             val inputBuffer = convertBitmapToByteBuffer(resizedBitmap)
-            updateDebugStep("[4] FLOAT32 입력 생성: ${inputBuffer.capacity()} bytes")
 
-            // ------------------------------------------------------------
-            // ⭐️ 4. 출력 배열 생성 (Direct ByteBuffer 대신 일반 배열 사용)
-            // ------------------------------------------------------------
-            saveCrashStage("4_OUTPUT_ARRAY_PREP")
-            
-            val outBoxes = Array(1) { Array(maxDetections) { FloatArray(4) } }
-            val outScores = Array(1) { FloatArray(maxDetections) }
-            val outClasses = Array(1) { IntArray(maxDetections) }
-            val outNum = IntArray(1)
+            // ⭐️ 08_AFTER_INPUT_BUFFER
+            saveDebugStage("08_AFTER_INPUT_BUFFER", listOf("capacity = ${inputBuffer.capacity()}", "position = ${inputBuffer.position()}", "limit = ${inputBuffer.limit()}"))
+
+            // ⭐️ 09_BEFORE_OUTPUT_BUFFER
+            saveDebugStage("09_BEFORE_OUTPUT_BUFFER", listOf(
+                "boxesIndex = $outIdxBoxes", "scoresIndex = $outIdxScores", "classesIndex = $outIdxClasses", "numIndex = $outIdxNum", "maxDetections = $maxDetections"
+            ))
+
+            val boxesTensor = tflite?.getOutputTensor(outIdxBoxes) ?: throw IllegalStateException("Boxes Tensor 획득 실패")
+            val scoresTensor = tflite?.getOutputTensor(outIdxScores) ?: throw IllegalStateException("Scores Tensor 획득 실패")
+            val classesTensor = tflite?.getOutputTensor(outIdxClasses) ?: throw IllegalStateException("Classes Tensor 획득 실패")
+            val numTensor = tflite?.getOutputTensor(outIdxNum) ?: throw IllegalStateException("Num Tensor 획득 실패")
+
+            val boxesBytes = boxesTensor.numElements() * 4
+            val scoresBytes = scoresTensor.numElements() * 4
+            val classesBytes = classesTensor.numElements() * 4
+            val numBytes = numTensor.numElements() * 4
+
+            val outBoxesBuf = ByteBuffer.allocateDirect(boxesBytes).order(ByteOrder.nativeOrder())
+            val outScoresBuf = ByteBuffer.allocateDirect(scoresBytes).order(ByteOrder.nativeOrder())
+            val outClassesBuf = ByteBuffer.allocateDirect(classesBytes).order(ByteOrder.nativeOrder())
+            val outNumBuf = ByteBuffer.allocateDirect(numBytes).order(ByteOrder.nativeOrder())
+
+            // ⭐️ 10_AFTER_OUTPUT_BUFFER
+            saveDebugStage("10_AFTER_OUTPUT_BUFFER", listOf("boxesBytes = $boxesBytes", "scoresBytes = $scoresBytes", "classesBytes = $classesBytes", "numBytes = $numBytes"))
 
             val outputs = HashMap<Int, Any>()
-            outputs[outIdxBoxes] = outBoxes
-            outputs[outIdxScores] = outScores
-            outputs[outIdxClasses] = outClasses
-            outputs[outIdxNum] = outNum
+            outputs[outIdxBoxes] = outBoxesBuf
+            outputs[outIdxScores] = outScoresBuf
+            outputs[outIdxClasses] = outClassesBuf
+            outputs[outIdxNum] = outNumBuf
 
-            updateDebugStep("[5] Output 배열 매핑 완료")
-
-            // ------------------------------------------------------------
-            // ⭐️ 5. 실행 전 정지 (UI 버튼 클릭 대기)
-            // ------------------------------------------------------------
-            saveCrashStage("5_BEFORE_TFLITE_RUN")
-            updateDebugStep("[6] TFLite 실행 준비 완료.\n버튼을 누르면 추론을 시작합니다.", waitForClick = true)
-            
-
-            // ------------------------------------------------------------
-            // ⭐️ 6. TFLite 실행 (여기서 죽으면 이 단계가 저장됨)
-            // ------------------------------------------------------------
-            saveCrashStage("6_TFLITE_RUNNING")
-            Log.e("AI_CRASH_TEST", "F: TFLite run 직전")
+            // ⭐️ 11_BEFORE_TFLITE_RUN
+            saveDebugStage("11_BEFORE_TFLITE_RUN", listOf(
+                "inputBytes = ${inputBuffer.capacity()}", "boxesBytes = ${outBoxesBuf.capacity()}", 
+                "scoresBytes = ${outScoresBuf.capacity()}", "classesBytes = ${outClassesBuf.capacity()}", 
+                "numBytes = ${outNumBuf.capacity()}", "thread = ${Thread.currentThread().name}"
+            ))
 
             synchronized(tfliteLock) {
                 val interpreter = tflite ?: throw IllegalStateException("TFLite Interpreter가 없습니다.")
                 interpreter.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputs)
             }
 
-            Log.e("AI_CRASH_TEST", "G: TFLite run 완료")
-            saveCrashStage("7_SUCCESS")
-            updateDebugStep("[7] TFLite 실행 성공!")
+            // ⭐️ 12_AFTER_TFLITE_RUN
+            saveDebugStage("12_AFTER_TFLITE_RUN", listOf("TFLite 실행 성공", "output buffers populated"))
 
-            // ------------------------------------------------------------
-            // 7. 결과 해석
-            // ------------------------------------------------------------
-            val reportedNum = outNum[0]
+            // ⭐️ 13_BEFORE_OUTPUT_READ
+            saveDebugStage("13_BEFORE_OUTPUT_READ")
+
+            outBoxesBuf.rewind()
+            outScoresBuf.rewind()
+            outClassesBuf.rewind()
+            outNumBuf.rewind()
+
+            // ⭐️ 14_AFTER_OUTPUT_REWIND
+            saveDebugStage("14_AFTER_OUTPUT_REWIND")
+
+            val boxesFloat = outBoxesBuf.asFloatBuffer()
+            val scoresFloat = outScoresBuf.asFloatBuffer()
+            val classesInt = outClassesBuf.asIntBuffer()
+            val numInt = outNumBuf.asIntBuffer()
+
+            val reportedNum = if (numInt.remaining() > 0) numInt.get(0) else 0
             val detectionCount = reportedNum.coerceIn(0, maxDetections)
-            Log.d("AI_DEBUG", "num_detections=$reportedNum (사용할 개수: $detectionCount)")
+
+            // ⭐️ 15_DETECTION_COUNT
+            saveDebugStage("15_DETECTION_COUNT", listOf("reportedNum = $reportedNum", "detectionCount = $detectionCount"))
 
             val localTouchX = localCrop.croppedBitmap.width / 2f
             val localTouchY = localCrop.croppedBitmap.height / 2f
@@ -568,14 +650,14 @@ class MainActivity : AppCompatActivity() {
             val maxAllowedDistance = min(localCrop.croppedBitmap.width, localCrop.croppedBitmap.height) * 0.3f
 
             for (i in 0 until detectionCount) {
-                val score = outScores[0][i]
+                val score = scoresFloat.get(i)
                 if (!score.isFinite() || score < 0.4f) continue
 
-                val classId = outClasses[0][i]
-                val ymin = outBoxes[0][i][0]
-                val xmin = outBoxes[0][i][1]
-                val ymax = outBoxes[0][i][2]
-                val xmax = outBoxes[0][i][3]
+                val classId = classesInt.get(i)
+                val ymin = boxesFloat.get(i * 4 + 0)
+                val xmin = boxesFloat.get(i * 4 + 1)
+                val ymax = boxesFloat.get(i * 4 + 2)
+                val xmax = boxesFloat.get(i * 4 + 3)
 
                 if (!ymin.isFinite() || !xmin.isFinite() || !ymax.isFinite() || !xmax.isFinite()) continue
 
@@ -621,6 +703,11 @@ class MainActivity : AppCompatActivity() {
             if (bestBoxRect != null) {
                 val box = bestBoxRect
 
+                // ⭐️ 16_AI_BOX
+                saveDebugBitmap("16_AI_BOX", localCrop.croppedBitmap, listOf(
+                    "score = $bestScore", "left = ${box.left}", "top = ${box.top}", "right = ${box.right}", "bottom = ${box.bottom}"
+                ))
+
                 val globalLineBox = android.graphics.Rect(
                     localCrop.offsetX + box.left.toInt(),
                     localCrop.offsetY + box.top.toInt(),
@@ -628,21 +715,15 @@ class MainActivity : AppCompatActivity() {
                     localCrop.offsetY + box.bottom.toInt()
                 )
 
-                updateDebugStep("[8] 최적의 번호판 박스 도출: $globalLineBox\nOpenCV 정밀화로 이동합니다.")
                 localCrop.croppedBitmap.recycle()
-
-                // OpenCV 마스킹 단계로 이동 (디버그 UI 유지하려면 약간의 딜레이 후 넘겨도 됨)
-                runOnUiThread { debugHudContainer?.visibility = View.GONE }
                 buildFinalWireframe(safeBitmap, globalLineBox, currentSession, debugInterceptor)
                 return
 
             } else {
                 val debugBmp = localCrop.croppedBitmap.copy(Bitmap.Config.ARGB_8888, true)
-                updateDebugStep("[8] ❌ 실패: 터치 영역 내에서 번호판 박스를 찾지 못했습니다.")
                 
                 debugInterceptor.pauseAndShowStep(
-                    "디버그 1단계: [FAIL] AI 모델 탐색 실패",
-                    debugBmp,
+                    "디버그 1단계: [FAIL] AI 모델 탐색 실패", debugBmp,
                     "[FAIL] 터치 영역 내 번호판 없음",
                     listOf("검출 개수: $detectionCount", "번호판 중앙을 다시 터치해주세요.")
                 )
@@ -664,15 +745,6 @@ class MainActivity : AppCompatActivity() {
             }
             safeBitmap.recycle()
 
-            runOnUiThread {
-                android.app.AlertDialog.Builder(this)
-                    .setTitle("AI 파이프라인 에러")
-                    .setMessage(e.message)
-                    .setPositiveButton("확인", null)
-                    .show()
-                debugHudContainer?.visibility = View.GONE
-            }
-
             fallbackToManualMode(currentSession, "AI 처리 중 오류가 발생했습니다.")
             return
         }
@@ -688,9 +760,13 @@ class MainActivity : AppCompatActivity() {
                 return@launch
             }
 
-            val targetPolygon = PlateDetectionEngine.processWithMLKitResult(
-                safeBitmap, aiGlobalBox, debugInterceptor
-            )
+            // ⭐️ 17_BEFORE_GEOMETRY
+            saveDebugBitmap("17_BEFORE_GEOMETRY", safeBitmap, listOf("AI Box = $aiGlobalBox"))
+
+            val targetPolygon = PlateDetectionEngine.processWithMLKitResult(safeBitmap, aiGlobalBox, debugInterceptor)
+
+            // ⭐️ 18_AFTER_GEOMETRY
+            saveDebugStage("18_AFTER_GEOMETRY", listOf("polygonFound = ${targetPolygon != null}", "polygonSize = ${targetPolygon?.size ?: 0}"))
 
             runOnUiThread {
                 if (isFinishing || isDestroyed || captureSessionId.get() != currentSession) {
@@ -704,6 +780,131 @@ class MainActivity : AppCompatActivity() {
                     fallbackToManualMode(currentSession, "번호판 기하학 조립에 실패했습니다.")
                 }
                 safeBitmap.recycle() 
+            }
+        }
+    }
+
+    private fun triggerInstantMasking(targetCandidate: List<ImmutablePoint>) {
+        if (Looper.myLooper() != Looper.getMainLooper()) { 
+            runOnUiThread { triggerInstantMasking(targetCandidate) }
+            return 
+        }
+        
+        // ⭐️ 19_BEFORE_MASK
+        saveDebugStage("19_BEFORE_MASK")
+
+        val currentSessionId = captureSessionId.get()
+        progressBar?.visibility = View.VISIBLE
+        nativeGuideView?.visibility = View.GONE
+        guideText?.visibility = View.GONE 
+       
+        try {
+            maskExecutor.execute {
+                if (captureSessionId.get() != currentSessionId) {
+                    runOnUiThread { 
+                        progressBar?.visibility = View.GONE
+                        nativeGuideView?.visibility = View.VISIBLE 
+                    }
+                    return@execute
+                }
+                
+                val safeTargetBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) }
+                
+                if (safeTargetBitmap != null) {
+                    try {
+                        val resultMat = Mat()
+                        Utils.bitmapToMat(safeTargetBitmap, resultMat)
+
+                        cachedTextureMat?.let { texture ->
+                            applyMaskToMat(resultMat, targetCandidate, texture)
+                        }
+
+                        val resultBitmap = Bitmap.createBitmap(resultMat.cols(), resultMat.rows(), Bitmap.Config.ARGB_8888)
+                        Utils.matToBitmap(resultMat, resultBitmap)
+                        resultMat.release()
+                        
+                        // ⭐️ 20_MASK_COMPLETE
+                        saveDebugBitmap("20_MASK_COMPLETE", resultBitmap, listOf("mask completed"))
+
+                        runOnUiThread {
+                            if (isFinishing || isDestroyed || captureSessionId.get() != currentSessionId) { 
+                                resultBitmap.recycle()
+                                return@runOnUiThread 
+                            }
+ 
+                            val oldBitmap = displayedBitmap
+                            nativeBackgroundView?.setImageBitmap(resultBitmap)
+                            displayedBitmap = resultBitmap
+            
+                            oldBitmap?.let { bmp -> 
+                                uiHandler.postDelayed({ 
+                                    if (!bmp.isRecycled) bmp.recycle() 
+                                }, 500)
+                            }
+                            
+                            progressBar?.visibility = View.GONE
+                            resultActionLayout?.visibility = View.VISIBLE
+                        }
+                    } catch (e: Exception) {
+                        Log.e("CAMERA_DEBUG", "Masking failed", e)
+                        runOnUiThread { 
+                            progressBar?.visibility = View.GONE
+                            nativeGuideView?.visibility = View.VISIBLE 
+                        }
+                    } finally { 
+                        safeTargetBitmap.recycle() 
+                    }
+                } else {
+                    runOnUiThread { 
+                        progressBar?.visibility = View.GONE
+                        nativeGuideView?.visibility = View.VISIBLE 
+                        Toast.makeText(this@MainActivity, "이미지 데이터를 불러올 수 없습니다.", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("CAMERA_DEBUG", "Failed to execute masking task", e)
+            progressBar?.visibility = View.GONE
+            nativeGuideView?.visibility = View.VISIBLE
+        }
+    }
+
+    private fun createDebugInterceptor(): PlateDetectionEngine.DetectionDebugListener {
+        return object : PlateDetectionEngine.DetectionDebugListener {
+            override fun pauseAndShowStep(stageName: String, debugBitmap: Bitmap, title: String, logs: List<String>) {
+                
+                // ⭐️ ENGINE_... 단계 저장
+                saveDebugBitmap("ENGINE_${stageName.replace(" ", "_")}", debugBitmap, listOf("title = $title") + logs)
+
+                debugLatch = CountDownLatch(1)
+                
+                runOnUiThread {
+                    if (isFinishing || isDestroyed) return@runOnUiThread
+                    
+                    nativeBackgroundView?.setImageBitmap(debugBitmap)
+                    debugHudTitle?.text = title
+                    
+                    val logText = StringBuilder()
+                    for (log in logs) {
+                        logText.append(log).append("\n")
+                    }
+                    debugHudLogs?.text = logText.toString()
+                    debugHudContainer?.visibility = View.VISIBLE
+                    btnDebugNext?.visibility = View.VISIBLE 
+                    progressBar?.visibility = View.GONE 
+                }
+                
+                try {
+                    debugLatch?.await() 
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+                
+                runOnUiThread { 
+                    btnDebugNext?.visibility = View.GONE 
+                    progressBar?.visibility = View.VISIBLE 
+                    debugHudContainer?.visibility = View.GONE
+                }
             }
         }
     }
@@ -877,39 +1078,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun createDebugInterceptor(): PlateDetectionEngine.DetectionDebugListener {
-        return object : PlateDetectionEngine.DetectionDebugListener {
-            override fun pauseAndShowStep(stageName: String, debugBitmap: Bitmap, title: String, logs: List<String>) {
-                debugLatch = CountDownLatch(1)
-                
-                runOnUiThread {
-                    if (isFinishing || isDestroyed) return@runOnUiThread
-                    
-                    nativeBackgroundView?.setImageBitmap(debugBitmap)
-                    
-                    debugHudTitle?.text = title
-                    val logText = StringBuilder()
-                    for (log in logs) {
-                        logText.append(log).append("\n")
-                    }
-                    debugHudLogs?.text = logText.toString()
-                    debugHudContainer?.visibility = View.VISIBLE
-                    
-                    btnDebugNext?.visibility = View.VISIBLE 
-                    progressBar?.visibility = View.GONE 
-                }
-                
-                debugLatch?.await() 
-                
-                runOnUiThread { 
-                    btnDebugNext?.visibility = View.GONE 
-                    progressBar?.visibility = View.VISIBLE 
-                    debugHudContainer?.visibility = View.GONE
-                }
-            }
-        }
-    }
-
     private fun setupMatrixAndPrecalculate(sessionId: Int) {
         val bgView = nativeBackgroundView ?: return
         val safeBitmap = synchronized(bitmapLock) { lastCapturedBitmap } ?: return
@@ -946,85 +1114,6 @@ class MainActivity : AppCompatActivity() {
             }
         })
         bgView.invalidate() 
-    }
-
-    private fun triggerInstantMasking(targetCandidate: List<ImmutablePoint>) {
-        if (Looper.myLooper() != Looper.getMainLooper()) { 
-            runOnUiThread { triggerInstantMasking(targetCandidate) }
-            return 
-        }
-        
-        val currentSessionId = captureSessionId.get()
-        progressBar?.visibility = View.VISIBLE
-        nativeGuideView?.visibility = View.GONE
-        guideText?.visibility = View.GONE 
-       
-        try {
-            maskExecutor.execute {
-                if (captureSessionId.get() != currentSessionId) {
-                    runOnUiThread { 
-                        progressBar?.visibility = View.GONE
-                        nativeGuideView?.visibility = View.VISIBLE 
-                    }
-                    return@execute
-                }
-                
-                val safeTargetBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) }
-                
-                if (safeTargetBitmap != null) {
-                    try {
-                        val resultMat = Mat()
-                        Utils.bitmapToMat(safeTargetBitmap, resultMat)
-
-                        cachedTextureMat?.let { texture ->
-                            applyMaskToMat(resultMat, targetCandidate, texture)
-                        }
-
-                        val resultBitmap = Bitmap.createBitmap(resultMat.cols(), resultMat.rows(), Bitmap.Config.ARGB_8888)
-                        Utils.matToBitmap(resultMat, resultBitmap)
-                        resultMat.release()
-                        
-                        runOnUiThread {
-                            if (isFinishing || isDestroyed || captureSessionId.get() != currentSessionId) { 
-                                resultBitmap.recycle()
-                                return@runOnUiThread 
-                            }
- 
-                            val oldBitmap = displayedBitmap
-                            nativeBackgroundView?.setImageBitmap(resultBitmap)
-                            displayedBitmap = resultBitmap
-            
-                            oldBitmap?.let { bmp -> 
-                                uiHandler.postDelayed({ 
-                                    if (!bmp.isRecycled) bmp.recycle() 
-                                }, 500)
-                            }
-                            
-                            progressBar?.visibility = View.GONE
-                            resultActionLayout?.visibility = View.VISIBLE
-                        }
-                    } catch (e: Exception) {
-                        Log.e("CAMERA_DEBUG", "Masking failed", e)
-                        runOnUiThread { 
-                            progressBar?.visibility = View.GONE
-                            nativeGuideView?.visibility = View.VISIBLE 
-                        }
-                    } finally { 
-                        safeTargetBitmap.recycle() 
-                    }
-                } else {
-                    runOnUiThread { 
-                        progressBar?.visibility = View.GONE
-                        nativeGuideView?.visibility = View.VISIBLE 
-                        Toast.makeText(this@MainActivity, "이미지 데이터를 불러올 수 없습니다.", Toast.LENGTH_SHORT).show()
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Log.e("CAMERA_DEBUG", "Failed to execute masking task", e)
-            progressBar?.visibility = View.GONE
-            nativeGuideView?.visibility = View.VISIBLE
-        }
     }
 
     private fun applyMaskToMat(mat: Mat, corners: List<ImmutablePoint>, textureInput: Mat) {
@@ -1131,23 +1220,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun saveBitmapToGallery(bitmap: Bitmap) {
-        try {
-            val filename = "JiSeKa_${System.currentTimeMillis()}.jpg"
-            val values = ContentValues().apply { 
-                put(MediaStore.Images.Media.DISPLAY_NAME, filename)
-                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg") 
-            }
-     
-            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return
-            contentResolver.openOutputStream(uri)?.use { bitmap.compress(Bitmap.CompressFormat.JPEG, 95, it) }
-            Toast.makeText(this, "💾 저장 완료", Toast.LENGTH_SHORT).show()
-            resetToLiveMode()
-        } catch (e: Exception) { 
-            Toast.makeText(this, "저장 실패", Toast.LENGTH_SHORT).show() 
-        }
-    }
-
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQUEST_CODE_PERMISSIONS && allPermissionsGranted()) viewFinder?.post { startCamera() }
@@ -1170,14 +1242,24 @@ class MainActivity : AppCompatActivity() {
         cachedTextureMat?.release()
         cachedTextureMat = null
 
+        // ⭐️ 리소스 완벽 해제
         synchronized(tfliteLock) {
             try {
                 tflite?.close()
-            } catch (e: Exception) {
-                Log.e("AI_DEBUG", "TFLite 종료 중 오류", e)
+            } catch (e: Throwable) {
+                Log.e("AI_DEBUG", "TFLite close 오류", e)
             }
             tflite = null
         }
+
+        try { modelFileChannel?.close() } catch (_: Throwable) { }
+        try { modelInputStream?.close() } catch (_: Throwable) { }
+        try { modelAssetFileDescriptor?.close() } catch (_: Throwable) { }
+
+        modelFileChannel = null
+        modelInputStream = null
+        modelAssetFileDescriptor = null
+        modelMappedBuffer = null
 
         cameraExecutor.shutdownNow()
         precomputeExecutor.shutdownNow()
