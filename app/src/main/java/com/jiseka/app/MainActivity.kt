@@ -719,8 +719,9 @@ class MainActivity : AppCompatActivity() {
                 )
 
                 localCrop.croppedBitmap.recycle()
+
                 
-                saveDebugBitmap("17_BEFORE_GEOMETRY", safeBitmap, listOf("AI Box = $aiGlobalBox"))
+                saveDebugBitmap("17_BEFORE_GEOMETRY", safeBitmap, listOf("AI Box = $globalLineBox"))
 
                 buildFinalWireframe(safeBitmap, globalLineBox, currentSession, debugInterceptor)
                 return
