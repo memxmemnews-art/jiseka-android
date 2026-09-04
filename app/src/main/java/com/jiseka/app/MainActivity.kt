@@ -385,10 +385,10 @@ class MainActivity : AppCompatActivity() {
                 val g = (pixel shr 8) and 0xFF
                 val b = pixel and 0xFF
 
-                // 정규화 (현재 -1.0 ~ 1.0 적용됨)
-                byteBuffer.putFloat((r - 127.5f) / 127.5f)
-                byteBuffer.putFloat((g - 127.5f) / 127.5f)
-                byteBuffer.putFloat((b - 127.5f) / 127.5f)
+                // ⭐️ [수정완료] Score 향상: 원상 복구된 표준 정규화 (0.0 ~ 1.0)
+                byteBuffer.putFloat(r / 255.0f)
+                byteBuffer.putFloat(g / 255.0f)
+                byteBuffer.putFloat(b / 255.0f)
             }
         }
 
@@ -613,7 +613,7 @@ class MainActivity : AppCompatActivity() {
             saveDebugStage("15_DETECTION_COUNT", listOf("reportedNum = $reportedNum", "detectionCount = $detectionCount"))
 
             // -----------------------------------------------------------------
-            // ⭐️ 15_5_RAW_DETECTIONS: AI가 반환한 날것의 데이터(Raw Data) 낱낱이 파헤치기
+            // ⭐️ 15_5_RAW_DETECTIONS: AI가 반환한 날것의 데이터
             // -----------------------------------------------------------------
             val localTouchX = localCrop.croppedBitmap.width / 2f
             val localTouchY = localCrop.croppedBitmap.height / 2f
@@ -622,7 +622,7 @@ class MainActivity : AppCompatActivity() {
             rawLogList.add("TouchX: $localTouchX, TouchY: $localTouchY")
             rawLogList.add("CropSize: ${localCrop.croppedBitmap.width}x${localCrop.croppedBitmap.height}")
 
-            val printLimit = min(detectionCount, 5) // UI 넘침 방지를 위해 최대 5개만 로깅
+            val printLimit = min(detectionCount, 5) 
             for (i in 0 until printLimit) {
                 val score = scoresFloat.get(i)
                 val classId = classesInt.get(i)
@@ -631,11 +631,12 @@ class MainActivity : AppCompatActivity() {
                 val ymax = boxesFloat.get(i * 4 + 2)
                 val xmax = boxesFloat.get(i * 4 + 3)
 
+                // ⭐️ [수정완료] 절대 좌표 맵핑 오류 방지 (inputWidth/Height로 나누어 비율을 구함)
                 val rect = android.graphics.RectF(
-                    xmin * localCrop.croppedBitmap.width,
-                    ymin * localCrop.croppedBitmap.height,
-                    xmax * localCrop.croppedBitmap.width,
-                    ymax * localCrop.croppedBitmap.height
+                    (xmin / inputWidth.toFloat()) * localCrop.croppedBitmap.width,
+                    (ymin / inputHeight.toFloat()) * localCrop.croppedBitmap.height,
+                    (xmax / inputWidth.toFloat()) * localCrop.croppedBitmap.width,
+                    (ymax / inputHeight.toFloat()) * localCrop.croppedBitmap.height
                 )
                 
                 val contains = rect.contains(localTouchX, localTouchY)
@@ -665,11 +666,12 @@ class MainActivity : AppCompatActivity() {
 
                 if (!ymin.isFinite() || !xmin.isFinite() || !ymax.isFinite() || !xmax.isFinite()) continue
 
+                // ⭐️ [수정완료] 절대 좌표 맵핑 오류 방지
                 val rect = android.graphics.RectF(
-                    xmin * localCrop.croppedBitmap.width,
-                    ymin * localCrop.croppedBitmap.height,
-                    xmax * localCrop.croppedBitmap.width,
-                    ymax * localCrop.croppedBitmap.height
+                    (xmin / inputWidth.toFloat()) * localCrop.croppedBitmap.width,
+                    (ymin / inputHeight.toFloat()) * localCrop.croppedBitmap.height,
+                    (xmax / inputWidth.toFloat()) * localCrop.croppedBitmap.width,
+                    (ymax / inputHeight.toFloat()) * localCrop.croppedBitmap.height
                 )
 
                 if (rect.width() <= 0f || rect.height() <= 0f) continue
@@ -719,7 +721,6 @@ class MainActivity : AppCompatActivity() {
                 )
 
                 localCrop.croppedBitmap.recycle()
-
                 
                 saveDebugBitmap("17_BEFORE_GEOMETRY", safeBitmap, listOf("AI Box = $globalLineBox"))
 
@@ -729,7 +730,6 @@ class MainActivity : AppCompatActivity() {
             } else {
                 val debugBmp = localCrop.croppedBitmap.copy(Bitmap.Config.ARGB_8888, true)
                 
-                // ⭐️ [수정] 실패 시 팝업에도 Raw 데이터를 함께 띄워서 즉시 볼 수 있게 만듦
                 val failLogs = mutableListOf("검출 개수: $detectionCount")
                 failLogs.addAll(rawLogList)
                 failLogs.add("번호판 중앙을 다시 터치해주세요.")
