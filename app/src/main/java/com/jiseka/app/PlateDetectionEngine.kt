@@ -1,7 +1,7 @@
 package com.jiseka.app
 
 import android.graphics.Bitmap
-import android.graphics.Rect as AndroidRect // 1. 명확한 분리를 위한 Alias 적용
+import android.graphics.Rect as AndroidRect
 import org.opencv.android.Utils
 import org.opencv.core.*
 import org.opencv.imgproc.Imgproc
@@ -64,7 +64,7 @@ object PlateDetectionEngine {
     }
 
     // ---------------------------------------------------------
-    // ⭐️ 안전한 Rect (AndroidRect 반환) - 회원님 제안 로직 완벽 적용
+    // ⭐️ 안전한 Rect (AndroidRect 반환) - 마이너스 너비 방지
     // ---------------------------------------------------------
     private fun getSafeRect(
         x: Int,
@@ -74,24 +74,19 @@ object PlateDetectionEngine {
         maxW: Int,
         maxH: Int
     ): AndroidRect {
-        // 원본 자체가 비정상(0 이하)인 경우 방어
         if (maxW <= 0 || maxH <= 0) {
             return AndroidRect(0, 0, 1, 1)
         }
 
-        // 1. 시작점은 실제 이미지 내부로 제한
         val left = x.coerceIn(0, maxW - 1)
         val top = y.coerceIn(0, maxH - 1)
 
-        // 2. 남아 있는 실제 공간
         val availableW = maxW - left
         val availableH = maxH - top
 
-        // 3. width / height는 반드시 1 이상, 남은 공간 이하 보장
         val safeW = w.coerceIn(1, availableW)
         val safeH = h.coerceIn(1, availableH)
 
-        // 4. 정상적인 right, bottom 도출
         val right = left + safeW
         val bottom = top + safeH
 
@@ -99,7 +94,7 @@ object PlateDetectionEngine {
     }
 
     // ---------------------------------------------------------
-    // 1. 터치 주변 AI용 Crop
+    // ⭐️ 1. 터치 주변 AI용 Crop (정사각형 강제 변환 완료)
     // ---------------------------------------------------------
     fun prepareWideCrop(
         fullBitmap: Bitmap,
@@ -116,6 +111,11 @@ object PlateDetectionEngine {
         cropW = max(cropW, minPhysicalWidth).coerceAtMost(fullBitmap.width)
         cropH = max(cropH, minPhysicalHeight).coerceAtMost(fullBitmap.height)
 
+        // ⭐️ [적용 완료] 비율 왜곡을 막기 위해 넉넉한 정사각형 크기로 통일
+        val squareSize = max(cropW, cropH)
+        cropW = squareSize
+        cropH = squareSize
+
         val safeRect = getSafeRect(
             (touchX - cropW / 2).toInt(),
             (touchY - cropH / 2).toInt(),
@@ -125,7 +125,6 @@ object PlateDetectionEngine {
             fullBitmap.height
         )
 
-        // 안전한 Rect가 보장되므로 createBitmap에서 예외가 발생하지 않음
         val croppedBitmap = Bitmap.createBitmap(
             fullBitmap, 
             safeRect.left, 
