@@ -64,7 +64,10 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+
+// ⭐️ min, max 명확한 import
 import kotlin.math.max
+import kotlin.math.min
 
 @OptIn(TransformExperimental::class)
 class MainActivity : AppCompatActivity() {
@@ -113,16 +116,28 @@ class MainActivity : AppCompatActivity() {
         }?.start()
     }
 
-    // ⭐️ 순수 TFLite Interpreter 변수 및 동적 텐서 매핑 인덱스
+    // ============================================================
+    // TFLite - plate_detector.tflite 실제 구조에 맞춘 설정
+    // ============================================================
+
     private var tflite: Interpreter? = null
     private var inputWidth = 256
     private var inputHeight = 256
-    private var isQuantized = false
-    
+
+    // 이 모델의 입력은 반드시 FLOAT32
+    private var inputType: DataType = DataType.FLOAT32
+
+    // 최종 Detection Tensor index
     private var outIdxBoxes = -1
     private var outIdxScores = -1
     private var outIdxClasses = -1
     private var outIdxNum = -1
+
+    // 실제 Tensor shape에서 읽은 Detection 개수
+    private var maxDetections = 100
+
+    // Interpreter 실행/종료 동시 접근 방지
+    private val tfliteLock = Any()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -167,68 +182,156 @@ class MainActivity : AppCompatActivity() {
 
     private fun initCustomAIModel() {
         try {
-            Log.d("AI_DEBUG", "--- RetinaNet 커스텀 Interpreter 어댑터 로드 ---")
+            Log.d("AI_DEBUG", "========================================")
+            Log.d("AI_DEBUG", "TFLite 모델 초기화 시작")
+            Log.d("AI_DEBUG", "========================================")
 
             val assetFileDescriptor = assets.openFd("plate_detector.tflite")
-            val fileInputStream = FileInputStream(assetFileDescriptor.fileDescriptor)
-            val fileChannel = fileInputStream.channel
-            val mappedByteBuffer = fileChannel.map(
-                FileChannel.MapMode.READ_ONLY,
-                assetFileDescriptor.startOffset,
-                assetFileDescriptor.declaredLength
+
+            val mappedByteBuffer = FileInputStream(
+                assetFileDescriptor.fileDescriptor
+            ).use { inputStream ->
+                val fileChannel = inputStream.channel
+                fileChannel.map(
+                    FileChannel.MapMode.READ_ONLY,
+                    assetFileDescriptor.startOffset,
+                    assetFileDescriptor.declaredLength
+                )
+            }
+
+            assetFileDescriptor.close()
+
+            val options = Interpreter.Options().apply {
+                // 우선 안정성을 위해 4개 스레드
+                setNumThreads(4)
+            }
+
+            val interpreter = Interpreter(mappedByteBuffer, options)
+
+            // --------------------------------------------------------
+            // INPUT 검사
+            // --------------------------------------------------------
+
+            val inputTensor = interpreter.getInputTensor(0)
+            val inputShape = inputTensor.shape()
+            val actualInputType = inputTensor.dataType()
+
+            Log.d(
+                "AI_DEBUG",
+                "INPUT shape=${inputShape.contentToString()}, type=$actualInputType"
             )
 
-            val options = Interpreter.Options().apply { setNumThreads(4) }
-            tflite = Interpreter(mappedByteBuffer, options)
+            // 실제 모델 구조 검증
+            if (!inputShape.contentEquals(intArrayOf(1, 256, 256, 3))) {
+                interpreter.close()
+                throw IllegalStateException(
+                    "예상하지 못한 입력 shape: ${inputShape.contentToString()}"
+                )
+            }
 
-            // 1. 입력 텐서 분석
-            val inputTensor = tflite!!.getInputTensor(0)
-            val shape = inputTensor.shape()
-            inputHeight = shape[1] // 256
-            inputWidth = shape[2] // 256
-            isQuantized = (inputTensor.dataType() == DataType.UINT8)
-            Log.d("AI_DEBUG", "Input: ${inputWidth}x${inputHeight}, Type: ${inputTensor.dataType()}")
+            if (actualInputType != DataType.FLOAT32) {
+                interpreter.close()
+                throw IllegalStateException(
+                    "예상하지 못한 입력 타입: $actualInputType (FLOAT32 필요)"
+                )
+            }
 
-            // 2. 14개 출력 텐서 중 '최종 4개' 동적 스캔 및 매핑
-            for (i in 0 until tflite!!.outputTensorCount) {
-                val outTensor = tflite!!.getOutputTensor(i)
-                val outShape = outTensor.shape()
-                val outType = outTensor.dataType()
-                
-                // Boxes: [1, 100, 4] FLOAT32
-                if (outShape.contentEquals(intArrayOf(1, 100, 4)) && outType == DataType.FLOAT32) {
+            inputHeight = inputShape[1]
+            inputWidth = inputShape[2]
+            inputType = actualInputType
+
+            // --------------------------------------------------------
+            // OUTPUT 검사
+            // --------------------------------------------------------
+
+            outIdxBoxes = -1
+            outIdxScores = -1
+            outIdxClasses = -1
+            outIdxNum = -1
+
+            Log.d("AI_DEBUG", "OUTPUT Tensor count=${interpreter.outputTensorCount}")
+
+            for (i in 0 until interpreter.outputTensorCount) {
+                val tensor = interpreter.getOutputTensor(i)
+                val shape = tensor.shape()
+                val type = tensor.dataType()
+
+                Log.d(
+                    "AI_DEBUG",
+                    "OUTPUT[$i] shape=${shape.contentToString()}, type=$type, name=${tensor.name()}"
+                )
+
+                // detection_boxes
+                if (shape.size == 3 && shape[0] == 1 && shape[2] == 4 && type == DataType.FLOAT32) {
                     outIdxBoxes = i
-                } 
-                // Scores: [1, 100] FLOAT32
-                else if (outShape.contentEquals(intArrayOf(1, 100)) && outType == DataType.FLOAT32) {
+                    maxDetections = shape[1]
+                }
+                // detection_scores
+                else if (shape.contentEquals(intArrayOf(1, maxDetections)) && type == DataType.FLOAT32) {
                     outIdxScores = i
                 }
-                // Classes: [1, 100] INT32 (일부 모델은 Float32일 수도 있으나 명시된 조건 우선)
-                else if (outShape.contentEquals(intArrayOf(1, 100)) && (outType == DataType.INT32 || outType == DataType.FLOAT32)) {
-                    // 동일한 [1, 100] 배열이 두 개일 수 있으므로 Scores가 아니면 Classes로 할당
-                    if (outIdxScores != i) outIdxClasses = i
+                // detection_classes
+                else if (shape.contentEquals(intArrayOf(1, maxDetections)) && type == DataType.INT32) {
+                    outIdxClasses = i
                 }
-                // Num: [1] INT32 또는 FLOAT32
-                else if (outShape.contentEquals(intArrayOf(1))) {
+                // num_detections
+                else if (shape.contentEquals(intArrayOf(1)) && type == DataType.INT32) {
                     outIdxNum = i
                 }
             }
 
-            Log.d("AI_DEBUG", "텐서 매핑 결과 - Boxes:$outIdxBoxes, Scores:$outIdxScores, Classes:$outIdxClasses, Num:$outIdxNum")
+            // --------------------------------------------------------
+            // 최종 구조 검증
+            // --------------------------------------------------------
 
-            if (outIdxBoxes == -1 || outIdxScores == -1) {
-                throw Exception("모델 구조 분석 실패: 최종 Detection 텐서(Box, Score)를 찾을 수 없습니다.")
+            if (outIdxBoxes == -1) {
+                interpreter.close()
+                throw IllegalStateException("detection_boxes Tensor를 찾지 못했습니다.")
+            }
+            if (outIdxScores == -1) {
+                interpreter.close()
+                throw IllegalStateException("detection_scores Tensor를 찾지 못했습니다.")
+            }
+            if (outIdxClasses == -1) {
+                interpreter.close()
+                throw IllegalStateException("detection_classes Tensor를 찾지 못했습니다.")
+            }
+            if (outIdxNum == -1) {
+                interpreter.close()
+                throw IllegalStateException("num_detections Tensor를 찾지 못했습니다.")
             }
 
-            Log.d("AI_DEBUG", "--- 어댑터 로드 성공 ---")
-            
+            // --------------------------------------------------------
+            // 최종 Interpreter 등록
+            // --------------------------------------------------------
+
+            synchronized(tfliteLock) {
+                tflite?.close()
+                tflite = interpreter
+            }
+
+            Log.d("AI_DEBUG", "========================================")
+            Log.d("AI_DEBUG", "TFLite 초기화 성공")
+            Log.d("AI_DEBUG", "input = [$inputHeight,$inputWidth,3] FLOAT32")
+            Log.d("AI_DEBUG", "boxes index = $outIdxBoxes")
+            Log.d("AI_DEBUG", "scores index = $outIdxScores")
+            Log.d("AI_DEBUG", "classes index = $outIdxClasses")
+            Log.d("AI_DEBUG", "num index = $outIdxNum")
+            Log.d("AI_DEBUG", "maxDetections = $maxDetections")
+            Log.d("AI_DEBUG", "========================================")
+
         } catch (e: Throwable) {
-            tflite = null
-            Log.e("AI_DEBUG", "Interpreter 초기화 실패", e)
+            synchronized(tfliteLock) {
+                tflite?.close()
+                tflite = null
+            }
+
+            Log.e("AI_DEBUG", "TFLite 초기화 실패", e)
+
             runOnUiThread {
                 android.app.AlertDialog.Builder(this)
                     .setTitle("AI 로드 에러")
-                    .setMessage(e.message)
+                    .setMessage("plate_detector.tflite 초기화에 실패했습니다.\n\n${e.message}")
                     .setPositiveButton("확인", null)
                     .setCancelable(false)
                     .show()
@@ -236,33 +339,51 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 💡 Float32 입력을 위한 변환
     private fun convertBitmapToByteBuffer(bitmap: Bitmap): ByteBuffer {
-        val bytesPerChannel = if (isQuantized) 1 else 4
-        val byteBuffer = ByteBuffer.allocateDirect(1 * inputWidth * inputHeight * 3 * bytesPerChannel)
-        byteBuffer.order(ByteOrder.nativeOrder())
-        
-        val intValues = IntArray(inputWidth * inputHeight)
-        bitmap.getPixels(intValues, 0, inputWidth, 0, 0, inputWidth, inputHeight)
-        
-        var pixel = 0
-        for (i in 0 until inputHeight) {
-            for (j in 0 until inputWidth) {
-                val valInt = intValues[pixel++]
-                val r = (valInt shr 16) and 0xFF
-                val g = (valInt shr 8) and 0xFF
-                val b = valInt and 0xFF
+        // 실제 모델 입력: [1, 256, 256, 3] FLOAT32
+        if (bitmap.width != inputWidth || bitmap.height != inputHeight) {
+            throw IllegalArgumentException(
+                "입력 Bitmap 크기 오류: ${bitmap.width}x${bitmap.height}, 필요: ${inputWidth}x${inputHeight}"
+            )
+        }
 
-                if (isQuantized) {
-                    byteBuffer.put(r.toByte()); byteBuffer.put(g.toByte()); byteBuffer.put(b.toByte())
-                } else {
-                    // RetinaNet 기본 정규화 (0.0 ~ 1.0)
-                    byteBuffer.putFloat(r / 255.0f)
-                    byteBuffer.putFloat(g / 255.0f)
-                    byteBuffer.putFloat(b / 255.0f)
-                }
+        val bufferSize = inputWidth * inputHeight * 3 * 4   // FLOAT32 = 4 bytes
+
+        val byteBuffer = ByteBuffer
+            .allocateDirect(bufferSize)
+            .order(ByteOrder.nativeOrder())
+
+        val intValues = IntArray(inputWidth * inputHeight)
+
+        bitmap.getPixels(
+            intValues,
+            0,
+            inputWidth,
+            0,
+            0,
+            inputWidth,
+            inputHeight
+        )
+
+        var pixelIndex = 0
+        for (y in 0 until inputHeight) {
+            for (x in 0 until inputWidth) {
+                val pixel = intValues[pixelIndex++]
+
+                val r = (pixel shr 16) and 0xFF
+                val g = (pixel shr 8) and 0xFF
+                val b = pixel and 0xFF
+
+                // plate_detector.tflite는 FLOAT32 입력
+                // 0~255 → 0.0~1.0
+                byteBuffer.putFloat(r / 255.0f)
+                byteBuffer.putFloat(g / 255.0f)
+                byteBuffer.putFloat(b / 255.0f)
             }
         }
+
+        // 반드시 처음으로 되돌린다.
+        byteBuffer.rewind()
         return byteBuffer
     }
 
@@ -376,105 +497,252 @@ class MainActivity : AppCompatActivity() {
         safeBitmap: Bitmap, touchX: Float, touchY: Float,
         currentSession: Int, debugInterceptor: PlateDetectionEngine.DetectionDebugListener
     ) {
-        if (tflite == null) {
-            fallbackToManualMode(currentSession, "AI 모델이 로드되지 않았습니다.")
-            safeBitmap.recycle()
-            return
-        }
-
         val localCrop = PlateDetectionEngine.prepareWideCrop(safeBitmap, touchX, touchY)
-        val resizedBitmap = Bitmap.createScaledBitmap(localCrop.croppedBitmap, inputWidth, inputHeight, true)
-        val inputBuffer = convertBitmapToByteBuffer(resizedBitmap)
-        
-        // 💡 14개 출력 중 매핑된 '4개 텐서 배열'을 담을 빈 그릇 준비
-        val outBoxes = Array(1) { Array(100) { FloatArray(4) } }
-        val outScores = Array(1) { FloatArray(100) }
-        
-        // Classes와 Num은 DataType에 따라 Int 또는 Float 배열이 필요할 수 있으나,
-        // 현재 추론(Score > 0.4 판별)에는 Box와 Score만 사용하므로 해당 배열만 매핑하여 안전하게 뽑아냅니다.
-        val outputs = mutableMapOf<Int, Any>()
-        outputs[outIdxBoxes] = outBoxes
-        outputs[outIdxScores] = outScores
-        // (필요 시 classes, num 배열도 추가 가능하지만, Box와 Score로 필터링은 충분합니다)
-        
-        Log.d("AI_DEBUG", "AI 추론(runForMultipleInputsOutputs) 시작")
+        var resizedBitmap: Bitmap? = null
 
         try {
-            tflite?.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputs)
-        } catch (e: Throwable) {
-            Log.e("AI_DEBUG", "AI 연산 실패", e)
-            runOnUiThread { Toast.makeText(this@MainActivity, "AI 연산 오류 발생:\n${e.message}", Toast.LENGTH_LONG).show() }
-            localCrop.croppedBitmap.recycle()
-            safeBitmap.recycle()
-            fallbackToManualMode(currentSession, "AI 추론 중 오류가 발생했습니다.")
-            return
-        }
+            // ------------------------------------------------------------
+            // 1. Crop 크기 확인
+            // ------------------------------------------------------------
+            if (localCrop.croppedBitmap.isRecycled) {
+                throw IllegalStateException("AI 입력 Crop Bitmap이 이미 recycle되었습니다.")
+            }
 
-        val boxes = outBoxes[0]
-        val scores = outScores[0]
+            // ------------------------------------------------------------
+            // 2. 256 x 256으로 변환
+            // ------------------------------------------------------------
+            resizedBitmap = Bitmap.createScaledBitmap(
+                localCrop.croppedBitmap,
+                inputWidth,
+                inputHeight,
+                true
+            )
 
-        val localTouchX = localCrop.croppedBitmap.width / 2f
-        val localTouchY = localCrop.croppedBitmap.height / 2f
+            // ------------------------------------------------------------
+            // 3. FLOAT32 입력 Buffer 생성
+            // ------------------------------------------------------------
+            val inputBuffer = convertBitmapToByteBuffer(resizedBitmap)
 
-        var bestBoxRect: android.graphics.RectF? = null
-        var maxScore = -1f
-        var minDistance = Float.MAX_VALUE
-        val maxAllowedDistance = Math.min(localCrop.croppedBitmap.width, localCrop.croppedBitmap.height) * 0.3f
-        
-        // 100개의 후보 중 터치 위치 기반 최적의 박스 스캔
-        for (i in 0 until 100) {
-            val score = scores[i]
-            if (score < 0.4f) continue // 정확도 낮은 후보 즉시 필터링
-            
-            // 모델의 출력 형태 [ymin, xmin, ymax, xmax] (정규화된 0.0 ~ 1.0 비율)
-            val ymin = boxes[i][0] * localCrop.croppedBitmap.height
-            val xmin = boxes[i][1] * localCrop.croppedBitmap.width
-            val ymax = boxes[i][2] * localCrop.croppedBitmap.height
-            val xmax = boxes[i][3] * localCrop.croppedBitmap.width
-            
-            val rect = android.graphics.RectF(xmin, ymin, xmax, ymax)
+            // ------------------------------------------------------------
+            // 4. 실제 Tensor 크기에서 출력 버퍼 생성
+            // ------------------------------------------------------------
+            val boxesTensor = tflite?.getOutputTensor(outIdxBoxes)
+                ?: throw IllegalStateException("Boxes Tensor를 가져올 수 없습니다.")
+            val scoresTensor = tflite?.getOutputTensor(outIdxScores)
+                ?: throw IllegalStateException("Scores Tensor를 가져올 수 없습니다.")
+            val classesTensor = tflite?.getOutputTensor(outIdxClasses)
+                ?: throw IllegalStateException("Classes Tensor를 가져올 수 없습니다.")
+            val numTensor = tflite?.getOutputTensor(outIdxNum)
+                ?: throw IllegalStateException("Num Tensor를 가져올 수 없습니다.")
 
-            if (rect.contains(localTouchX, localTouchY)) {
-                if (score > maxScore) {
-                    maxScore = score
-                    bestBoxRect = rect
-                }
-            } else if (bestBoxRect == null) {
-                val cx = rect.centerX()
-                val cy = rect.centerY()
-                val dist = Math.hypot((cx - localTouchX).toDouble(), (cy - localTouchY).toDouble()).toFloat()
-                if (dist < minDistance && dist < maxAllowedDistance) {
-                    minDistance = dist
-                    bestBoxRect = rect
+            // 실제 Tensor byte 수 사용
+            val boxesBytes = boxesTensor.numElements() * 4
+            val scoresBytes = scoresTensor.numElements() * 4
+            val classesBytes = classesTensor.numElements() * 4
+            val numBytes = numTensor.numElements() * 4
+
+            val outBoxesBuf = ByteBuffer
+                .allocateDirect(boxesBytes)
+                .order(ByteOrder.nativeOrder())
+            val outScoresBuf = ByteBuffer
+                .allocateDirect(scoresBytes)
+                .order(ByteOrder.nativeOrder())
+            val outClassesBuf = ByteBuffer
+                .allocateDirect(classesBytes)
+                .order(ByteOrder.nativeOrder())
+            val outNumBuf = ByteBuffer
+                .allocateDirect(numBytes)
+                .order(ByteOrder.nativeOrder())
+
+            // ------------------------------------------------------------
+            // 5. 모든 최종 Detection 출력 연결
+            // ------------------------------------------------------------
+            val outputs = HashMap<Int, Any>()
+            outputs[outIdxBoxes] = outBoxesBuf
+            outputs[outIdxScores] = outScoresBuf
+            outputs[outIdxClasses] = outClassesBuf
+            outputs[outIdxNum] = outNumBuf
+
+            Log.d("AI_DEBUG", "----------------------------------------")
+            Log.d("AI_DEBUG", "AI 추론 시작")
+            Log.d("AI_DEBUG", "input capacity=${inputBuffer.capacity()}")
+            Log.d("AI_DEBUG", "boxes capacity=${outBoxesBuf.capacity()}")
+            Log.d("AI_DEBUG", "scores capacity=${outScoresBuf.capacity()}")
+            Log.d("AI_DEBUG", "classes capacity=${outClassesBuf.capacity()}")
+            Log.d("AI_DEBUG", "num capacity=${outNumBuf.capacity()}")
+
+            // ------------------------------------------------------------
+            // 6. TFLite 실행 (동시 실행 방지 lock)
+            // ------------------------------------------------------------
+            synchronized(tfliteLock) {
+                val interpreter = tflite
+                    ?: throw IllegalStateException("TFLite Interpreter가 없습니다.")
+
+                interpreter.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputs)
+            }
+
+            Log.d("AI_DEBUG", "AI 추론 완료")
+
+            // ------------------------------------------------------------
+            // 7. 출력 Buffer rewind
+            // ------------------------------------------------------------
+            outBoxesBuf.rewind()
+            outScoresBuf.rewind()
+            outClassesBuf.rewind()
+            outNumBuf.rewind()
+
+            val boxesFloat = outBoxesBuf.asFloatBuffer()
+            val scoresFloat = outScoresBuf.asFloatBuffer()
+            val classesInt = outClassesBuf.asIntBuffer()
+            val numInt = outNumBuf.asIntBuffer()
+
+            // ------------------------------------------------------------
+            // 8. 실제 검출 개수 읽기
+            // ------------------------------------------------------------
+            val reportedNum = if (numInt.remaining() > 0) numInt.get(0) else 0
+            val detectionCount = reportedNum.coerceIn(0, maxDetections)
+
+            Log.d("AI_DEBUG", "num_detections=$reportedNum")
+            Log.d("AI_DEBUG", "사용할 detection 수=$detectionCount")
+
+            // ------------------------------------------------------------
+            // 9. 터치 위치
+            // ------------------------------------------------------------
+            val localTouchX = localCrop.croppedBitmap.width / 2f
+            val localTouchY = localCrop.croppedBitmap.height / 2f
+
+            var bestBoxRect: android.graphics.RectF? = null
+            var bestScore = -1f
+            var minDistance = Float.MAX_VALUE
+            val maxAllowedDistance = min(localCrop.croppedBitmap.width, localCrop.croppedBitmap.height) * 0.3f
+
+            // ------------------------------------------------------------
+            // 10. 실제 Detection만 검사
+            // ------------------------------------------------------------
+            for (i in 0 until detectionCount) {
+                val score = scoresFloat.get(i)
+
+                if (!score.isFinite() || score < 0.4f) continue
+
+                val classId = classesInt.get(i)
+                Log.d("AI_DEBUG", "Detection[$i] score=$score class=$classId")
+
+                val ymin = boxesFloat.get(i * 4 + 0)
+                val xmin = boxesFloat.get(i * 4 + 1)
+                val ymax = boxesFloat.get(i * 4 + 2)
+                val xmax = boxesFloat.get(i * 4 + 3)
+
+                // --------------------------------------------------------
+                // 비정상 Box 방어
+                // --------------------------------------------------------
+                if (!ymin.isFinite() || !xmin.isFinite() || !ymax.isFinite() || !xmax.isFinite()) continue
+
+                val rect = android.graphics.RectF(
+                    xmin * localCrop.croppedBitmap.width,
+                    ymin * localCrop.croppedBitmap.height,
+                    xmax * localCrop.croppedBitmap.width,
+                    ymax * localCrop.croppedBitmap.height
+                )
+
+                if (rect.width() <= 0f || rect.height() <= 0f) continue
+
+                // 이미지 영역 밖으로 과도하게 나간 Box 방어
+                rect.left = rect.left.coerceIn(0f, localCrop.croppedBitmap.width.toFloat())
+                rect.right = rect.right.coerceIn(0f, localCrop.croppedBitmap.width.toFloat())
+                rect.top = rect.top.coerceIn(0f, localCrop.croppedBitmap.height.toFloat())
+                rect.bottom = rect.bottom.coerceIn(0f, localCrop.croppedBitmap.height.toFloat())
+
+                if (rect.width() <= 0f || rect.height() <= 0f) continue
+
+                // --------------------------------------------------------
+                // 11. 터치가 Box 안에 있는 경우
+                // --------------------------------------------------------
+                if (rect.contains(localTouchX, localTouchY)) {
+                    if (score > bestScore) {
+                        bestScore = score
+                        bestBoxRect = rect
+                        Log.d("AI_DEBUG", "→ 터치 포함 후보 선택 index=$i score=$score")
+                    }
+                } else if (bestBoxRect == null) {
+                    // 터치가 Box 밖이면 가까운 후보를 보조적으로 선택
+                    val cx = rect.centerX()
+                    val cy = rect.centerY()
+                    val dist = Math.hypot((cx - localTouchX).toDouble(), (cy - localTouchY).toDouble()).toFloat()
+
+                    if (dist < minDistance && dist < maxAllowedDistance) {
+                        minDistance = dist
+                        bestBoxRect = rect
+                        bestScore = score
+                        Log.d("AI_DEBUG", "→ 근접 후보 선택 index=$i score=$score distance=$dist")
+                    }
                 }
             }
-        }
 
-        if (bestBoxRect != null) {
-            Log.d("AI_DEBUG", "최적 번호판 박스 발견 - Score: $maxScore, Box: $bestBoxRect")
-            
-            val globalLineBox = android.graphics.Rect(
-                localCrop.offsetX + bestBoxRect.left.toInt(),
-                localCrop.offsetY + bestBoxRect.top.toInt(),
-                localCrop.offsetX + bestBoxRect.right.toInt(),
-                localCrop.offsetY + bestBoxRect.bottom.toInt()
-            )
-            
-            localCrop.croppedBitmap.recycle()
-            buildFinalWireframe(safeBitmap, globalLineBox, currentSession, debugInterceptor)
-        } else {
-            val debugBmp = localCrop.croppedBitmap.copy(Bitmap.Config.ARGB_8888, true)
-            debugInterceptor.pauseAndShowStep(
-                "디버그 1단계: [FAIL] AI 모델 탐색 실패", debugBmp,
-                "[FAIL] 터치 영역 내 번호판 없음",
-                listOf(
-                    "-> 원인: 터치된 구역 안에서 AI가 유효한 번호판 박스(스코어 > 0.4)를 찾지 못했습니다.",
-                    "-> 조치: 번호판 중앙을 다시 터치해주세요."
+            // ------------------------------------------------------------
+            // 12. 입력 Bitmap 정리
+            // ------------------------------------------------------------
+            if (resizedBitmap != null && resizedBitmap !== localCrop.croppedBitmap) {
+                resizedBitmap.recycle()
+                resizedBitmap = null
+            }
+
+            // ------------------------------------------------------------
+            // 13. 번호판 후보가 발견됨
+            // ------------------------------------------------------------
+            if (bestBoxRect != null) {
+                val box = bestBoxRect
+
+                val globalLineBox = android.graphics.Rect(
+                    localCrop.offsetX + box.left.toInt(),
+                    localCrop.offsetY + box.top.toInt(),
+                    localCrop.offsetX + box.right.toInt(),
+                    localCrop.offsetY + box.bottom.toInt()
                 )
-            )
-            localCrop.croppedBitmap.recycle()
+
+                Log.d("AI_DEBUG", "최종 AI Box = $globalLineBox")
+                localCrop.croppedBitmap.recycle()
+
+                buildFinalWireframe(safeBitmap, globalLineBox, currentSession, debugInterceptor)
+                return
+            } else {
+                // --------------------------------------------------------
+                // AI 탐색 실패
+                // --------------------------------------------------------
+                val debugBmp = localCrop.croppedBitmap.copy(Bitmap.Config.ARGB_8888, true)
+                debugInterceptor.pauseAndShowStep(
+                    "디버그 1단계: [FAIL] AI 모델 탐색 실패",
+                    debugBmp,
+                    "[FAIL] 터치 영역 내 번호판 없음",
+                    listOf(
+                        "검출 개수: $detectionCount",
+                        "AI threshold: 0.4",
+                        "터치 주변에서 유효한 번호판 후보를 찾지 못했습니다.",
+                        "번호판 중앙을 다시 터치해주세요."
+                    )
+                )
+
+                localCrop.croppedBitmap.recycle()
+                safeBitmap.recycle()
+
+                fallbackToManualMode(currentSession, "해당 위치 주변에서 번호판을 찾지 못했습니다.")
+                return
+            }
+
+        } catch (e: Throwable) {
+            Log.e("AI_DEBUG", "TFLite Pipeline 오류", e)
+
+            if (resizedBitmap != null && !resizedBitmap.isRecycled && resizedBitmap !== localCrop.croppedBitmap) {
+                resizedBitmap.recycle()
+            }
+
+            if (!localCrop.croppedBitmap.isRecycled) {
+                localCrop.croppedBitmap.recycle()
+            }
+
             safeBitmap.recycle()
-            fallbackToManualMode(currentSession, "해당 위치 주변에서 번호판을 찾지 못했습니다.")
+
+            fallbackToManualMode(currentSession, "AI 처리 중 오류가 발생했습니다.")
+            return
         }
     }
 
@@ -970,9 +1238,15 @@ class MainActivity : AppCompatActivity() {
         cachedTextureMat?.release()
         cachedTextureMat = null
 
-        // 💡 원시 엔진 메모리 해제
-        tflite?.close()
-        tflite = null
+        // 💡 원시 엔진 메모리 해제 충돌 방지 로직 (tfliteLock)
+        synchronized(tfliteLock) {
+            try {
+                tflite?.close()
+            } catch (e: Exception) {
+                Log.e("AI_DEBUG", "TFLite 종료 중 오류", e)
+            }
+            tflite = null
+        }
 
         cameraExecutor.shutdownNow()
         precomputeExecutor.shutdownNow()
