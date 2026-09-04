@@ -60,6 +60,9 @@ dependencies {
     // 💡 최신 MediaPipe Tasks Vision (14개 출력 텐서 모델 완벽 지원)
     implementation 'com.google.mediapipe:tasks-vision:0.10.14'
 
+    // ⭐️ [추가됨] TensorFlow Lite Interpreter (원시 모델 구동용)
+    implementation 'org.tensorflow:tensorflow-lite:2.14.0'
+
     // 💡 구글 ML Kit (현재 AI 모델로 번호판 영역을 찾으므로 제외, 글자 인식이 다시 필요할 때 주석 해제)
     // implementation 'com.google.mlkit:text-recognition-korean:16.0.0'
 
