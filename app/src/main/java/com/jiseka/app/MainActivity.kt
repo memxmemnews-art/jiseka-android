@@ -91,7 +91,6 @@ class MainActivity : AppCompatActivity() {
     private var progressBar: ProgressBar? = null
     private var guideText: TextView? = null
 
-    // ⭐️ 화면 디버그 UI 변수
     private var debugLatch: CountDownLatch? = null
     private var btnDebugNext: Button? = null
     private var debugHudContainer: LinearLayout? = null
@@ -127,17 +126,11 @@ class MainActivity : AppCompatActivity() {
         }?.start()
     }
 
-    // ============================================================
-    // 갤러리 자동 디버그 기록
-    // ============================================================
     private val debugSaveLock = Any()
     private var debugSequence = 0
     private var debugLastStage = "앱 시작"
     private val debugDateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault())
 
-    // ============================================================
-    // TFLite - plate_detector.tflite 실제 구조에 맞춘 설정
-    // ============================================================
     private var tflite: Interpreter? = null
     
     private var modelAssetFileDescriptor: android.content.res.AssetFileDescriptor? = null
@@ -198,9 +191,6 @@ class MainActivity : AppCompatActivity() {
         else ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
     }
 
-    // ============================================================
-    // 디버그 파일 저장 함수 (동기식)
-    // ============================================================
     private fun saveDebugBitmap(stage: String, sourceBitmap: Bitmap?, extraLines: List<String> = emptyList()) {
         synchronized(debugSaveLock) {
             debugSequence++
@@ -216,7 +206,6 @@ class MainActivity : AppCompatActivity() {
                     debugBitmap = Bitmap.createBitmap(800, 450, Bitmap.Config.ARGB_8888)
                 }
 
-                // ⭐️ Null safety(!!)를 적용하여 컴파일 에러 해결
                 val canvas = Canvas(debugBitmap!!)
                 val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                     textSize = 28f
@@ -238,7 +227,6 @@ class MainActivity : AppCompatActivity() {
                 val lineHeight = 38f
                 val overlayHeight = 35f + lineHeight * lines.size
 
-                // ⭐️ Null safety(!!) 적용
                 canvas.drawRect(0f, 0f, debugBitmap!!.width.toFloat(), overlayHeight, backgroundPaint)
 
                 var y = 35f
@@ -266,7 +254,6 @@ class MainActivity : AppCompatActivity() {
 
                 try {
                     contentResolver.openOutputStream(uri)?.use { outputStream ->
-                        // ⭐️ Null safety(!!) 적용
                         val success = debugBitmap!!.compress(Bitmap.CompressFormat.JPEG, 92, outputStream)
                         if (!success) {
                             throw IllegalStateException("Bitmap JPEG 압축 실패")
@@ -298,9 +285,6 @@ class MainActivity : AppCompatActivity() {
         saveDebugBitmap(stage = stage, sourceBitmap = null, extraLines = lines)
     }
 
-    // ============================================================
-    // 모델 초기화
-    // ============================================================
     private fun initCustomAIModel() {
         try {
             modelAssetFileDescriptor = assets.openFd("plate_detector.tflite")
@@ -313,12 +297,11 @@ class MainActivity : AppCompatActivity() {
             )
 
             val options = Interpreter.Options().apply {
-                setNumThreads(1) // 디버깅 중에는 1 thread
+                setNumThreads(1) 
             }
 
             val interpreter = Interpreter(modelMappedBuffer!!, options)
 
-            // INPUT 검사
             val inputTensor = interpreter.getInputTensor(0)
             val inputShape = inputTensor.shape()
             val actualInputType = inputTensor.dataType()
@@ -336,7 +319,6 @@ class MainActivity : AppCompatActivity() {
             inputWidth = inputShape[2]
             inputType = actualInputType
 
-            // OUTPUT 검사
             outIdxBoxes = -1
             outIdxScores = -1
             outIdxClasses = -1
@@ -386,10 +368,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun convertBitmapToByteBuffer(bitmap: Bitmap): ByteBuffer {
         if (bitmap.width != inputWidth || bitmap.height != inputHeight) {
-            throw IllegalArgumentException("입력 Bitmap 크기 오류: ${bitmap.width}x${bitmap.height}, 필요: ${inputWidth}x${inputHeight}")
+            throw IllegalArgumentException("입력 Bitmap 크기 오류")
         }
 
-        val bufferSize = inputWidth * inputHeight * 3 * 4   // FLOAT32 = 4 bytes
+        val bufferSize = inputWidth * inputHeight * 3 * 4   
         val byteBuffer = ByteBuffer.allocateDirect(bufferSize).order(ByteOrder.nativeOrder())
         val intValues = IntArray(inputWidth * inputHeight)
 
@@ -403,9 +385,10 @@ class MainActivity : AppCompatActivity() {
                 val g = (pixel shr 8) and 0xFF
                 val b = pixel and 0xFF
 
-                byteBuffer.putFloat(r / 255.0f)
-                byteBuffer.putFloat(g / 255.0f)
-                byteBuffer.putFloat(b / 255.0f)
+                // 정규화 (현재 -1.0 ~ 1.0 적용됨)
+                byteBuffer.putFloat((r - 127.5f) / 127.5f)
+                byteBuffer.putFloat((g - 127.5f) / 127.5f)
+                byteBuffer.putFloat((b - 127.5f) / 127.5f)
             }
         }
 
@@ -629,8 +612,42 @@ class MainActivity : AppCompatActivity() {
 
             saveDebugStage("15_DETECTION_COUNT", listOf("reportedNum = $reportedNum", "detectionCount = $detectionCount"))
 
+            // -----------------------------------------------------------------
+            // ⭐️ 15_5_RAW_DETECTIONS: AI가 반환한 날것의 데이터(Raw Data) 낱낱이 파헤치기
+            // -----------------------------------------------------------------
             val localTouchX = localCrop.croppedBitmap.width / 2f
             val localTouchY = localCrop.croppedBitmap.height / 2f
+
+            val rawLogList = mutableListOf<String>()
+            rawLogList.add("TouchX: $localTouchX, TouchY: $localTouchY")
+            rawLogList.add("CropSize: ${localCrop.croppedBitmap.width}x${localCrop.croppedBitmap.height}")
+
+            val printLimit = min(detectionCount, 5) // UI 넘침 방지를 위해 최대 5개만 로깅
+            for (i in 0 until printLimit) {
+                val score = scoresFloat.get(i)
+                val classId = classesInt.get(i)
+                val ymin = boxesFloat.get(i * 4 + 0)
+                val xmin = boxesFloat.get(i * 4 + 1)
+                val ymax = boxesFloat.get(i * 4 + 2)
+                val xmax = boxesFloat.get(i * 4 + 3)
+
+                val rect = android.graphics.RectF(
+                    xmin * localCrop.croppedBitmap.width,
+                    ymin * localCrop.croppedBitmap.height,
+                    xmax * localCrop.croppedBitmap.width,
+                    ymax * localCrop.croppedBitmap.height
+                )
+                
+                val contains = rect.contains(localTouchX, localTouchY)
+
+                rawLogList.add("--- [$i] ---")
+                rawLogList.add("cls=$classId, scr=${String.format("%.3f", score)}")
+                rawLogList.add("raw=[$ymin, $xmin, $ymax, $xmax]")
+                rawLogList.add("map=[${rect.left.toInt()}, ${rect.top.toInt()}, ${rect.right.toInt()}, ${rect.bottom.toInt()}]")
+                rawLogList.add("containsTouch=$contains")
+            }
+            saveDebugStage("15_5_RAW_DETECTIONS", rawLogList)
+            // -----------------------------------------------------------------
 
             var bestBoxRect: android.graphics.RectF? = null
             var bestScore = -1f
@@ -641,7 +658,6 @@ class MainActivity : AppCompatActivity() {
                 val score = scoresFloat.get(i)
                 if (!score.isFinite() || score < 0.4f) continue
 
-                val classId = classesInt.get(i)
                 val ymin = boxesFloat.get(i * 4 + 0)
                 val xmin = boxesFloat.get(i * 4 + 1)
                 val ymax = boxesFloat.get(i * 4 + 2)
@@ -704,7 +720,7 @@ class MainActivity : AppCompatActivity() {
 
                 localCrop.croppedBitmap.recycle()
                 
-                saveDebugBitmap("17_BEFORE_GEOMETRY", safeBitmap, listOf("AI Box = $globalLineBox"))
+                saveDebugBitmap("17_BEFORE_GEOMETRY", safeBitmap, listOf("AI Box = $aiGlobalBox"))
 
                 buildFinalWireframe(safeBitmap, globalLineBox, currentSession, debugInterceptor)
                 return
@@ -712,10 +728,15 @@ class MainActivity : AppCompatActivity() {
             } else {
                 val debugBmp = localCrop.croppedBitmap.copy(Bitmap.Config.ARGB_8888, true)
                 
+                // ⭐️ [수정] 실패 시 팝업에도 Raw 데이터를 함께 띄워서 즉시 볼 수 있게 만듦
+                val failLogs = mutableListOf("검출 개수: $detectionCount")
+                failLogs.addAll(rawLogList)
+                failLogs.add("번호판 중앙을 다시 터치해주세요.")
+
                 debugInterceptor.pauseAndShowStep(
                     "디버그 1단계: [FAIL] AI 모델 탐색 실패", debugBmp,
                     "[FAIL] 터치 영역 내 번호판 없음",
-                    listOf("검출 개수: $detectionCount", "번호판 중앙을 다시 터치해주세요.")
+                    failLogs
                 )
 
                 localCrop.croppedBitmap.recycle()
@@ -959,7 +980,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ⭐️ 누락되었던 saveBitmapToGallery 복구
     private fun saveBitmapToGallery(bitmap: Bitmap) {
         try {
             val filename = "JiSeKa_${System.currentTimeMillis()}.jpg"
