@@ -48,7 +48,7 @@ object PlateDetectionEngine {
     )
 
     // =========================================================
-    // 디버그 이미지 렌더링 최적화 헬퍼 (중복 방지 및 메모리 누수 방지)
+    // 디버그 이미지 렌더링 최적화 헬퍼
     // =========================================================
     private fun emitDebug(
         listener: DetectionDebugListener,
@@ -60,11 +60,11 @@ object PlateDetectionEngine {
         val bmp = Bitmap.createBitmap(mat.cols(), mat.rows(), Bitmap.Config.ARGB_8888)
         Utils.matToBitmap(mat, bmp)
         listener.pauseAndShowStep(stageName, bmp, title, logs)
-        bmp.recycle() // 콜백 호출 후 즉시 메모리 반환
+        bmp.recycle() 
     }
 
     // ---------------------------------------------------------
-    // 안전한 Rect (AndroidRect 반환)
+    // ⭐️ 안전한 Rect (AndroidRect 반환) - 회원님 제안 로직 완벽 적용
     // ---------------------------------------------------------
     private fun getSafeRect(
         x: Int,
@@ -74,15 +74,28 @@ object PlateDetectionEngine {
         maxW: Int,
         maxH: Int
     ): AndroidRect {
+        // 원본 자체가 비정상(0 이하)인 경우 방어
         if (maxW <= 0 || maxH <= 0) {
-            return AndroidRect(0, 0, 0, 0)
+            return AndroidRect(0, 0, 1, 1)
         }
-        val safeX = x.coerceIn(0, maxW - 1)
-        val safeY = y.coerceIn(0, maxH - 1)
-        val safeW = w.coerceAtMost(maxW - safeX)
-        val safeH = h.coerceAtMost(maxH - safeY)
 
-        return AndroidRect(safeX, safeY, safeW, safeH)
+        // 1. 시작점은 실제 이미지 내부로 제한
+        val left = x.coerceIn(0, maxW - 1)
+        val top = y.coerceIn(0, maxH - 1)
+
+        // 2. 남아 있는 실제 공간
+        val availableW = maxW - left
+        val availableH = maxH - top
+
+        // 3. width / height는 반드시 1 이상, 남은 공간 이하 보장
+        val safeW = w.coerceIn(1, availableW)
+        val safeH = h.coerceIn(1, availableH)
+
+        // 4. 정상적인 right, bottom 도출
+        val right = left + safeW
+        val bottom = top + safeH
+
+        return AndroidRect(left, top, right, bottom)
     }
 
     // ---------------------------------------------------------
@@ -112,6 +125,7 @@ object PlateDetectionEngine {
             fullBitmap.height
         )
 
+        // 안전한 Rect가 보장되므로 createBitmap에서 예외가 발생하지 않음
         val croppedBitmap = Bitmap.createBitmap(
             fullBitmap, 
             safeRect.left, 
@@ -133,7 +147,7 @@ object PlateDetectionEngine {
     // ---------------------------------------------------------
     suspend fun processWithMLKitResult(
         fullBitmap: Bitmap,
-        aiGlobalBox: AndroidRect, // AndroidRect 명시
+        aiGlobalBox: AndroidRect, 
         debugListener: DetectionDebugListener? = null
     ): List<ImmutablePoint>? {
 
@@ -161,7 +175,6 @@ object PlateDetectionEngine {
                 return null
             }
 
-            // OpenCV API용 전용 Rect 생성
             val cvSafeRoi = Rect(
                 safeRoi.left,
                 safeRoi.top,
@@ -169,7 +182,6 @@ object PlateDetectionEngine {
                 safeRoi.height()
             )
 
-            // [디버그 1] AI 영역 확보 (cvSafeRoi 사용)
             debugListener?.let {
                 val debugMat = fullMat.clone()
                 Imgproc.rectangle(debugMat, cvSafeRoi, Scalar(0.0, 255.0, 0.0, 255.0), 5)
@@ -182,9 +194,8 @@ object PlateDetectionEngine {
             }
 
             val roiGray = Mat()
-            fullGray.submat(cvSafeRoi).copyTo(roiGray) // cvSafeRoi 사용
+            fullGray.submat(cvSafeRoi).copyTo(roiGray) 
 
-            // 지역 평가용 AndroidRect 생성
             val localAiRect = AndroidRect(
                 0, 
                 0, 
@@ -194,42 +205,32 @@ object PlateDetectionEngine {
             
             val candidates = mutableListOf<PlateCandidate>()
 
-            // -------------------------------------------------
             // A. Contour 후보
-            // -------------------------------------------------
             val contourCandidates = extractContourCandidates(roiGray, debugListener)
             candidates.addAll(contourCandidates.mapNotNull { pts ->
                 val score = evaluateCandidate(pts, localAiRect, safeRoi.width(), safeRoi.height())
                 if (score.score >= MIN_CANDIDATE_SCORE) PlateCandidate(pts, score.score, score.log) else null
             })
 
-            // -------------------------------------------------
-            // B. Hough 기반 실제 4선 조합
-            // -------------------------------------------------
+            // B. Hough 후보
             val houghCandidates = extractHoughQuadCandidates(roiGray, debugListener)
             candidates.addAll(houghCandidates.mapNotNull { pts ->
                 val score = evaluateCandidate(pts, localAiRect, safeRoi.width(), safeRoi.height())
                 if (score.score >= MIN_CANDIDATE_SCORE) PlateCandidate(pts, score.score, score.log) else null
             })
 
-            // =================================================
-            // 최고 후보 도출
-            // =================================================
             val bestCandidate = candidates.maxByOrNull { it.score }
 
-            // [디버그 4] 최종 후보군 렌더링 및 평가 내역
             debugListener?.let { listener ->
                 val debugMat = Mat()
                 Imgproc.cvtColor(roiGray, debugMat, Imgproc.COLOR_GRAY2RGBA)
 
-                // 후보군 전체 렌더링 (회색)
                 candidates.forEach { c ->
                     val poly = MatOfPoint(*c.pts.toTypedArray())
                     Imgproc.polylines(debugMat, listOf(poly), true, Scalar(180.0, 180.0, 180.0, 255.0), 1)
                     poly.release()
                 }
 
-                // 1등 후보군 렌더링 (진녹색)
                 bestCandidate?.let { best ->
                     val poly = MatOfPoint(*best.pts.toTypedArray())
                     Imgproc.polylines(debugMat, listOf(poly), true, Scalar(0.0, 255.0, 0.0, 255.0), 3)
@@ -248,19 +249,14 @@ object PlateDetectionEngine {
                 debugMat.release()
             }
 
-            // =================================================
-            // 실패 처리
-            // =================================================
             if (bestCandidate == null || bestCandidate.score < MIN_FINAL_SCORE) {
-                // [디버그 5-Fail] OpenCV 정밀화 실패
                 debugListener?.let {
                     val debugMat = fullMat.clone()
-                    Imgproc.rectangle(debugMat, cvSafeRoi, Scalar(255.0, 0.0, 0.0, 255.0), 5) // Red Box
+                    Imgproc.rectangle(debugMat, cvSafeRoi, Scalar(255.0, 0.0, 0.0, 255.0), 5) 
                     emitDebug(it, debugMat, "5. OpenCV 정밀화 실패", "번호판 4점 확정 실패", listOf(
                         "AI Box는 정상적으로 검출됨",
                         "하지만 신뢰할 수 있는 4점 후보를 찾지 못함",
-                        "기준 점수 미달: ${bestCandidate?.score?.let { s -> String.format("%.1f", s) } ?: "0.0"} < $MIN_FINAL_SCORE",
-                        "→ 마스킹 로직으로 넘어가지 않음"
+                        "기준 점수 미달: ${bestCandidate?.score?.let { s -> String.format("%.1f", s) } ?: "0.0"} < $MIN_FINAL_SCORE"
                     ))
                     debugMat.release()
                 }
@@ -268,18 +264,14 @@ object PlateDetectionEngine {
                 return null
             }
 
-            // =================================================
-            // 최종 4점 성공
-            // =================================================
             val finalLocalPts = sortCorners(bestCandidate.pts)
             val globalPts = finalLocalPts.map {
                 ImmutablePoint((it.x + safeRoi.left).toFloat(), (it.y + safeRoi.top).toFloat())
             }
 
-            // [디버그 5-Success] 최종 결과 확정
             debugListener?.let {
                 val debugMat = fullMat.clone()
-                Imgproc.rectangle(debugMat, cvSafeRoi, Scalar(0.0, 255.0, 255.0, 255.0), 3) // Yellow Box
+                Imgproc.rectangle(debugMat, cvSafeRoi, Scalar(0.0, 255.0, 255.0, 255.0), 3) 
 
                 for (i in 0 until 4) {
                     val p1 = Point(globalPts[i].x.toDouble(), globalPts[i].y.toDouble())
@@ -305,25 +297,16 @@ object PlateDetectionEngine {
         }
     }
 
-    // =========================================================
-    // Contour 후보 생성
-    // =========================================================
-
-    private fun extractContourCandidates(
-        gray: Mat,
-        debugListener: DetectionDebugListener?
-    ): List<List<Point>> {
+    private fun extractContourCandidates(gray: Mat, debugListener: DetectionDebugListener?): List<List<Point>> {
         val result = mutableListOf<List<Point>>()
         val edgeMats = mutableListOf<Mat>()
 
-        // A. 기본 Canny
         run {
             val blurred = Mat()
             val edges = Mat()
             Imgproc.GaussianBlur(gray, blurred, Size(3.0, 3.0), 0.0)
             Imgproc.Canny(blurred, edges, 40.0, 120.0)
             
-            // [디버그 2-1] 기본 Canny 
             debugListener?.let {
                 emitDebug(it, edges, "2-1. Contour - 기본 Canny", "Canny 엣지 추출", listOf("Blur(3x3) -> Canny(40, 120)"))
             }
@@ -332,7 +315,6 @@ object PlateDetectionEngine {
             blurred.release()
         }
 
-        // B. 약한 Close
         run {
             val blurred = Mat()
             val edges = Mat()
@@ -342,7 +324,6 @@ object PlateDetectionEngine {
             val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
             Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_CLOSE, kernel)
             
-            // [디버그 2-2] Morph Close
             debugListener?.let {
                 emitDebug(it, edges, "2-2. Contour - Morph Close", "끊어진 선 연결", listOf("Morphology Close (2x2) 적용됨"))
             }
@@ -382,7 +363,6 @@ object PlateDetectionEngine {
             edges.release()
         }
 
-        // [디버그 2-3] 추출된 다각형 필터링 결과
         debugListener?.let { listener ->
             val debugMat = Mat()
             Imgproc.cvtColor(gray, debugMat, Imgproc.COLOR_GRAY2RGBA)
@@ -400,20 +380,12 @@ object PlateDetectionEngine {
         return result
     }
 
-    // =========================================================
-    // HoughLinesP → 실제 4개 선 조합
-    // =========================================================
-
-    private fun extractHoughQuadCandidates(
-        gray: Mat,
-        debugListener: DetectionDebugListener?
-    ): List<List<Point>> {
+    private fun extractHoughQuadCandidates(gray: Mat, debugListener: DetectionDebugListener?): List<List<Point>> {
         val result = mutableListOf<List<Point>>()
         val edges = Mat()
 
         Imgproc.Canny(gray, edges, 40.0, 120.0)
 
-        // [디버그 3-1] Hough용 Canny
         debugListener?.let {
             emitDebug(it, edges, "3-1. Hough - Canny", "직선 추출용 엣지", listOf("Canny(40, 120)"))
         }
@@ -445,7 +417,6 @@ object PlateDetectionEngine {
         lines.release()
         edges.release()
 
-        // [디버그 3-2] 검출된 직선 렌더링
         debugListener?.let { listener ->
             val debugMat = Mat()
             Imgproc.cvtColor(gray, debugMat, Imgproc.COLOR_GRAY2RGBA)
@@ -489,7 +460,6 @@ object PlateDetectionEngine {
             }
         }
 
-        // [디버그 3-3] 선의 교점으로 만들어진 사각형 렌더링
         debugListener?.let { listener ->
             val debugMat = Mat()
             Imgproc.cvtColor(gray, debugMat, Imgproc.COLOR_GRAY2RGBA)
@@ -507,13 +477,7 @@ object PlateDetectionEngine {
         return result
     }
 
-    // =========================================================
-    // 4개 선의 교점으로 사각형 생성
-    // =========================================================
-
-    private fun buildQuadFromLines(
-        a1: HoughLine, a2: HoughLine, b1: HoughLine, b2: HoughLine
-    ): List<Point>? {
+    private fun buildQuadFromLines(a1: HoughLine, a2: HoughLine, b1: HoughLine, b2: HoughLine): List<Point>? {
         val p1 = intersection(a1.p1, a1.p2, b1.p1, b1.p2)
         val p2 = intersection(a1.p1, a1.p2, b2.p1, b2.p2)
         val p3 = intersection(a2.p1, a2.p2, b2.p1, b2.p2)
@@ -523,13 +487,7 @@ object PlateDetectionEngine {
         return listOf(p1, p2, p3, p4)
     }
 
-    // =========================================================
-    // 두 직선 교점
-    // =========================================================
-
-    private fun intersection(
-        p1: Point, p2: Point, p3: Point, p4: Point
-    ): Point? {
+    private fun intersection(p1: Point, p2: Point, p3: Point, p4: Point): Point? {
         val x1 = p1.x; val y1 = p1.y
         val x2 = p2.x; val y2 = p2.y
         val x3 = p3.x; val y3 = p3.y
@@ -543,13 +501,7 @@ object PlateDetectionEngine {
         return Point(px, py)
     }
 
-    // =========================================================
-    // 사각형 기본 유효성
-    // =========================================================
-
-    private fun isReasonableQuad(
-        pts: List<Point>, width: Int, height: Int
-    ): Boolean {
+    private fun isReasonableQuad(pts: List<Point>, width: Int, height: Int): Boolean {
         if (pts.size != 4) return false
         for (p in pts) {
             if (p.x < -width * 0.15 || p.x > width * 1.15 ||
@@ -563,31 +515,14 @@ object PlateDetectionEngine {
         return true
     }
 
-    // =========================================================
-    // 후보 평가
-    // =========================================================
-
-    private fun evaluateCandidate(
-        pts: List<Point>,
-        aiRect: AndroidRect,
-        roiWidth: Int,
-        roiHeight: Int
-    ): ScoreResult {
-
+    private fun evaluateCandidate(pts: List<Point>, aiRect: AndroidRect, roiWidth: Int, roiHeight: Int): ScoreResult {
         if (pts.size != 4) {
             return ScoreResult(0.0, "4점 아님")
         }
 
         val p = sortCorners(pts)
+        val tl = p[0]; val tr = p[1]; val br = p[2]; val bl = p[3]
 
-        val tl = p[0]
-        val tr = p[1]
-        val br = p[2]
-        val bl = p[3]
-
-        // ---------------------------------------------
-        // 변 길이
-        // ---------------------------------------------
         val top = hypot(tr.x - tl.x, tr.y - tl.y)
         val bottom = hypot(br.x - bl.x, br.y - bl.y)
         val left = hypot(bl.x - tl.x, bl.y - tl.y)
@@ -601,26 +536,17 @@ object PlateDetectionEngine {
         val heightAvg = (left + right) / 2.0
         val aspectRatio = widthAvg / heightAvg
 
-        // ---------------------------------------------
-        // 1. 종횡비
-        // ---------------------------------------------
         val aspectScore = if (aspectRatio in 1.8..6.0) {
             100.0 - abs(aspectRatio - 3.0) * 12.0
         } else {
             max(0.0, 100.0 - abs(aspectRatio - 3.0) * 30.0)
         }
 
-        // ---------------------------------------------
-        // 2. 상하변 평행성
-        // ---------------------------------------------
         val topAngle = lineAngle(tl, tr)
         val bottomAngle = lineAngle(bl, br)
         val horizontalParallel = angleDifference(topAngle, bottomAngle)
         val horizontalScore = max(0.0, 100.0 - horizontalParallel * 6.0)
 
-        // ---------------------------------------------
-        // 3. 좌우변 평행성
-        // ---------------------------------------------
         val leftAngle = lineAngle(tl, bl)
         val rightAngle = lineAngle(tr, br)
         val verticalParallel = angleDifference(leftAngle, rightAngle)
@@ -628,9 +554,6 @@ object PlateDetectionEngine {
 
         val parallelScore = (horizontalScore + verticalScore) / 2.0
 
-        // ---------------------------------------------
-        // 4. AI Box 내부 적합도
-        // ---------------------------------------------
         val candidateArea = abs(polygonArea(p))
         val aiWidth = aiRect.width().toDouble()
         val aiHeight = aiRect.height().toDouble()
@@ -647,50 +570,34 @@ object PlateDetectionEngine {
             else -> max(0.0, 100.0 - (areaRatio - 1.05) * 150.0)
         }
 
-        // ---------------------------------------------
-        // 5. 중심 위치
-        // ---------------------------------------------
         val centerX = p.map { it.x }.average()
         val centerY = p.map { it.y }.average()
-
         val aiCenterX = (aiRect.left + aiRect.right) / 2.0
         val aiCenterY = (aiRect.top + aiRect.bottom) / 2.0
 
         val centerDistance = hypot(centerX - aiCenterX, centerY - aiCenterY)
         val maxCenterDistance = hypot(aiWidth, aiHeight) / 2.0
 
-        val centerScore = max(
-            0.0,
-            100.0 - (centerDistance / maxCenterDistance.coerceAtLeast(1.0)) * 100.0
-        )
+        val centerScore = max(0.0, 100.0 - (centerDistance / maxCenterDistance.coerceAtLeast(1.0)) * 100.0)
 
-        // ---------------------------------------------
-        // 6. AI Box 밖으로 나간 점
-        // ---------------------------------------------
         var overflow = 0.0
-
         for (point in p) {
             val dx = when {
                 point.x < aiRect.left -> aiRect.left - point.x
                 point.x > aiRect.right -> point.x - aiRect.right
                 else -> 0.0
             }
-
             val dy = when {
                 point.y < aiRect.top -> aiRect.top - point.y
                 point.y > aiRect.bottom -> point.y - aiRect.bottom
                 else -> 0.0
             }
-
             overflow += hypot(dx, dy)
         }
 
         val overflowRatio = overflow / (aiWidth + aiHeight)
         val overflowScore = max(0.0, 100.0 - overflowRatio * 200.0)
 
-        // ---------------------------------------------
-        // 최종 점수
-        // ---------------------------------------------
         val finalScore = (
             aspectScore * 0.20 +
             parallelScore * 0.25 +
@@ -699,19 +606,9 @@ object PlateDetectionEngine {
             overflowScore * 0.15
         )
 
-        val log = "점수=${String.format("%.1f", finalScore)} " +
-                "AR=${aspectScore.toInt()} " +
-                "평행=${parallelScore.toInt()} " +
-                "크기=${areaFitScore.toInt()} " +
-                "중심=${centerScore.toInt()} " +
-                "Over=${overflowScore.toInt()}"
-
+        val log = "점수=${String.format("%.1f", finalScore)} AR=${aspectScore.toInt()} 평행=${parallelScore.toInt()} 크기=${areaFitScore.toInt()} 중심=${centerScore.toInt()} Over=${overflowScore.toInt()}"
         return ScoreResult(finalScore, log)
     }
-
-    // =========================================================
-    // 선 각도
-    // =========================================================
 
     private fun lineAngle(a: Point, b: Point): Double {
         var angle = Math.toDegrees(atan2(b.y - a.y, b.x - a.x))
@@ -719,19 +616,11 @@ object PlateDetectionEngine {
         return angle
     }
 
-    // =========================================================
-    // 각도 차이
-    // =========================================================
-
     private fun angleDifference(a: Double, b: Double): Double {
         var diff = abs(a - b)
         while (diff > 180.0) diff -= 180.0
         return min(diff, 180.0 - diff)
     }
-
-    // =========================================================
-    // Polygon 면적
-    // =========================================================
 
     private fun polygonArea(pts: List<Point>): Double {
         var area = 0.0
@@ -742,10 +631,6 @@ object PlateDetectionEngine {
         return area / 2.0
     }
 
-    // =========================================================
-    // 꼭지점 정렬
-    // =========================================================
-
     private fun sortCorners(pts: List<Point>): List<Point> {
         if (pts.size != 4) return pts
         val centerX = pts.map { it.x }.average()
@@ -754,10 +639,6 @@ object PlateDetectionEngine {
         val startIndex = sorted.indices.minByOrNull { i -> sorted[i].x + sorted[i].y } ?: 0
         return List(4) { index -> sorted[(startIndex + index) % 4] }
     }
-
-    // =========================================================
-    // 최소 점수
-    // =========================================================
 
     private const val MIN_CANDIDATE_SCORE = 35.0
     private const val MIN_FINAL_SCORE = 65.0
