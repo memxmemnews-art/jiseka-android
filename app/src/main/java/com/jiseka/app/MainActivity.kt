@@ -345,7 +345,6 @@ class MainActivity : AppCompatActivity() {
                 val g = (pixel shr 8) and 0xFF
                 val b = pixel and 0xFF
 
-                // ⭐️ [실험 A] 0.0 ~ 1.0 정규화 유지 
                 byteBuffer.putFloat(r / 255.0f)
                 byteBuffer.putFloat(g / 255.0f)
                 byteBuffer.putFloat(b / 255.0f)
@@ -499,7 +498,6 @@ class MainActivity : AppCompatActivity() {
             val classesInt = outClassesBuf.asIntBuffer()
             val numInt = outNumBuf.asIntBuffer()
 
-            // ⭐️ [에러 방지용 안전한 조건문 블록 1]
             val reportedNum: Int
             if (numInt.remaining() > 0) {
                 reportedNum = numInt.get(0)
@@ -511,9 +509,6 @@ class MainActivity : AppCompatActivity() {
 
             saveDebugStage("15_DETECTION_COUNT", listOf("reportedNum = $reportedNum"))
 
-            // -----------------------------------------------------------------
-            // ⭐️ 실험 B, C: 순수 Raw Tensor 값 로그 출력
-            // -----------------------------------------------------------------
             val localTouchX = localCrop.croppedBitmap.width / 2f
             val localTouchY = localCrop.croppedBitmap.height / 2f
 
@@ -524,7 +519,6 @@ class MainActivity : AppCompatActivity() {
                 val score = scoresFloat.get(i)
                 val classId = classesInt.get(i)
                 
-                // 가공 없는 순수 버퍼 값
                 val raw0 = boxesFloat.get(i * 4 + 0)
                 val raw1 = boxesFloat.get(i * 4 + 1)
                 val raw2 = boxesFloat.get(i * 4 + 2)
@@ -534,10 +528,8 @@ class MainActivity : AppCompatActivity() {
                 rawLogList.add("cls=$classId, scr=${String.format("%.3f", score)}")
                 rawLogList.add("pure_raw=[$raw0, $raw1, $raw2, $raw3]")
 
-                // 좌표계(0~1 또는 0~256) 자동 판별
                 val isPixelScale = raw3 > 2.0f
                 
-                // ⭐️ [에러 방지용 안전한 조건문 블록 2]
                 val scaleW: Float
                 val scaleH: Float
                 if (isPixelScale) {
@@ -558,7 +550,6 @@ class MainActivity : AppCompatActivity() {
                 rawLogList.add("map=[${rect.left.toInt()}, ${rect.top.toInt()}, ${rect.right.toInt()}, ${rect.bottom.toInt()}]")
             }
             saveDebugStage("15_5_RAW_DETECTIONS", rawLogList)
-            // -----------------------------------------------------------------
 
             var bestBoxRect: android.graphics.RectF? = null
             var bestScore = -1f
@@ -568,7 +559,6 @@ class MainActivity : AppCompatActivity() {
             for (i in 0 until detectionCount) {
                 val score = scoresFloat.get(i)
                 
-                // ⭐️ [진단용 시각화] 박스가 잡히는지 눈으로 확인하기 위해 기준치를 임시로 낮춤
                 if (!score.isFinite() || score < 0.05f) continue
 
                 val ymin = boxesFloat.get(i * 4 + 0)
@@ -580,7 +570,6 @@ class MainActivity : AppCompatActivity() {
 
                 val isPixelScale = xmax > 2.0f
                 
-                // ⭐️ [에러 방지용 안전한 조건문 블록 3]
                 val scaleW: Float
                 val scaleH: Float
                 if (isPixelScale) {
