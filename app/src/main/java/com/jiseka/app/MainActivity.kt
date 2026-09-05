@@ -345,8 +345,7 @@ class MainActivity : AppCompatActivity() {
                 val g = (pixel shr 8) and 0xFF
                 val b = pixel and 0xFF
 
-                // ⭐️ [실험 A] 현재 상태 유지 (정규화 변수 통제)
-                // 모델 스케일이 0~255인지 판별하기 전까지는 기존 로직을 건드리지 않습니다.
+                // ⭐️ [실험 A] 0.0 ~ 1.0 정규화 유지 
                 byteBuffer.putFloat(r / 255.0f)
                 byteBuffer.putFloat(g / 255.0f)
                 byteBuffer.putFloat(b / 255.0f)
@@ -500,7 +499,14 @@ class MainActivity : AppCompatActivity() {
             val classesInt = outClassesBuf.asIntBuffer()
             val numInt = outNumBuf.asIntBuffer()
 
-            val reportedNum = if (numInt.remaining() > 0) numInt.get(0) else 0
+            // ⭐️ [에러 방지용 안전한 조건문 블록 1]
+            val reportedNum: Int
+            if (numInt.remaining() > 0) {
+                reportedNum = numInt.get(0)
+            } else {
+                reportedNum = 0
+            }
+            
             val detectionCount = reportedNum.coerceIn(0, maxDetections)
 
             saveDebugStage("15_DETECTION_COUNT", listOf("reportedNum = $reportedNum"))
@@ -518,7 +524,7 @@ class MainActivity : AppCompatActivity() {
                 val score = scoresFloat.get(i)
                 val classId = classesInt.get(i)
                 
-                // 버퍼에서 추출한 어떠한 가공도 거치지 않은 순수 원본 Tensor 값
+                // 가공 없는 순수 버퍼 값
                 val raw0 = boxesFloat.get(i * 4 + 0)
                 val raw1 = boxesFloat.get(i * 4 + 1)
                 val raw2 = boxesFloat.get(i * 4 + 2)
@@ -528,10 +534,19 @@ class MainActivity : AppCompatActivity() {
                 rawLogList.add("cls=$classId, scr=${String.format("%.3f", score)}")
                 rawLogList.add("pure_raw=[$raw0, $raw1, $raw2, $raw3]")
 
-                // 오토 맵핑: Tensor 값이 2.0 이상이면 절대 픽셀(0~256), 미만이면 정규화 비율(0~1)로 판단
+                // 좌표계(0~1 또는 0~256) 자동 판별
                 val isPixelScale = raw3 > 2.0f
-                val scaleW = if (isPixelScale) inputWidth.toFloat() else 1.0f
-                val scaleH = if (isPixelScale) inputHeight.toFloat() else 1.0f
+                
+                // ⭐️ [에러 방지용 안전한 조건문 블록 2]
+                val scaleW: Float
+                val scaleH: Float
+                if (isPixelScale) {
+                    scaleW = inputWidth.toFloat()
+                    scaleH = inputHeight.toFloat()
+                } else {
+                    scaleW = 1.0f
+                    scaleH = 1.0f
+                }
 
                 val rect = android.graphics.RectF(
                     (raw1 / scaleW) * localCrop.croppedBitmap.width,
@@ -553,7 +568,7 @@ class MainActivity : AppCompatActivity() {
             for (i in 0 until detectionCount) {
                 val score = scoresFloat.get(i)
                 
-                // ⭐️ [진단용 시각화] Threshold 완화: Score가 낮아도 박스 위치를 눈으로 확인하기 위함
+                // ⭐️ [진단용 시각화] 박스가 잡히는지 눈으로 확인하기 위해 기준치를 임시로 낮춤
                 if (!score.isFinite() || score < 0.05f) continue
 
                 val ymin = boxesFloat.get(i * 4 + 0)
@@ -564,8 +579,17 @@ class MainActivity : AppCompatActivity() {
                 if (!ymin.isFinite() || !xmin.isFinite() || !ymax.isFinite() || !xmax.isFinite()) continue
 
                 val isPixelScale = xmax > 2.0f
-                val scaleW = if (isPixelScale) inputWidth.toFloat() else 1.0f
-                val scaleH = if (isPixelScale) inputHeight.toFloat() else 1.0f
+                
+                // ⭐️ [에러 방지용 안전한 조건문 블록 3]
+                val scaleW: Float
+                val scaleH: Float
+                if (isPixelScale) {
+                    scaleW = inputWidth.toFloat()
+                    scaleH = inputHeight.toFloat()
+                } else {
+                    scaleW = 1.0f
+                    scaleH = 1.0f
+                }
 
                 val rect = android.graphics.RectF(
                     (xmin / scaleW) * localCrop.croppedBitmap.width,
