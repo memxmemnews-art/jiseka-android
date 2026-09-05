@@ -50,7 +50,6 @@ import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 
-// 💡 TFLite & Debug용 추가 import
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 import java.io.FileInputStream
@@ -247,36 +246,23 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-                if (uri == null) {
-                    Log.e("JI_DEBUG_FILE", "디버그 이미지 URI 생성 실패: $filename")
-                    return
-                }
+                if (uri == null) return
 
                 try {
                     contentResolver.openOutputStream(uri)?.use { outputStream ->
-                        val success = debugBitmap!!.compress(Bitmap.CompressFormat.JPEG, 92, outputStream)
-                        if (!success) {
-                            throw IllegalStateException("Bitmap JPEG 압축 실패")
-                        }
+                        debugBitmap!!.compress(Bitmap.CompressFormat.JPEG, 92, outputStream)
                     }
-
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                         val completedValues = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
                         contentResolver.update(uri, completedValues, null, null)
                     }
-                    Log.d("JI_DEBUG_FILE", "디버그 저장 완료: $filename")
-
                 } catch (e: Throwable) {
                     try { contentResolver.delete(uri, null, null) } catch (_: Throwable) { }
-                    Log.e("JI_DEBUG_FILE", "디버그 이미지 저장 실패: $filename", e)
                 }
-
             } catch (e: Throwable) {
-                Log.e("JI_DEBUG_FILE", "디버그 기록 전체 실패: $stage", e)
+                // Ignore
             } finally {
-                if (debugBitmap != null && !debugBitmap.isRecycled) {
-                    debugBitmap.recycle()
-                }
+                if (debugBitmap != null && !debugBitmap.isRecycled) debugBitmap.recycle()
             }
         }
     }
@@ -296,28 +282,15 @@ class MainActivity : AppCompatActivity() {
                 modelAssetFileDescriptor!!.declaredLength
             )
 
-            val options = Interpreter.Options().apply {
-                setNumThreads(1) 
-            }
-
+            val options = Interpreter.Options().apply { setNumThreads(1) }
             val interpreter = Interpreter(modelMappedBuffer!!, options)
 
             val inputTensor = interpreter.getInputTensor(0)
             val inputShape = inputTensor.shape()
-            val actualInputType = inputTensor.dataType()
-
-            if (!inputShape.contentEquals(intArrayOf(1, 256, 256, 3))) {
-                interpreter.close()
-                throw IllegalStateException("예상하지 못한 입력 shape: ${inputShape.contentToString()}")
-            }
-            if (actualInputType != DataType.FLOAT32) {
-                interpreter.close()
-                throw IllegalStateException("예상하지 못한 입력 타입: $actualInputType (FLOAT32 필요)")
-            }
+            inputType = inputTensor.dataType()
 
             inputHeight = inputShape[1]
             inputWidth = inputShape[2]
-            inputType = actualInputType
 
             outIdxBoxes = -1
             outIdxScores = -1
@@ -341,11 +314,6 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            if (outIdxBoxes == -1) { interpreter.close(); throw java.lang.IllegalStateException("detection_boxes Tensor를 찾지 못했습니다.") }
-            if (outIdxScores == -1) { interpreter.close(); throw java.lang.IllegalStateException("detection_scores Tensor를 찾지 못했습니다.") }
-            if (outIdxClasses == -1) { interpreter.close(); throw java.lang.IllegalStateException("detection_classes Tensor를 찾지 못했습니다.") }
-            if (outIdxNum == -1) { interpreter.close(); throw java.lang.IllegalStateException("num_detections Tensor를 찾지 못했습니다.") }
-
             synchronized(tfliteLock) {
                 tflite?.close()
                 tflite = interpreter
@@ -357,20 +325,12 @@ class MainActivity : AppCompatActivity() {
             )
 
         } catch (e: Throwable) {
-            saveDebugStage(
-                "00_TFLITE_INIT_FAILED",
-                listOf("Error = ${e.javaClass.name}", "Message = ${e.message}")
-            )
-            Log.e("AI_DEBUG", "TFLite 초기화 실패", e)
+            saveDebugStage("00_TFLITE_INIT_FAILED", listOf("Error = ${e.message}"))
             tflite = null
         }
     }
 
     private fun convertBitmapToByteBuffer(bitmap: Bitmap): ByteBuffer {
-        if (bitmap.width != inputWidth || bitmap.height != inputHeight) {
-            throw IllegalArgumentException("입력 Bitmap 크기 오류")
-        }
-
         val bufferSize = inputWidth * inputHeight * 3 * 4   
         val byteBuffer = ByteBuffer.allocateDirect(bufferSize).order(ByteOrder.nativeOrder())
         val intValues = IntArray(inputWidth * inputHeight)
@@ -385,7 +345,8 @@ class MainActivity : AppCompatActivity() {
                 val g = (pixel shr 8) and 0xFF
                 val b = pixel and 0xFF
 
-                // ⭐️ [수정완료] Score 향상: 원상 복구된 표준 정규화 (0.0 ~ 1.0)
+                // ⭐️ [실험 A] 현재 상태 유지 (정규화 변수 통제)
+                // 모델 스케일이 0~255인지 판별하기 전까지는 기존 로직을 건드리지 않습니다.
                 byteBuffer.putFloat(r / 255.0f)
                 byteBuffer.putFloat(g / 255.0f)
                 byteBuffer.putFloat(b / 255.0f)
@@ -456,9 +417,7 @@ class MainActivity : AppCompatActivity() {
         if (rawBitmap != null) {
             cachedTextureMat = Mat()
             Utils.bitmapToMat(rawBitmap, cachedTextureMat!!)
-            if (cachedTextureMat!!.channels() == 4) {
-                Imgproc.cvtColor(cachedTextureMat!!, cachedTextureMat!!, Imgproc.COLOR_RGBA2RGB)
-            }
+            if (cachedTextureMat!!.channels() == 4) Imgproc.cvtColor(cachedTextureMat!!, cachedTextureMat!!, Imgproc.COLOR_RGBA2RGB)
             rawBitmap.recycle()
         } else {
             cachedTextureMat = Mat(100, 300, CvType.CV_8UC3, Scalar(70.0, 70.0, 70.0))
@@ -470,18 +429,10 @@ class MainActivity : AppCompatActivity() {
         btnRetry?.setOnClickListener { resetToLiveMode() }
         btnSave?.setOnClickListener {
             displayedBitmap?.let { bmp -> saveBitmapToGallery(bmp) } 
-            ?: Toast.makeText(this, "저장할 이미지가 없습니다.", Toast.LENGTH_SHORT).show()
         }
 
         nativeGuideView?.onTouchPointListener = touchDrop@{ uiPoint ->
-            
-            saveDebugStage(
-                "01_TOUCH",
-                listOf("UI X = ${uiPoint.x}", "UI Y = ${uiPoint.y}", "MatrixReady = $isMatrixReady")
-            )
-
             if (!isMatrixReady) return@touchDrop
-
             val currentSession = captureSessionId.get()
             progressBar?.visibility = View.VISIBLE
             nativeGuideView?.visibility = View.GONE
@@ -489,19 +440,12 @@ class MainActivity : AppCompatActivity() {
             
             precomputeExecutor.execute {
                 if (captureSessionId.get() != currentSession) return@execute 
-                
                 val safeBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) }
        
                 if (safeBitmap != null) {
-                    val touchCoords = FloatArray(2).apply { 
-                        this[0] = uiPoint.x; this[1] = uiPoint.y 
-                    }
+                    val touchCoords = FloatArray(2).apply { this[0] = uiPoint.x; this[1] = uiPoint.y }
                     inverseMatrix.mapPoints(touchCoords)
-                    val debugInterceptor = createDebugInterceptor()
-
-                    runAIPipeline(safeBitmap, touchCoords[0], touchCoords[1], currentSession, debugInterceptor)
-                } else {
-                    runOnUiThread { progressBar?.visibility = View.GONE }
+                    runAIPipeline(safeBitmap, touchCoords[0], touchCoords[1], currentSession, createDebugInterceptor())
                 }
             }
         }
@@ -511,68 +455,30 @@ class MainActivity : AppCompatActivity() {
         safeBitmap: Bitmap, touchX: Float, touchY: Float,
         currentSession: Int, debugInterceptor: PlateDetectionEngine.DetectionDebugListener
     ) {
-        saveDebugBitmap(
-            "02_PIPELINE_START", safeBitmap,
-            listOf("touchX = $touchX", "touchY = $touchY", "session = $currentSession")
-        )
-
         if (tflite == null) {
             fallbackToManualMode(currentSession, "AI 모델이 로드되지 않았습니다.")
             safeBitmap.recycle()
             return
         }
 
-        saveDebugStage("03_BEFORE_CROP", listOf("touchX = $touchX", "touchY = $touchY"))
-
         val localCrop = PlateDetectionEngine.prepareWideCrop(safeBitmap, touchX, touchY)
-
-        saveDebugBitmap("04_AFTER_CROP", localCrop.croppedBitmap, listOf(
-            "cropWidth = ${localCrop.croppedBitmap.width}", "cropHeight = ${localCrop.croppedBitmap.height}",
-            "offsetX = ${localCrop.offsetX}", "offsetY = ${localCrop.offsetY}"
-        ))
+        saveDebugBitmap("04_AFTER_CROP", localCrop.croppedBitmap, listOf("cropWidth = ${localCrop.croppedBitmap.width}"))
 
         var resizedBitmap: Bitmap? = null
 
         try {
-            if (localCrop.croppedBitmap.isRecycled) {
-                throw IllegalStateException("AI 입력 Crop Bitmap이 이미 recycle되었습니다.")
-            }
-
-            saveDebugStage("05_BEFORE_RESIZE", listOf(
-                "source = ${localCrop.croppedBitmap.width}x${localCrop.croppedBitmap.height}",
-                "target = ${inputWidth}x${inputHeight}"
-            ))
-
             resizedBitmap = Bitmap.createScaledBitmap(localCrop.croppedBitmap, inputWidth, inputHeight, true)
-
-            saveDebugBitmap("06_AFTER_RESIZE", resizedBitmap, listOf("width = ${resizedBitmap.width}", "height = ${resizedBitmap.height}"))
-
-            saveDebugStage("07_BEFORE_INPUT_BUFFER", listOf("Bitmap = ${resizedBitmap.width}x${resizedBitmap.height}", "type = FLOAT32"))
-
             val inputBuffer = convertBitmapToByteBuffer(resizedBitmap)
 
-            saveDebugStage("08_AFTER_INPUT_BUFFER", listOf("capacity = ${inputBuffer.capacity()}", "position = ${inputBuffer.position()}", "limit = ${inputBuffer.limit()}"))
-
-            saveDebugStage("09_BEFORE_OUTPUT_BUFFER", listOf(
-                "boxesIndex = $outIdxBoxes", "scoresIndex = $outIdxScores", "classesIndex = $outIdxClasses", "numIndex = $outIdxNum", "maxDetections = $maxDetections"
-            ))
-
-            val boxesTensor = tflite?.getOutputTensor(outIdxBoxes) ?: throw IllegalStateException("Boxes Tensor 획득 실패")
-            val scoresTensor = tflite?.getOutputTensor(outIdxScores) ?: throw IllegalStateException("Scores Tensor 획득 실패")
-            val classesTensor = tflite?.getOutputTensor(outIdxClasses) ?: throw IllegalStateException("Classes Tensor 획득 실패")
-            val numTensor = tflite?.getOutputTensor(outIdxNum) ?: throw IllegalStateException("Num Tensor 획득 실패")
-
-            val boxesBytes = boxesTensor.numElements() * 4
-            val scoresBytes = scoresTensor.numElements() * 4
-            val classesBytes = classesTensor.numElements() * 4
-            val numBytes = numTensor.numElements() * 4
+            val boxesBytes = maxDetections * 4 * 4
+            val scoresBytes = maxDetections * 4
+            val classesBytes = maxDetections * 4
+            val numBytes = 4
 
             val outBoxesBuf = ByteBuffer.allocateDirect(boxesBytes).order(ByteOrder.nativeOrder())
             val outScoresBuf = ByteBuffer.allocateDirect(scoresBytes).order(ByteOrder.nativeOrder())
             val outClassesBuf = ByteBuffer.allocateDirect(classesBytes).order(ByteOrder.nativeOrder())
             val outNumBuf = ByteBuffer.allocateDirect(numBytes).order(ByteOrder.nativeOrder())
-
-            saveDebugStage("10_AFTER_OUTPUT_BUFFER", listOf("boxesBytes = $boxesBytes", "scoresBytes = $scoresBytes", "classesBytes = $classesBytes", "numBytes = $numBytes"))
 
             val outputs = HashMap<Int, Any>()
             outputs[outIdxBoxes] = outBoxesBuf
@@ -580,27 +486,14 @@ class MainActivity : AppCompatActivity() {
             outputs[outIdxClasses] = outClassesBuf
             outputs[outIdxNum] = outNumBuf
 
-            saveDebugStage("11_BEFORE_TFLITE_RUN", listOf(
-                "inputBytes = ${inputBuffer.capacity()}", "boxesBytes = ${outBoxesBuf.capacity()}", 
-                "scoresBytes = ${outScoresBuf.capacity()}", "classesBytes = ${outClassesBuf.capacity()}", 
-                "numBytes = ${outNumBuf.capacity()}", "thread = ${Thread.currentThread().name}"
-            ))
-
             synchronized(tfliteLock) {
-                val interpreter = tflite ?: throw IllegalStateException("TFLite Interpreter가 없습니다.")
-                interpreter.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputs)
+                tflite?.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputs)
             }
-
-            saveDebugStage("12_AFTER_TFLITE_RUN", listOf("TFLite 실행 성공", "output buffers populated"))
-
-            saveDebugStage("13_BEFORE_OUTPUT_READ")
 
             outBoxesBuf.rewind()
             outScoresBuf.rewind()
             outClassesBuf.rewind()
             outNumBuf.rewind()
-
-            saveDebugStage("14_AFTER_OUTPUT_REWIND")
 
             val boxesFloat = outBoxesBuf.asFloatBuffer()
             val scoresFloat = outScoresBuf.asFloatBuffer()
@@ -610,42 +503,44 @@ class MainActivity : AppCompatActivity() {
             val reportedNum = if (numInt.remaining() > 0) numInt.get(0) else 0
             val detectionCount = reportedNum.coerceIn(0, maxDetections)
 
-            saveDebugStage("15_DETECTION_COUNT", listOf("reportedNum = $reportedNum", "detectionCount = $detectionCount"))
+            saveDebugStage("15_DETECTION_COUNT", listOf("reportedNum = $reportedNum"))
 
             // -----------------------------------------------------------------
-            // ⭐️ 15_5_RAW_DETECTIONS: AI가 반환한 날것의 데이터
+            // ⭐️ 실험 B, C: 순수 Raw Tensor 값 로그 출력
             // -----------------------------------------------------------------
             val localTouchX = localCrop.croppedBitmap.width / 2f
             val localTouchY = localCrop.croppedBitmap.height / 2f
 
             val rawLogList = mutableListOf<String>()
-            rawLogList.add("TouchX: $localTouchX, TouchY: $localTouchY")
-            rawLogList.add("CropSize: ${localCrop.croppedBitmap.width}x${localCrop.croppedBitmap.height}")
-
             val printLimit = min(detectionCount, 5) 
+            
             for (i in 0 until printLimit) {
                 val score = scoresFloat.get(i)
                 val classId = classesInt.get(i)
-                val ymin = boxesFloat.get(i * 4 + 0)
-                val xmin = boxesFloat.get(i * 4 + 1)
-                val ymax = boxesFloat.get(i * 4 + 2)
-                val xmax = boxesFloat.get(i * 4 + 3)
-
-                // ⭐️ [수정완료] 절대 좌표 맵핑 오류 방지 (inputWidth/Height로 나누어 비율을 구함)
-                val rect = android.graphics.RectF(
-                    (xmin / inputWidth.toFloat()) * localCrop.croppedBitmap.width,
-                    (ymin / inputHeight.toFloat()) * localCrop.croppedBitmap.height,
-                    (xmax / inputWidth.toFloat()) * localCrop.croppedBitmap.width,
-                    (ymax / inputHeight.toFloat()) * localCrop.croppedBitmap.height
-                )
                 
-                val contains = rect.contains(localTouchX, localTouchY)
+                // 버퍼에서 추출한 어떠한 가공도 거치지 않은 순수 원본 Tensor 값
+                val raw0 = boxesFloat.get(i * 4 + 0)
+                val raw1 = boxesFloat.get(i * 4 + 1)
+                val raw2 = boxesFloat.get(i * 4 + 2)
+                val raw3 = boxesFloat.get(i * 4 + 3)
 
                 rawLogList.add("--- [$i] ---")
                 rawLogList.add("cls=$classId, scr=${String.format("%.3f", score)}")
-                rawLogList.add("raw=[$ymin, $xmin, $ymax, $xmax]")
+                rawLogList.add("pure_raw=[$raw0, $raw1, $raw2, $raw3]")
+
+                // 오토 맵핑: Tensor 값이 2.0 이상이면 절대 픽셀(0~256), 미만이면 정규화 비율(0~1)로 판단
+                val isPixelScale = raw3 > 2.0f
+                val scaleW = if (isPixelScale) inputWidth.toFloat() else 1.0f
+                val scaleH = if (isPixelScale) inputHeight.toFloat() else 1.0f
+
+                val rect = android.graphics.RectF(
+                    (raw1 / scaleW) * localCrop.croppedBitmap.width,
+                    (raw0 / scaleH) * localCrop.croppedBitmap.height,
+                    (raw3 / scaleW) * localCrop.croppedBitmap.width,
+                    (raw2 / scaleH) * localCrop.croppedBitmap.height
+                )
+                
                 rawLogList.add("map=[${rect.left.toInt()}, ${rect.top.toInt()}, ${rect.right.toInt()}, ${rect.bottom.toInt()}]")
-                rawLogList.add("containsTouch=$contains")
             }
             saveDebugStage("15_5_RAW_DETECTIONS", rawLogList)
             // -----------------------------------------------------------------
@@ -657,7 +552,9 @@ class MainActivity : AppCompatActivity() {
 
             for (i in 0 until detectionCount) {
                 val score = scoresFloat.get(i)
-                if (!score.isFinite() || score < 0.4f) continue
+                
+                // ⭐️ [진단용 시각화] Threshold 완화: Score가 낮아도 박스 위치를 눈으로 확인하기 위함
+                if (!score.isFinite() || score < 0.05f) continue
 
                 val ymin = boxesFloat.get(i * 4 + 0)
                 val xmin = boxesFloat.get(i * 4 + 1)
@@ -666,20 +563,16 @@ class MainActivity : AppCompatActivity() {
 
                 if (!ymin.isFinite() || !xmin.isFinite() || !ymax.isFinite() || !xmax.isFinite()) continue
 
-                // ⭐️ [수정완료] 절대 좌표 맵핑 오류 방지
+                val isPixelScale = xmax > 2.0f
+                val scaleW = if (isPixelScale) inputWidth.toFloat() else 1.0f
+                val scaleH = if (isPixelScale) inputHeight.toFloat() else 1.0f
+
                 val rect = android.graphics.RectF(
-                    (xmin / inputWidth.toFloat()) * localCrop.croppedBitmap.width,
-                    (ymin / inputHeight.toFloat()) * localCrop.croppedBitmap.height,
-                    (xmax / inputWidth.toFloat()) * localCrop.croppedBitmap.width,
-                    (ymax / inputHeight.toFloat()) * localCrop.croppedBitmap.height
+                    (xmin / scaleW) * localCrop.croppedBitmap.width,
+                    (ymin / scaleH) * localCrop.croppedBitmap.height,
+                    (xmax / scaleW) * localCrop.croppedBitmap.width,
+                    (ymax / scaleH) * localCrop.croppedBitmap.height
                 )
-
-                if (rect.width() <= 0f || rect.height() <= 0f) continue
-
-                rect.left = rect.left.coerceIn(0f, localCrop.croppedBitmap.width.toFloat())
-                rect.right = rect.right.coerceIn(0f, localCrop.croppedBitmap.width.toFloat())
-                rect.top = rect.top.coerceIn(0f, localCrop.croppedBitmap.height.toFloat())
-                rect.bottom = rect.bottom.coerceIn(0f, localCrop.croppedBitmap.height.toFloat())
 
                 if (rect.width() <= 0f || rect.height() <= 0f) continue
 
@@ -721,18 +614,13 @@ class MainActivity : AppCompatActivity() {
                 )
 
                 localCrop.croppedBitmap.recycle()
-                
-                saveDebugBitmap("17_BEFORE_GEOMETRY", safeBitmap, listOf("AI Box = $globalLineBox"))
-
+                saveDebugBitmap("17_BEFORE_GEOMETRY", safeBitmap, listOf("globalLineBox = $globalLineBox"))
                 buildFinalWireframe(safeBitmap, globalLineBox, currentSession, debugInterceptor)
                 return
 
             } else {
                 val debugBmp = localCrop.croppedBitmap.copy(Bitmap.Config.ARGB_8888, true)
-                
-                val failLogs = mutableListOf("검출 개수: $detectionCount")
-                failLogs.addAll(rawLogList)
-                failLogs.add("번호판 중앙을 다시 터치해주세요.")
+                val failLogs = mutableListOf("검출 개수: $detectionCount").apply { addAll(rawLogList) }
 
                 debugInterceptor.pauseAndShowStep(
                     "디버그 1단계: [FAIL] AI 모델 탐색 실패", debugBmp,
@@ -748,15 +636,9 @@ class MainActivity : AppCompatActivity() {
 
         } catch (e: Throwable) {
             Log.e("AI_DEBUG", "TFLite Pipeline 오류", e)
-
-            if (resizedBitmap != null && !resizedBitmap.isRecycled && resizedBitmap !== localCrop.croppedBitmap) {
-                resizedBitmap.recycle()
-            }
-            if (!localCrop.croppedBitmap.isRecycled) {
-                localCrop.croppedBitmap.recycle()
-            }
+            resizedBitmap?.recycle()
+            localCrop.croppedBitmap.recycle()
             safeBitmap.recycle()
-
             fallbackToManualMode(currentSession, "AI 처리 중 오류가 발생했습니다.")
             return
         }
@@ -771,24 +653,14 @@ class MainActivity : AppCompatActivity() {
                 safeBitmap.recycle()
                 return@launch
             }
-
-            val targetPolygon = PlateDetectionEngine.processWithMLKitResult(
-                safeBitmap, aiGlobalBox, debugInterceptor
-            )
-
-            saveDebugStage("18_AFTER_GEOMETRY", listOf("polygonFound = ${targetPolygon != null}", "polygonSize = ${targetPolygon?.size ?: 0}"))
-
+            val targetPolygon = PlateDetectionEngine.processWithMLKitResult(safeBitmap, aiGlobalBox, debugInterceptor)
             runOnUiThread {
                 if (isFinishing || isDestroyed || captureSessionId.get() != currentSession) {
                     safeBitmap.recycle()
                     return@runOnUiThread
                 }
-
-                if (targetPolygon != null && targetPolygon.isNotEmpty()) {
-                    triggerInstantMasking(targetPolygon)
-                } else {
-                    fallbackToManualMode(currentSession, "번호판 기하학 조립에 실패했습니다.")
-                }
+                if (targetPolygon != null && targetPolygon.isNotEmpty()) triggerInstantMasking(targetPolygon)
+                else fallbackToManualMode(currentSession, "번호판 기하학 조립에 실패했습니다.")
                 safeBitmap.recycle() 
             }
         }
@@ -800,92 +672,53 @@ class MainActivity : AppCompatActivity() {
             return 
         }
         
-        saveDebugStage("19_BEFORE_MASK")
-
         val currentSessionId = captureSessionId.get()
         progressBar?.visibility = View.VISIBLE
         nativeGuideView?.visibility = View.GONE
         guideText?.visibility = View.GONE 
        
-        try {
-            maskExecutor.execute {
-                if (captureSessionId.get() != currentSessionId) {
-                    runOnUiThread { 
-                        progressBar?.visibility = View.GONE
-                        nativeGuideView?.visibility = View.VISIBLE 
-                    }
-                    return@execute
-                }
-                
-                val safeTargetBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) }
-                
-                if (safeTargetBitmap != null) {
-                    try {
-                        val resultMat = Mat()
-                        Utils.bitmapToMat(safeTargetBitmap, resultMat)
-
-                        cachedTextureMat?.let { texture ->
-                            applyMaskToMat(resultMat, targetCandidate, texture)
-                        }
-
-                        val resultBitmap = Bitmap.createBitmap(resultMat.cols(), resultMat.rows(), Bitmap.Config.ARGB_8888)
-                        Utils.matToBitmap(resultMat, resultBitmap)
-                        resultMat.release()
-                        
-                        saveDebugBitmap("20_MASK_COMPLETE", resultBitmap, listOf("mask completed"))
-
-                        runOnUiThread {
-                            if (isFinishing || isDestroyed || captureSessionId.get() != currentSessionId) { 
-                                resultBitmap.recycle()
-                                return@runOnUiThread 
-                            }
- 
-                            val oldBitmap = displayedBitmap
-                            nativeBackgroundView?.setImageBitmap(resultBitmap)
-                            displayedBitmap = resultBitmap
-            
-                            oldBitmap?.let { bmp -> 
-                                uiHandler.postDelayed({ 
-                                    if (!bmp.isRecycled) bmp.recycle() 
-                                }, 500)
-                            }
-                            
-                            progressBar?.visibility = View.GONE
-                            resultActionLayout?.visibility = View.VISIBLE
-                        }
-                    } catch (e: Exception) {
-                        Log.e("CAMERA_DEBUG", "Masking failed", e)
-                        runOnUiThread { 
-                            progressBar?.visibility = View.GONE
-                            nativeGuideView?.visibility = View.VISIBLE 
-                        }
-                    } finally { 
-                        safeTargetBitmap.recycle() 
-                    }
-                } else {
-                    runOnUiThread { 
-                        progressBar?.visibility = View.GONE
-                        nativeGuideView?.visibility = View.VISIBLE 
-                        Toast.makeText(this@MainActivity, "이미지 데이터를 불러올 수 없습니다.", Toast.LENGTH_SHORT).show()
-                    }
-                }
+        maskExecutor.execute {
+            if (captureSessionId.get() != currentSessionId) {
+                runOnUiThread { progressBar?.visibility = View.GONE; nativeGuideView?.visibility = View.VISIBLE }
+                return@execute
             }
-        } catch (e: Exception) {
-            Log.e("CAMERA_DEBUG", "Failed to execute masking task", e)
-            progressBar?.visibility = View.GONE
-            nativeGuideView?.visibility = View.VISIBLE
+            
+            val safeTargetBitmap = synchronized(bitmapLock) { lastCapturedBitmap?.copy(Bitmap.Config.ARGB_8888, true) }
+            if (safeTargetBitmap != null) {
+                try {
+                    val resultMat = Mat()
+                    Utils.bitmapToMat(safeTargetBitmap, resultMat)
+                    cachedTextureMat?.let { applyMaskToMat(resultMat, targetCandidate, it) }
+
+                    val resultBitmap = Bitmap.createBitmap(resultMat.cols(), resultMat.rows(), Bitmap.Config.ARGB_8888)
+                    Utils.matToBitmap(resultMat, resultBitmap)
+                    resultMat.release()
+                    
+                    runOnUiThread {
+                        if (isFinishing || isDestroyed || captureSessionId.get() != currentSessionId) { 
+                            resultBitmap.recycle()
+                            return@runOnUiThread 
+                        }
+                        val oldBitmap = displayedBitmap
+                        nativeBackgroundView?.setImageBitmap(resultBitmap)
+                        displayedBitmap = resultBitmap
+                        oldBitmap?.let { uiHandler.postDelayed({ if (!it.isRecycled) it.recycle() }, 500) }
+                        progressBar?.visibility = View.GONE
+                        resultActionLayout?.visibility = View.VISIBLE
+                    }
+                } catch (e: Exception) {
+                    runOnUiThread { progressBar?.visibility = View.GONE; nativeGuideView?.visibility = View.VISIBLE }
+                } finally { 
+                    safeTargetBitmap.recycle() 
+                }
+            } else {
+                runOnUiThread { progressBar?.visibility = View.GONE; nativeGuideView?.visibility = View.VISIBLE }
+            }
         }
     }
 
     private fun applyMaskToMat(mat: Mat, corners: List<ImmutablePoint>, textureInput: Mat) {
         if (corners.size != 4) return
-
-        var maskMat: Mat? = null
-        var contour: org.opencv.core.MatOfPoint? = null
-        var blurredMask: Mat? = null
-        var alphaMat: Mat? = null
-        var preparedTexture: Mat? = null
-        var warpedTexture: Mat? = null
 
         var originalWasRgba = false
         if (mat.channels() == 4) {
@@ -893,140 +726,94 @@ class MainActivity : AppCompatActivity() {
             Imgproc.cvtColor(mat, mat, Imgproc.COLOR_RGBA2RGB)
         }
 
-        try {
-            val pts = corners.map { Point(it.x.toDouble(), it.y.toDouble()) }
+        val pts = corners.map { Point(it.x.toDouble(), it.y.toDouble()) }
+        val maskMat = Mat.zeros(mat.size(), CvType.CV_8UC1)
+        val contour = org.opencv.core.MatOfPoint(*pts.toTypedArray())
+        Imgproc.fillPoly(maskMat, listOf(contour), Scalar(255.0))
 
-            maskMat = Mat.zeros(mat.size(), CvType.CV_8UC1)
-            contour = org.opencv.core.MatOfPoint(*pts.toTypedArray())
-            Imgproc.fillPoly(maskMat, listOf(contour), Scalar(255.0))
+        val blurredMask = Mat()
+        Imgproc.GaussianBlur(maskMat, blurredMask, Size(15.0, 15.0), 5.0)
 
-            blurredMask = Mat()
-            Imgproc.GaussianBlur(maskMat, blurredMask, Size(15.0, 15.0), 5.0)
+        val alphaMat = Mat()
+        blurredMask.convertTo(alphaMat, CvType.CV_32F, 1.0 / 255.0)
 
-            alphaMat = Mat()
-            blurredMask.convertTo(alphaMat, CvType.CV_32F, 1.0 / 255.0)
-
-            preparedTexture = Mat()
-            if (textureInput.channels() != mat.channels()) {
-                if (mat.channels() == 3 && textureInput.channels() == 4) {
-                    Imgproc.cvtColor(textureInput, preparedTexture, Imgproc.COLOR_RGBA2RGB)
-                } else {
-                    textureInput.copyTo(preparedTexture)
-                }
-            } else {
-                textureInput.copyTo(preparedTexture)
-            }
-
-            warpedTexture = Mat.zeros(mat.size(), mat.type())
-            val srcPts = MatOfPoint2f(
-                Point(0.0, 0.0),
-                Point(preparedTexture.cols().toDouble(), 0.0),
-                Point(preparedTexture.cols().toDouble(), preparedTexture.rows().toDouble()),
-                Point(0.0, preparedTexture.rows().toDouble())
-            )
-            
-            val dstPts = MatOfPoint2f(*pts.toTypedArray())
-
-            val perspectiveMat = Imgproc.getPerspectiveTransform(srcPts, dstPts)
-            Imgproc.warpPerspective(preparedTexture, warpedTexture, perspectiveMat, mat.size(), Imgproc.INTER_LINEAR)
-
-            srcPts.release()
-            dstPts.release()
-            perspectiveMat.release()
-
-            val matChannels = ArrayList<Mat>()
-            val textureChannels = ArrayList<Mat>()
-            Core.split(mat, matChannels)
-            Core.split(warpedTexture, textureChannels)
-
-            for (i in 0 until 3) {
-                var mcF: Mat? = null; var ccF: Mat? = null; var blendedF: Mat? = null
-                var invAlpha: Mat? = null; var scalarMat: Mat? = null
-                try {
-                    mcF = Mat(); ccF = Mat()
-                    matChannels[i].convertTo(mcF, CvType.CV_32F)
-                    textureChannels[i].convertTo(ccF, CvType.CV_32F)
-
-                    blendedF = Mat()
-                    Core.multiply(ccF, alphaMat, ccF) 
-         
-                    invAlpha = Mat()
-                    scalarMat = Mat(alphaMat.size(), alphaMat.type(), Scalar(1.0))
-
-                    Core.subtract(scalarMat, alphaMat, invAlpha) 
-                    Core.multiply(mcF, invAlpha, mcF) 
-
-                    Core.add(ccF, mcF, blendedF) 
-                    blendedF.convertTo(matChannels[i], CvType.CV_8U)
-                } finally {
-                    mcF?.release(); ccF?.release(); blendedF?.release()
-                    invAlpha?.release(); scalarMat?.release()
-                }
-            }
-            Core.merge(matChannels, mat)
-            matChannels.forEach { it.release() }
-            textureChannels.forEach { it.release() }
-
-        } finally {
-            maskMat?.release()
-            contour?.release()
-            blurredMask?.release()
-            alphaMat?.release()
-            preparedTexture?.release()
-            warpedTexture?.release()
-
-            if (originalWasRgba) {
-                Imgproc.cvtColor(mat, mat, Imgproc.COLOR_RGB2RGBA)
-            }
+        val preparedTexture = Mat()
+        if (textureInput.channels() != mat.channels()) {
+            if (mat.channels() == 3 && textureInput.channels() == 4) Imgproc.cvtColor(textureInput, preparedTexture, Imgproc.COLOR_RGBA2RGB)
+            else textureInput.copyTo(preparedTexture)
+        } else {
+            textureInput.copyTo(preparedTexture)
         }
+
+        val warpedTexture = Mat.zeros(mat.size(), mat.type())
+        val srcPts = MatOfPoint2f(
+            Point(0.0, 0.0), Point(preparedTexture.cols().toDouble(), 0.0),
+            Point(preparedTexture.cols().toDouble(), preparedTexture.rows().toDouble()), Point(0.0, preparedTexture.rows().toDouble())
+        )
+        val dstPts = MatOfPoint2f(*pts.toTypedArray())
+        val perspectiveMat = Imgproc.getPerspectiveTransform(srcPts, dstPts)
+        Imgproc.warpPerspective(preparedTexture, warpedTexture, perspectiveMat, mat.size(), Imgproc.INTER_LINEAR)
+
+        val matChannels = ArrayList<Mat>()
+        val textureChannels = ArrayList<Mat>()
+        Core.split(mat, matChannels)
+        Core.split(warpedTexture, textureChannels)
+
+        for (i in 0 until 3) {
+            val mcF = Mat(); val ccF = Mat(); val blendedF = Mat()
+            val invAlpha = Mat(); val scalarMat = Mat(alphaMat.size(), alphaMat.type(), Scalar(1.0))
+            
+            matChannels[i].convertTo(mcF, CvType.CV_32F)
+            textureChannels[i].convertTo(ccF, CvType.CV_32F)
+
+            Core.multiply(ccF, alphaMat, ccF) 
+            Core.subtract(scalarMat, alphaMat, invAlpha) 
+            Core.multiply(mcF, invAlpha, mcF) 
+            Core.add(ccF, mcF, blendedF) 
+            blendedF.convertTo(matChannels[i], CvType.CV_8U)
+
+            mcF.release(); ccF.release(); blendedF.release(); invAlpha.release(); scalarMat.release()
+        }
+        Core.merge(matChannels, mat)
+
+        matChannels.forEach { it.release() }
+        textureChannels.forEach { it.release() }
+        maskMat.release(); contour.release(); blurredMask.release(); alphaMat.release()
+        preparedTexture.release(); warpedTexture.release(); srcPts.release(); dstPts.release(); perspectiveMat.release()
+        
+        if (originalWasRgba) Imgproc.cvtColor(mat, mat, Imgproc.COLOR_RGB2RGBA)
     }
 
     private fun saveBitmapToGallery(bitmap: Bitmap) {
-        try {
-            val filename = "JiSeKa_${System.currentTimeMillis()}.jpg"
-            val values = ContentValues().apply { 
-                put(MediaStore.Images.Media.DISPLAY_NAME, filename)
-                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg") 
-            }
-     
-            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return
-            contentResolver.openOutputStream(uri)?.use { bitmap.compress(Bitmap.CompressFormat.JPEG, 95, it) }
-            Toast.makeText(this, "💾 저장 완료", Toast.LENGTH_SHORT).show()
-            resetToLiveMode()
-        } catch (e: Exception) { 
-            Toast.makeText(this, "저장 실패", Toast.LENGTH_SHORT).show() 
+        val values = ContentValues().apply { 
+            put(MediaStore.Images.Media.DISPLAY_NAME, "JiSeKa_${System.currentTimeMillis()}.jpg")
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg") 
         }
+        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return
+        contentResolver.openOutputStream(uri)?.use { bitmap.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+        Toast.makeText(this, "💾 저장 완료", Toast.LENGTH_SHORT).show()
+        resetToLiveMode()
     }
 
     private fun createDebugInterceptor(): PlateDetectionEngine.DetectionDebugListener {
         return object : PlateDetectionEngine.DetectionDebugListener {
             override fun pauseAndShowStep(stageName: String, debugBitmap: Bitmap, title: String, logs: List<String>) {
-                
                 saveDebugBitmap("ENGINE_${stageName.replace(" ", "_")}", debugBitmap, listOf("title = $title") + logs)
-
                 debugLatch = CountDownLatch(1)
                 
                 runOnUiThread {
                     if (isFinishing || isDestroyed) return@runOnUiThread
-                    
                     nativeBackgroundView?.setImageBitmap(debugBitmap)
                     debugHudTitle?.text = title
-                    
                     val logText = StringBuilder()
-                    for (log in logs) {
-                        logText.append(log).append("\n")
-                    }
+                    for (log in logs) logText.append(log).append("\n")
                     debugHudLogs?.text = logText.toString()
                     debugHudContainer?.visibility = View.VISIBLE
                     btnDebugNext?.visibility = View.VISIBLE 
                     progressBar?.visibility = View.GONE 
                 }
                 
-                try {
-                    debugLatch?.await() 
-                } catch (e: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                }
+                try { debugLatch?.await() } catch (e: InterruptedException) { Thread.currentThread().interrupt() }
                 
                 runOnUiThread { 
                     btnDebugNext?.visibility = View.GONE 
@@ -1041,111 +828,70 @@ class MainActivity : AppCompatActivity() {
         orientationEventListener = object : OrientationEventListener(this) {
             override fun onOrientationChanged(orientation: Int) {
                 if (orientation == ORIENTATION_UNKNOWN) return
-
                 val targetRotation = when (orientation) {
-                    in 45..134 -> 270f
-                    in 135..224 -> 180f
-                    in 225..314 -> 90f
-                    else -> 0f
+                    in 45..134 -> 270f; in 135..224 -> 180f; in 225..314 -> 90f; else -> 0f
                 }
-
                 if (targetRotation != currentLogicalRotation) {
                     var diff = targetRotation - currentLogicalRotation
                     if (diff > 180f) diff -= 360f
                     if (diff < -180f) diff += 360f
-
                     accumulatedRotation += diff
                     currentLogicalRotation = targetRotation
                     nativeGuideView?.currentDeviceRotation = targetRotation
-
-                    val uiElements = listOf(guideText, btnCapture, btnRetry, btnSave)
-                    uiElements.forEach { view ->
+                    listOf(guideText, btnCapture, btnRetry, btnSave).forEach { view ->
                         view?.animate()?.rotation(accumulatedRotation)?.setDuration(200)?.start()
                     }
                 }
             }
         }
-
-        if (orientationEventListener?.canDetectOrientation() == true) {
-            orientationEventListener?.enable()
-        }
+        if (orientationEventListener?.canDetectOrientation() == true) orientationEventListener?.enable()
     }
 
     private fun resetToLiveMode() {
         captureSessionId.incrementAndGet()
-        
         debugLatch?.countDown() 
         btnDebugNext?.visibility = View.GONE
         debugHudContainer?.visibility = View.GONE
-       
         btnCapture?.isEnabled = true
         nativeBackgroundView?.setImageDrawable(null)
-    
-        displayedBitmap?.recycle()
-        displayedBitmap = null
-
-        synchronized(bitmapLock) { 
-            lastCapturedBitmap?.recycle()
-            lastCapturedBitmap = null 
-        }
-        
+        displayedBitmap?.recycle(); displayedBitmap = null
+        synchronized(bitmapLock) { lastCapturedBitmap?.recycle(); lastCapturedBitmap = null }
         isMatrixReady = false
         nativeGuideView?.resetState()
-        
         viewFinder?.visibility = View.VISIBLE
         btnCapture?.visibility = View.VISIBLE
-        
         nativeGuideView?.visibility = View.GONE
         nativeBackgroundView?.visibility = View.GONE
         resultActionLayout?.visibility = View.GONE
         progressBar?.visibility = View.GONE
-        
         uiHandler.removeCallbacks(hideGuideTextRunnable) 
-        guideText?.alpha = 1f
-        guideText?.visibility = View.GONE
+        guideText?.alpha = 1f; guideText?.visibility = View.GONE
     }
 
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
- 
         cameraProviderFuture.addListener({
             try {
                 val cameraProvider = cameraProviderFuture.get()
                 val preview = Preview.Builder().build().also { it.setSurfaceProvider(viewFinder?.surfaceProvider) }
                 imageCapture = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY).build()
-   
                 cameraProvider.unbindAll()
                 val viewPort = viewFinder?.viewPort
                 if (viewPort != null) {
-                    val useCaseGroup = UseCaseGroup.Builder()
-                        .addUseCase(preview)
-                        .addUseCase(imageCapture!!)
-                        .setViewPort(viewPort)
-                        .build()
+                    val useCaseGroup = UseCaseGroup.Builder().addUseCase(preview).addUseCase(imageCapture!!).setViewPort(viewPort).build()
                     cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, useCaseGroup)
                 } else {
                     cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageCapture)
                 }
             } catch (e: Exception) { 
-                Log.e("CAMERA_DEBUG", "Camera binding failed", e) 
-                runOnUiThread {
-                    Toast.makeText(this, "카메라를 실행할 수 없습니다.", Toast.LENGTH_LONG).show()
-                    btnCapture?.isEnabled = false
-                }
+                runOnUiThread { Toast.makeText(this, "카메라를 실행할 수 없습니다.", Toast.LENGTH_LONG).show(); btnCapture?.isEnabled = false }
             }
         }, ContextCompat.getMainExecutor(this))
     }
 
     private fun takePhoto() {
-        if (imageCapture == null) {
-            Toast.makeText(this, "카메라 초기화에 실패했거나 준비되지 않았습니다.", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        btnCapture?.isEnabled = false
-        progressBar?.visibility = View.VISIBLE
-        btnCapture?.visibility = View.GONE
- 
+        if (imageCapture == null) return
+        btnCapture?.isEnabled = false; progressBar?.visibility = View.VISIBLE; btnCapture?.visibility = View.GONE
         val currentSessionId = captureSessionId.incrementAndGet()
    
         try {
@@ -1153,53 +899,33 @@ class MainActivity : AppCompatActivity() {
                 override fun onCaptureSuccess(imageProxy: ImageProxy) {
                     try {
                         val rawBitmap = imageProxy.toBitmap()
-                        val rotationDegrees = imageProxy.imageInfo.rotationDegrees.toFloat()
-                        val matrix = Matrix().apply { postRotate(rotationDegrees) }
+                        val matrix = Matrix().apply { postRotate(imageProxy.imageInfo.rotationDegrees.toFloat()) }
                         val uprightBitmap = Bitmap.createBitmap(rawBitmap, 0, 0, rawBitmap.width, rawBitmap.height, matrix, true)
-  
-                        synchronized(bitmapLock) { 
-                            lastCapturedBitmap?.recycle() 
-                            lastCapturedBitmap = uprightBitmap 
-                        }
-                        
+                        synchronized(bitmapLock) { lastCapturedBitmap?.recycle(); lastCapturedBitmap = uprightBitmap }
                         runOnUiThread {
                             if (isFinishing || isDestroyed || captureSessionId.get() != currentSessionId) return@runOnUiThread
                             viewFinder?.visibility = View.GONE
                             nativeBackgroundView?.setImageBitmap(uprightBitmap)
                             nativeBackgroundView?.visibility = View.VISIBLE
-  
                             progressBar?.visibility = View.GONE 
                             setupMatrixAndPrecalculate(currentSessionId)
                         }
                     } catch (t: Throwable) { 
-                        Log.e("CAMERA_DEBUG", "Error processing captured image", t)
-                        runOnUiThread { 
-                            resetToLiveMode() 
-                            Toast.makeText(this@MainActivity, "이미지 처리 중 오류가 발생했습니다.", Toast.LENGTH_SHORT).show()
-                        } 
-                    } finally { 
-                        imageProxy.close() 
-                    }
+                        runOnUiThread { resetToLiveMode(); Toast.makeText(this@MainActivity, "이미지 처리 중 오류가 발생했습니다.", Toast.LENGTH_SHORT).show() } 
+                    } finally { imageProxy.close() }
                 }
                 override fun onError(exception: ImageCaptureException) { 
-                    Log.e("CAMERA_DEBUG", "Camera capture failed", exception)
-                    runOnUiThread { 
-                        resetToLiveMode() 
-                        Toast.makeText(this@MainActivity, "촬영에 실패했습니다.", Toast.LENGTH_SHORT).show()
-                    } 
+                    runOnUiThread { resetToLiveMode(); Toast.makeText(this@MainActivity, "촬영에 실패했습니다.", Toast.LENGTH_SHORT).show() } 
                 }
             })
         } catch (e: Exception) {
-            Log.e("CAMERA_DEBUG", "takePicture call threw an exception", e)
-            resetToLiveMode()
-            Toast.makeText(this, "카메라 모듈 오류로 촬영할 수 없습니다.", Toast.LENGTH_SHORT).show()
+            resetToLiveMode(); Toast.makeText(this, "카메라 오류.", Toast.LENGTH_SHORT).show()
         }
     }
 
     private fun fallbackToManualMode(sessionId: Int, message: String) {
         runOnUiThread {
             if (captureSessionId.get() != sessionId) return@runOnUiThread
-            
             progressBar?.visibility = View.GONE
             nativeGuideView?.visibility = View.VISIBLE
             Toast.makeText(this@MainActivity, message, Toast.LENGTH_SHORT).show()
@@ -1209,33 +935,20 @@ class MainActivity : AppCompatActivity() {
     private fun setupMatrixAndPrecalculate(sessionId: Int) {
         val bgView = nativeBackgroundView ?: return
         val safeBitmap = synchronized(bitmapLock) { lastCapturedBitmap } ?: return
-        
         bgView.viewTreeObserver.addOnPreDrawListener(object : ViewTreeObserver.OnPreDrawListener {
             override fun onPreDraw(): Boolean {
                 bgView.viewTreeObserver.removeOnPreDrawListener(this)
-                
-                val viewW = bgView.width.toFloat()
-                val viewH = bgView.height.toFloat()
-                val imgW = safeBitmap.width.toFloat()
-                val imgH = safeBitmap.height.toFloat()
-                
-                val scale = max(viewW / imgW, viewH / imgH)
-                val offsetX = (viewW - (imgW * scale)) / 2f
-                val offsetY = (viewH - (imgH * scale)) / 2f
-    
+                val scale = max(bgView.width.toFloat() / safeBitmap.width.toFloat(), bgView.height.toFloat() / safeBitmap.height.toFloat())
                 viewMatrix.reset()
                 viewMatrix.postScale(scale, scale)
-                viewMatrix.postTranslate(offsetX, offsetY)
+                viewMatrix.postTranslate((bgView.width - (safeBitmap.width * scale)) / 2f, (bgView.height - (safeBitmap.height * scale)) / 2f)
                 isMatrixReady = viewMatrix.invert(inverseMatrix)
-            
                 nativeGuideView?.visibility = View.VISIBLE
-                
                 guideText?.text = "번호판을 터치해주세요"
                 guideText?.paint?.isFakeBoldText = true 
                 guideText?.textSize = 20f 
                 guideText?.alpha = 1f
                 guideText?.visibility = View.VISIBLE
-                
                 uiHandler.removeCallbacks(hideGuideTextRunnable) 
                 uiHandler.postDelayed(hideGuideTextRunnable, 3500) 
                 return true 
@@ -1252,47 +965,20 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         orientationEventListener?.disable()
         uiHandler.removeCallbacksAndMessages(null)
-        
         debugLatch?.countDown() 
-
-        synchronized(bitmapLock) { 
-             lastCapturedBitmap?.recycle()
-             lastCapturedBitmap = null 
-        }
+        synchronized(bitmapLock) { lastCapturedBitmap?.recycle(); lastCapturedBitmap = null }
         nativeBackgroundView?.setImageDrawable(null)
-        displayedBitmap?.recycle()
-        displayedBitmap = null
-        
-        cachedTextureMat?.release()
-        cachedTextureMat = null
-
-        synchronized(tfliteLock) {
-            try {
-                tflite?.close()
-            } catch (e: Throwable) {
-                Log.e("AI_DEBUG", "TFLite close 오류", e)
-            }
-            tflite = null
-        }
-
+        displayedBitmap?.recycle(); displayedBitmap = null
+        cachedTextureMat?.release(); cachedTextureMat = null
+        synchronized(tfliteLock) { tflite?.close(); tflite = null }
         try { modelFileChannel?.close() } catch (_: Throwable) { }
         try { modelInputStream?.close() } catch (_: Throwable) { }
         try { modelAssetFileDescriptor?.close() } catch (_: Throwable) { }
-
-        modelFileChannel = null
-        modelInputStream = null
-        modelAssetFileDescriptor = null
-        modelMappedBuffer = null
-
-        cameraExecutor.shutdownNow()
-        precomputeExecutor.shutdownNow()
-        maskExecutor.shutdownNow()
+        cameraExecutor.shutdownNow(); precomputeExecutor.shutdownNow(); maskExecutor.shutdownNow()
         super.onDestroy()
     }
 
-    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
-        ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
-    }
+    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all { ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED }
 
     companion object { 
         private const val REQUEST_CODE_PERMISSIONS = 1001
