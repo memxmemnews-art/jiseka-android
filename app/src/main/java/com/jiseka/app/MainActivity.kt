@@ -256,6 +256,9 @@ class MainActivity : AppCompatActivity() {
                         val completedValues = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
                         contentResolver.update(uri, completedValues, null, null)
                     }
+                    
+                    // ⭐️ Kotlin 컴파일러의 expression 해석 에러를 방지하기 위해 Unit 명시
+                    Unit
                 } catch (e: Throwable) {
                     try { contentResolver.delete(uri, null, null) } catch (_: Throwable) { }
                 }
@@ -312,6 +315,12 @@ class MainActivity : AppCompatActivity() {
                 } else if (shape.contentEquals(intArrayOf(1)) && type == DataType.INT32) {
                     outIdxNum = i
                 }
+            }
+
+            // ⭐️ 다음 단계(런타임 에러)를 방지하기 위한 텐서 인덱스 검증 로직 복구
+            if (outIdxBoxes == -1 || outIdxScores == -1 || outIdxClasses == -1 || outIdxNum == -1) {
+                interpreter.close()
+                throw IllegalStateException("TFLite 출력 텐서를 찾을 수 없습니다. (Boxes:$outIdxBoxes, Scores:$outIdxScores, Classes:$outIdxClasses, Num:$outIdxNum)")
             }
 
             synchronized(tfliteLock) {
